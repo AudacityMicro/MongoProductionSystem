@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#17211d">
+    <title>Mongo Production System</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Mongo Production System home">
+        <span class="brand-mark">M</span>
+        <span>Mongo Production System</span>
+      </a>
+      <span class="system-state" id="system-state">
+        <span class="state-light" aria-hidden="true"></span>
+        Checking system
+      </span>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Production foundation</p>
+        <h1>Pallet scheduling starts here.</h1>
+        <p class="lede">
+          The proof of concept has been cleared away. This is the clean
+          foundation for coordinating Mongo, the mill, and every pallet moving
+          between them.
+        </p>
+      </section>
+
+      <section class="workspace" aria-labelledby="workspace-title">
+        <div>
+          <p class="section-number">01</p>
+          <h2 id="workspace-title">Scheduling workspace</h2>
+        </div>
+        <div class="empty-state">
+          <span class="empty-rule"></span>
+          <p>No production workflow has been defined yet.</p>
+          <small>Next: define pallet states, priorities, and machine routing.</small>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Mongo + Mill</span>
+      <span id="app-version">Version 0.1.0</span>
+    </footer>
+  </body>
+</html>
+

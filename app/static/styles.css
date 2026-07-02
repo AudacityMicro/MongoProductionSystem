@@ -1,0 +1,168 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;600;700&display=swap");
+
+:root {
+  --ink: #17211d;
+  --paper: #f2efe7;
+  --signal: #e4562b;
+  --muted: #6b746f;
+  --line: #c9c8bf;
+  --healthy: #73a942;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  background:
+    linear-gradient(90deg, transparent 49.9%, rgba(23, 33, 29, 0.05) 50%),
+    var(--paper);
+  font-family: "Manrope", sans-serif;
+}
+
+.topbar,
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem clamp(1.25rem, 4vw, 4rem);
+  border-bottom: 1px solid var(--ink);
+}
+
+.brand {
+  display: flex;
+  gap: 0.85rem;
+  align-items: center;
+  color: inherit;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.brand-mark {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  color: var(--paper);
+  background: var(--ink);
+  font-family: "DM Mono", monospace;
+}
+
+.system-state {
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  color: var(--muted);
+  font: 0.75rem "DM Mono", monospace;
+  text-transform: uppercase;
+}
+
+.state-light {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--signal);
+}
+
+.system-state.online .state-light {
+  background: var(--healthy);
+}
+
+main {
+  padding: clamp(3rem, 9vw, 8rem) clamp(1.25rem, 8vw, 8rem);
+}
+
+.hero {
+  max-width: 70rem;
+}
+
+.eyebrow,
+.section-number,
+footer {
+  font: 0.75rem "DM Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  color: var(--signal);
+}
+
+h1 {
+  max-width: 12ch;
+  margin: 1rem 0;
+  font-size: clamp(3rem, 8vw, 7.5rem);
+  line-height: 0.92;
+  letter-spacing: -0.07em;
+}
+
+.lede {
+  max-width: 46rem;
+  margin: 2rem 0 0;
+  color: var(--muted);
+  font-size: clamp(1rem, 2vw, 1.35rem);
+  line-height: 1.7;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.7fr) 1.3fr;
+  gap: 3rem;
+  margin-top: clamp(5rem, 12vw, 11rem);
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--ink);
+}
+
+.workspace h2 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.section-number {
+  color: var(--signal);
+}
+
+.empty-state {
+  min-height: 12rem;
+  padding: 2rem;
+  border: 1px solid var(--line);
+}
+
+.empty-rule {
+  display: block;
+  width: 3rem;
+  height: 0.25rem;
+  background: var(--signal);
+}
+
+.empty-state p {
+  margin: 2.5rem 0 0.5rem;
+  font-size: 1.25rem;
+}
+
+.empty-state small {
+  color: var(--muted);
+}
+
+footer {
+  border-top: 1px solid var(--ink);
+  border-bottom: 0;
+}
+
+@media (max-width: 650px) {
+  .topbar {
+    align-items: flex-start;
+  }
+
+  .brand {
+    max-width: 12rem;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
