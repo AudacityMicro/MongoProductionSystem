@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#17211d">
+    <title>Settings | Mongo Production System</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/settings.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">M</span>
+        <span>Mongo Production System</span>
+      </a>
+      <nav aria-label="Main navigation">
+        <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link active" href="/settings">Settings</a>
+      </nav>
+      <span class="system-state" id="system-state">
+        <span class="state-light" aria-hidden="true"></span>
+        Loading
+      </span>
+    </header>
+
+    <main class="settings-page">
+      <section class="settings-heading">
+        <p class="eyebrow">System configuration</p>
+        <h1>Scheduling settings</h1>
+        <p>Program discovery and physical storage layout are configured here.</p>
+      </section>
+
+      <form id="settings-form">
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">01</p>
+            <h2>Program source</h2>
+            <p>The folder must be available to the computer running this server.</p>
+          </div>
+          <div class="panel-fields">
+            <label>
+              Source folder
+              <input id="source-folder" placeholder="C:\Programs\Mongo" maxlength="1000">
+            </label>
+            <label>
+              Allowed extensions
+              <input id="program-extensions" placeholder=".nc, .tap, .gcode, .cnc, .urp" required>
+            </label>
+            <p class="field-help">Subfolders are scanned recursively. Program headers are not parsed yet.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">02</p>
+            <h2>Display</h2>
+            <p>Weights are stored canonically and converted for display.</p>
+          </div>
+          <div class="panel-fields">
+            <label>
+              Weight unit
+              <select id="weight-unit">
+                <option value="lb">Pounds (lb)</option>
+                <option value="kg">Kilograms (kg)</option>
+              </select>
+            </label>
+            <label class="checkbox-control">
+              <input id="debug-menu-enabled" type="checkbox">
+              <span>
+                Enable debug simulator
+                <small>Shows a fixed signal panel on the Schedule page.</small>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">03</p>
+            <h2>Pallet pool</h2>
+            <p>Pool positions are numbered sequentially and each holds one pallet.</p>
+          </div>
+          <div class="panel-fields">
+            <label>
+              Number of pool positions
+              <input id="pool-slot-count" type="number" min="1" max="256" step="1" required>
+            </label>
+            <p class="field-help">Default: 16. Occupied positions must be cleared before reducing this number below them.</p>
+          </div>
+        </section>
+
+        <div class="settings-actions">
+          <a class="button ghost" href="/">Cancel</a>
+          <button class="button primary" type="submit">Save settings</button>
+        </div>
+      </form>
+    </main>
+    <div class="toast hidden" id="toast" role="status"></div>
+  </body>
+</html>

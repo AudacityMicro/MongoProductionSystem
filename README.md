@@ -7,16 +7,20 @@ concept.
 
 ## Current state
 
-The application currently contains only:
+The application currently contains:
 
 - a FastAPI application;
-- a health and version endpoint;
-- a blank responsive UI shell;
-- environment-based server configuration;
-- a small automated test suite.
+- a persistent SQLite pallet database managed by Alembic migrations;
+- a graphical Pool, Queue, Machine, and Storage scheduling board;
+- pallet creation, editing, duplication, deletion, and program assignment;
+- automatic unique pallet names selected from a curated artist catalog;
+- program discovery from a configurable server-side source folder;
+- configurable numbered pool positions and weight display units;
+- transactional APIs with optimistic revision conflict detection;
+- an automated API and persistence test suite.
 
-Robot control, pallet scheduling, persistence, authentication, and production
-workflows are intentionally not implemented yet.
+Robot control, authentication, program execution, program-header parsing, and
+automatic machine-state synchronization are intentionally not implemented yet.
 
 ## Run locally
 
@@ -49,6 +53,25 @@ variables use the `MPS_` prefix.
 | `MPS_HOST` | `0.0.0.0` | Network interface used by the web server |
 | `MPS_PORT` | `8000` | Dashboard port |
 | `MPS_LOG_LEVEL` | `info` | Server log level |
+| `MPS_DATABASE_URL` | Project-root `mongo-production.db` | Optional SQLAlchemy database URL override |
+
+## Operator workflow
+
+Use the Schedule page to create pallets and move them physically between
+numbered Pool positions, the single Machine position, and general Storage.
+Queue membership is virtual: a queued pallet remains visible in its physical
+Pool position until it moves into the Machine. Moving a pallet into Machine or
+Storage removes it from the Queue. Cards can be dragged with a mouse or operated
+with explicit controls for touch and keyboard use.
+
+Use the Settings page to choose the server-side program source folder, allowed
+file extensions, display weight unit, and Pool position count. Program scans
+are recursive. If a previously assigned program disappears, refreshing the
+program list clears that assignment and reports the affected pallet.
+
+Settings can also enable a fixed debug simulator on the Schedule page. Its
+signals can mark the Mill pallet complete or defective and unload it to the
+first open Pool position, or place the simulated machine into an error state.
 
 ## Lessons retained from the proof of concept
 
@@ -81,4 +104,3 @@ The system will be built in vertical slices:
 
 The next implementation step should define the pallet workflow and scheduling
 state model before reconnecting controller commands.
-

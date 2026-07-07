@@ -4,50 +4,174 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
-    <title>Mongo Production System</title>
+    <title>Schedule | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script src="/static/app.js" defer></script>
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="/" aria-label="Mongo Production System home">
+      <a class="brand" href="/">
         <span class="brand-mark">M</span>
         <span>Mongo Production System</span>
       </a>
+      <nav aria-label="Main navigation">
+        <a class="nav-link active" href="/">Schedule</a>
+        <a class="nav-link" href="/settings">Settings</a>
+      </nav>
       <span class="system-state" id="system-state">
         <span class="state-light" aria-hidden="true"></span>
-        Checking system
+        Loading
       </span>
     </header>
 
-    <main>
-      <section class="hero">
-        <p class="eyebrow">Production foundation</p>
-        <h1>Pallet scheduling starts here.</h1>
-        <p class="lede">
-          The proof of concept has been cleared away. This is the clean
-          foundation for coordinating Mongo, the mill, and every pallet moving
-          between them.
-        </p>
+    <main class="board-page">
+      <section class="board-heading">
+        <div>
+          <p class="eyebrow">Live production board</p>
+          <h1>Pallet schedule</h1>
+        </div>
+        <div class="toolbar">
+          <button class="button primary" id="create-pallet">+ New pallet</button>
+        </div>
       </section>
 
-      <section class="workspace" aria-labelledby="workspace-title">
-        <div>
-          <p class="section-number">01</p>
-          <h2 id="workspace-title">Scheduling workspace</h2>
+      <div class="notice hidden" id="program-warning" role="status"></div>
+
+      <div class="board-layout">
+        <div class="operations-rail">
+          <section class="zone machine-zone" data-zone="machine">
+            <header class="zone-heading">
+              <div>
+                <p class="section-number">01 / Active</p>
+                <h2>Mill machine</h2>
+              </div>
+              <span class="machine-light"></span>
+            </header>
+            <div class="machine-bay drop-target" id="machine-slot" data-destination="machine"></div>
+          </section>
+
+          <section class="zone queue-zone" data-zone="queue">
+            <header class="zone-heading">
+              <div>
+                <p class="section-number">02 / Ordered</p>
+                <h2>Production queue</h2>
+              </div>
+              <span class="zone-count" id="queue-count">0 pallets</span>
+            </header>
+            <div class="queue-track drop-target" id="queue-list" data-destination="queue"></div>
+          </section>
         </div>
-        <div class="empty-state">
-          <span class="empty-rule"></span>
-          <p>No production workflow has been defined yet.</p>
-          <small>Next: define pallet states, priorities, and machine routing.</small>
+
+        <div class="production-workspace">
+          <section class="zone pool-zone" data-zone="pool">
+            <header class="zone-heading">
+              <div>
+                <p class="section-number">03 / Available</p>
+                <h2>Pallet pool</h2>
+              </div>
+              <span class="zone-count" id="pool-count">0 pallets</span>
+            </header>
+            <div class="pool-position-grid" id="pool-list"></div>
+          </section>
+
+          <section class="zone storage-zone" data-zone="storage">
+            <header class="zone-heading">
+              <div>
+                <p class="section-number">04 / Inventory</p>
+                <h2>Storage</h2>
+              </div>
+              <span class="zone-count" id="storage-count">0 pallets</span>
+            </header>
+            <div class="storage-grid drop-target" id="storage-list" data-destination="storage"></div>
+          </section>
         </div>
-      </section>
+      </div>
     </main>
 
-    <footer>
-      <span>Mongo + Mill</span>
-      <span id="app-version">Version 0.1.0</span>
-    </footer>
+    <aside class="debug-panel hidden" id="debug-panel" aria-label="Debug signal simulator">
+      <header>
+        <div>
+          <p class="section-number">Debug simulator</p>
+          <h2>Machine signals</h2>
+        </div>
+        <span class="debug-state" id="debug-state">Idle</span>
+      </header>
+      <p class="debug-help">These controls simulate signals without connecting to the robot or mill.</p>
+      <button class="debug-signal complete" type="button" data-debug-signal="complete">
+        <strong>Job complete</strong>
+        <span>Unload to Pool as complete parts</span>
+      </button>
+      <button class="debug-signal warning" type="button" data-debug-signal="out_of_spec">
+        <strong>Complete, out of spec</strong>
+        <span>Unload to Pool as defective parts</span>
+      </button>
+      <button class="debug-signal error" type="button" data-debug-signal="error">
+        <strong>Machine error</strong>
+        <span>Keep pallet in Mill and signal error</span>
+      </button>
+    </aside>
+
+    <dialog id="pallet-dialog">
+      <form method="dialog" id="pallet-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow" id="pallet-dialog-mode">Create</p>
+            <h2 id="pallet-dialog-title">New pallet</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-pallet aria-label="Close">&times;</button>
+        </div>
+        <input type="hidden" id="pallet-id">
+        <label>
+          Workholding
+          <input id="pallet-workholding" required maxlength="250" autocomplete="off">
+        </label>
+        <div class="form-row">
+          <label>
+            Weight <span id="weight-unit-label">(lb)</span>
+            <input id="pallet-weight" required type="number" min="0.001" step="0.001">
+          </label>
+          <label>
+            Contents
+            <select id="pallet-contents">
+              <option value="empty">Empty</option>
+              <option value="raw_stock">Raw stock</option>
+              <option value="complete_parts">Complete parts</option>
+              <option value="defective_parts">Defective parts</option>
+            </select>
+          </label>
+        </div>
+        <div class="program-picker">
+          <label>
+            Assigned program
+            <input id="pallet-program" list="program-options" placeholder="No program assigned" autocomplete="off">
+            <datalist id="program-options"></datalist>
+          </label>
+          <button class="button secondary" type="button" id="refresh-programs">Refresh programs</button>
+        </div>
+        <p class="field-help">Programs are read from the folder configured in Settings.</p>
+        <div class="dialog-actions">
+          <button class="button ghost" type="button" data-close-pallet>Cancel</button>
+          <button class="button primary" id="save-pallet" type="submit">Save pallet</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirm-dialog">
+      <form method="dialog">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Confirm action</p>
+            <h2 id="confirm-title">Confirm</h2>
+          </div>
+        </div>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button class="button ghost" value="cancel">Cancel</button>
+          <button class="button danger" id="confirm-action" value="confirm">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast hidden" id="toast" role="status"></div>
   </body>
 </html>
-
