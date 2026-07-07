@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#17211d">
+    <title>Debugging | Mongo Production System</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/debugging.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">M</span>
+        <span>Mongo Production System</span>
+      </a>
+      <nav aria-label="Main navigation">
+        <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link active" href="/debugging">Debugging</a>
+        <a class="nav-link" href="/settings">Settings</a>
+      </nav>
+      <span class="system-state" id="system-state">
+        <span class="state-light" aria-hidden="true"></span>
+        Loading
+      </span>
+    </header>
+
+    <main class="debugging-page">
+      <section class="settings-heading">
+        <p class="eyebrow">Telemetry and diagnostics</p>
+        <h1>Robot readable I/O</h1>
+        <p id="debug-notes">Loading current robot-readable signals.</p>
+      </section>
+
+      <section class="debug-overview">
+        <article class="debug-overview-card">
+          <p class="section-number">01</p>
+          <h2>Connection</h2>
+          <div class="debug-connection-row">
+            <span class="debug-connection-light" id="debug-connection-light" aria-hidden="true"></span>
+            <strong id="debug-connection-label">Unavailable</strong>
+          </div>
+          <dl class="debug-summary-list">
+            <div><dt>Source</dt><dd id="debug-source">Unavailable</dd></div>
+            <div><dt>Machine state</dt><dd id="debug-machine-state">Unknown</dd></div>
+            <div><dt>Updated</dt><dd id="debug-timestamp">Unknown</dd></div>
+          </dl>
+        </article>
+
+        <article class="debug-overview-card">
+          <p class="section-number">02</p>
+          <h2>Board summary</h2>
+          <dl class="debug-summary-list">
+            <div><dt>Machine pallet</dt><dd id="summary-machine-pallet">None</dd></div>
+            <div><dt>Queued pallets</dt><dd id="summary-queue-count">0</dd></div>
+            <div><dt>Pool pallets</dt><dd id="summary-pool-count">0</dd></div>
+            <div><dt>Stored pallets</dt><dd id="summary-storage-count">0</dd></div>
+            <div><dt>Open pool positions</dt><dd id="summary-pool-open">0</dd></div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="debug-grid">
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">03 / Controller map</p>
+              <h2>Digital I/O faceplate</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help">Simulator mode lets you click I/O tiles to toggle states. Use Rename on any port to assign a custom operator-facing name. Live robot values remain read-only.</p>
+          <div class="debug-controller-layout" id="digital-io-layout"></div>
+        </article>
+
+        <article class="debug-section">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">04 / Analog</p>
+              <h2>Analog and I/O values</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Channel</th>
+                  <th>Signal</th>
+                  <th>Value</th>
+                  <th>Mode bit</th>
+                  <th>Mask</th>
+                </tr>
+              </thead>
+              <tbody id="analog-inputs"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="debug-section">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">05 / Analog</p>
+              <h2>Analog outputs</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Channel</th>
+                  <th>Signal</th>
+                  <th>Value</th>
+                  <th>Mode bit</th>
+                  <th>Mask</th>
+                </tr>
+              </thead>
+              <tbody id="analog-outputs"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="debug-section">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">06 / State</p>
+              <h2>Robot state</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Field</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="state-rows"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="debug-section">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">07 / Motion</p>
+              <h2>Pose and joints</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Channel</th>
+                  <th>Signal</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="motion-rows"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="debug-section">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">08 / Actual</p>
+              <h2>Additional actual values</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Channel</th>
+                  <th>Signal</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="actual-rows"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+  </body>
+</html>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,12 +14,15 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.models import AppSettings, Pallet
 from app.pallet_names import PALLET_NAMES
+from app.robot_rtde import RobotTelemetryError, read_robot_snapshot
 from app.schemas import (
     CreatePallet,
     MovePallet,
     QueuePallet,
+    RenameDebugIo,
     ReorderQueue,
     SettingsUpdate,
+    ToggleDebugIo,
     UpdatePallet,
 )
 
@@ -115,9 +119,368 @@ def board_snapshot(session: Session) -> dict:
             "pool_slot_count": settings.pool_slot_count,
             "debug_menu_enabled": settings.debug_menu_enabled,
             "machine_state": settings.machine_state,
+            "robot_connection_mode": settings.robot_connection_mode,
+            "robot_host": settings.robot_host,
+            "robot_port": settings.robot_port,
+            "robot_poll_hz": settings.robot_poll_hz,
+            "robot_timeout_seconds": settings.robot_timeout_seconds,
         },
         "programs": programs,
         "program_warning": warning,
+    }
+
+
+def _board_summary(settings: AppSettings, pallets: list[Pallet]) -> dict:
+    machine_pallet = next((item for item in pallets if item.location == "machine"), None)
+    queue_count = sum(1 for item in pallets if item.queue_position is not None)
+    pool_count = sum(1 for item in pallets if item.location == "pool")
+    storage_count = sum(1 for item in pallets if item.location == "storage")
+    return {
+        "machine_pallet": machine_pallet.name if machine_pallet else None,
+        "queue_count": queue_count,
+        "pool_count": pool_count,
+        "storage_count": storage_count,
+        "pool_open_positions": max(settings.pool_slot_count - pool_count, 0),
+    }
+
+
+def _bit_value(mask: int, index: int) -> bool:
+    return bool((mask >> index) & 1)
+
+
+def _debug_io_label_key(direction: str, bank: str, index: int) -> str:
+    return f"{direction}:{bank}:{index}"
+
+
+def _load_debug_io_labels(settings: AppSettings) -> dict[str, str]:
+    try:
+        raw = json.loads(settings.debug_io_labels or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: value.strip()
+        for key, value in raw.items()
+        if isinstance(key, str) and isinstance(value, str) and value.strip()
+    }
+
+
+def _store_debug_io_labels(settings: AppSettings, labels: dict[str, str]) -> None:
+    settings.debug_io_labels = json.dumps(labels, separators=(",", ":"), sort_keys=True)
+
+
+def _mask_rows(
+    mask: int,
+    prefix: str,
+    count: int,
+    *,
+    writable: bool,
+    direction: str,
+    bank: str,
+) -> list[dict]:
+    return [
+        {
+            "channel": f"{prefix}{index}",
+            "index": index,
+            "bit": index,
+            "value": _bit_value(mask, index),
+            "writable": writable,
+            "direction": direction,
+            "bank": bank,
+        }
+        for index in range(count)
+    ]
+
+
+def _apply_debug_labels(snapshot: dict, settings: AppSettings) -> dict:
+    labels = _load_debug_io_labels(settings)
+    for group_name in ("digital_input_groups", "digital_output_groups"):
+        for group in snapshot.get(group_name, []):
+            for row in group.get("rows", []):
+                direction = row.get("direction")
+                bank = row.get("bank")
+                index = row.get("index")
+                key = (
+                    _debug_io_label_key(direction, bank, index)
+                    if direction is not None and bank is not None and index is not None
+                    else None
+                )
+                custom = labels.get(key) if key else None
+                row["label_key"] = key
+                row["label"] = custom or row.get("channel")
+                row["custom_label"] = custom
+    return snapshot
+
+
+def _simulated_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
+    machine_running = settings.machine_state == "running"
+    machine_error = settings.machine_state == "error"
+    queue_has_work = summary["queue_count"] > 0
+    total_known = max(
+        summary["queue_count"] + summary["pool_count"] + summary["storage_count"],
+        1,
+    )
+    snapshot = {
+        "revision": settings.revision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "simulated",
+        "connected": True,
+        "connection_label": "Simulator",
+        "robot": {
+            "host": None,
+            "port": None,
+            "controller_version": None,
+            "recipe_fields": [],
+        },
+        "digital_input_groups": [
+            {
+                "title": "Standard inputs",
+                "rows": _mask_rows(
+                    settings.debug_standard_input_mask,
+                    "DI",
+                    8,
+                    writable=True,
+                    direction="input",
+                    bank="standard",
+                ),
+            },
+            {
+                "title": "Configurable inputs",
+                "rows": _mask_rows(
+                    settings.debug_configurable_input_mask,
+                    "CI",
+                    8,
+                    writable=True,
+                    direction="input",
+                    bank="configurable",
+                ),
+            },
+            {
+                "title": "Tool inputs",
+                "rows": _mask_rows(
+                    settings.debug_tool_input_mask,
+                    "TI",
+                    2,
+                    writable=True,
+                    direction="input",
+                    bank="tool",
+                ),
+            }
+        ],
+        "digital_output_groups": [
+            {
+                "title": "Standard outputs",
+                "rows": _mask_rows(
+                    settings.debug_standard_output_mask,
+                    "DO",
+                    8,
+                    writable=True,
+                    direction="output",
+                    bank="standard",
+                ),
+            },
+            {
+                "title": "Configurable outputs",
+                "rows": _mask_rows(
+                    settings.debug_configurable_output_mask,
+                    "CO",
+                    8,
+                    writable=True,
+                    direction="output",
+                    bank="configurable",
+                ),
+            },
+            {
+                "title": "Tool outputs",
+                "rows": _mask_rows(
+                    settings.debug_tool_output_mask,
+                    "TO",
+                    2,
+                    writable=True,
+                    direction="output",
+                    bank="tool",
+                ),
+            }
+        ],
+        "analog_inputs": [
+            {"channel": "AI0", "label": "Queue fill ratio", "value": round(summary["queue_count"] / total_known, 3), "mode_mask": None, "mode_bit": None},
+            {"channel": "AI1", "label": "Pool open ratio", "value": round(summary["pool_open_positions"] / max(settings.pool_slot_count, 1), 3), "mode_mask": None, "mode_bit": None},
+        ],
+        "analog_outputs": [
+            {"channel": "AO0", "label": "Machine load demand", "value": 1.0 if summary["machine_pallet"] is None and queue_has_work else 0.0, "mode_mask": None, "mode_bit": None},
+            {"channel": "AO1", "label": "Machine unload demand", "value": 1.0 if summary["machine_pallet"] is not None and not machine_running else 0.0, "mode_mask": None, "mode_bit": None},
+        ],
+        "state_rows": [
+            {"label": "Robot mode", "value": "simulated"},
+            {"label": "Safety mode", "value": "normal" if not machine_error else "fault"},
+            {"label": "Runtime state", "value": settings.machine_state},
+        ],
+        "pose_rows": [],
+        "tcp_speed_rows": [],
+        "joint_rows": [],
+        "extra_actual_rows": [],
+        "notes": "Showing simulated I/O derived from the current board state because debug mode is enabled.",
+    }
+    return _apply_debug_labels(snapshot, settings)
+
+
+def robot_io_snapshot(session: Session) -> dict:
+    settings = get_settings(session)
+    pallets = session.scalars(select(Pallet)).all()
+    summary = _board_summary(settings, pallets)
+
+    if settings.robot_connection_mode == "physical":
+        if not settings.robot_host.strip():
+            return {
+                "revision": settings.revision,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "unavailable",
+                "connected": False,
+                "connection_label": "Physical robot not configured",
+                "machine_state": settings.machine_state,
+                "summary": summary,
+                "robot": {
+                    "mode": settings.robot_connection_mode,
+                    "host": None,
+                    "port": settings.robot_port,
+                    "controller_version": None,
+                    "recipe_fields": [],
+                },
+                "digital_input_groups": [],
+                "digital_output_groups": [],
+                "analog_inputs": [],
+                "analog_outputs": [],
+                "state_rows": [],
+                "pose_rows": [],
+                "tcp_speed_rows": [],
+                "joint_rows": [],
+                "extra_actual_rows": [],
+                "notes": "Physical robot mode is selected, but no robot host is configured.",
+            }
+        try:
+            snapshot = read_robot_snapshot(
+                settings.robot_host.strip(),
+                settings.robot_port,
+                settings.robot_poll_hz,
+                settings.robot_timeout_seconds,
+            )
+            snapshot["revision"] = settings.revision
+            snapshot["summary"] = summary
+            snapshot["machine_state"] = settings.machine_state
+            snapshot["robot"]["mode"] = settings.robot_connection_mode
+            return _apply_debug_labels(snapshot, settings)
+        except RobotTelemetryError as exc:
+            return {
+                "revision": settings.revision,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "unavailable",
+                "connected": False,
+                "connection_label": "Physical robot unavailable",
+                "machine_state": settings.machine_state,
+                "summary": summary,
+                "robot": {
+                    "mode": settings.robot_connection_mode,
+                    "host": settings.robot_host.strip(),
+                    "port": settings.robot_port,
+                    "controller_version": None,
+                    "recipe_fields": [],
+                },
+                "digital_input_groups": [],
+                "digital_output_groups": [],
+                "analog_inputs": [],
+                "analog_outputs": [],
+                "state_rows": [],
+                "pose_rows": [],
+                "tcp_speed_rows": [],
+                "joint_rows": [],
+                "extra_actual_rows": [],
+                "notes": f"Physical robot mode is selected, but live RTDE telemetry is unavailable: {exc}",
+                "warning": str(exc),
+            }
+
+    if settings.robot_connection_mode == "simulated":
+        snapshot = _simulated_robot_snapshot(settings, summary)
+        snapshot["summary"] = summary
+        snapshot["machine_state"] = settings.machine_state
+        snapshot["robot"]["mode"] = settings.robot_connection_mode
+        return snapshot
+
+    if settings.robot_host.strip():
+        try:
+            snapshot = read_robot_snapshot(
+                settings.robot_host.strip(),
+                settings.robot_port,
+                settings.robot_poll_hz,
+                settings.robot_timeout_seconds,
+            )
+            snapshot["revision"] = settings.revision
+            snapshot["summary"] = summary
+            snapshot["machine_state"] = settings.machine_state
+            return snapshot
+        except RobotTelemetryError as exc:
+            if settings.debug_menu_enabled:
+                snapshot = _simulated_robot_snapshot(settings, summary)
+                snapshot["revision"] = settings.revision
+                snapshot["summary"] = summary
+                snapshot["machine_state"] = settings.machine_state
+                snapshot["notes"] = (
+                    f"Live robot telemetry failed: {exc}. Falling back to simulated I/O because debug mode is enabled."
+                )
+                snapshot["warning"] = str(exc)
+                return snapshot
+            return {
+                "revision": settings.revision,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "unavailable",
+                "connected": False,
+                "connection_label": "Unavailable",
+                "machine_state": settings.machine_state,
+                "summary": summary,
+                "robot": {
+                    "host": settings.robot_host.strip(),
+                    "port": settings.robot_port,
+                    "controller_version": None,
+                    "recipe_fields": [],
+                },
+                "digital_input_groups": [],
+                "digital_output_groups": [],
+                "analog_inputs": [],
+                "analog_outputs": [],
+                "state_rows": [],
+                "pose_rows": [],
+                "tcp_speed_rows": [],
+                "joint_rows": [],
+                "extra_actual_rows": [],
+                "notes": f"Live robot telemetry is unavailable: {exc}",
+                "warning": str(exc),
+            }
+
+    return {
+        "revision": settings.revision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "unavailable",
+        "connected": False,
+        "connection_label": "Unavailable",
+        "machine_state": settings.machine_state,
+        "summary": summary,
+        "robot": {
+            "mode": settings.robot_connection_mode,
+            "host": None,
+            "port": None,
+            "controller_version": None,
+            "recipe_fields": [],
+        },
+        "digital_input_groups": [],
+        "digital_output_groups": [],
+        "analog_inputs": [],
+        "analog_outputs": [],
+        "state_rows": [],
+        "pose_rows": [],
+        "tcp_speed_rows": [],
+        "joint_rows": [],
+        "extra_actual_rows": [],
+        "notes": "Select simulated or physical robot mode in Settings.",
     }
 
 
@@ -412,12 +775,66 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     settings.weight_unit = payload.weight_unit
     settings.pool_slot_count = payload.pool_slot_count
     settings.debug_menu_enabled = payload.debug_menu_enabled
+    settings.robot_connection_mode = payload.robot_connection_mode
+    settings.robot_host = payload.robot_host
+    settings.robot_port = payload.robot_port
+    settings.robot_poll_hz = payload.robot_poll_hz
+    settings.robot_timeout_seconds = payload.robot_timeout_seconds
     if not payload.debug_menu_enabled:
         settings.machine_state = "idle"
     cleared = reconcile_programs(session, settings)
     bump(settings)
     commit_or_conflict(session)
     return cleared
+
+
+def toggle_debug_io(session: Session, payload: ToggleDebugIo) -> None:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if not settings.debug_menu_enabled:
+        raise problem(403, "Debug simulation is disabled in Settings.")
+
+    if payload.bank == "tool" and payload.index > 1:
+        raise problem(422, "Tool I/O indices only allow 0 or 1.")
+
+    if settings.robot_host.strip():
+        try:
+            read_robot_snapshot(
+                settings.robot_host.strip(),
+                settings.robot_port,
+                settings.robot_poll_hz,
+                settings.robot_timeout_seconds,
+            )
+            raise problem(409, "Physical robot mode is active. Digital toggles only apply in simulated mode.")
+        except RobotTelemetryError:
+            pass
+
+    if settings.robot_connection_mode != "simulated":
+        raise problem(409, "Digital toggles only apply in simulated robot mode.")
+
+    attribute_name = f"debug_{payload.bank}_{payload.direction}_mask"
+    current_mask = getattr(settings, attribute_name)
+    toggled_mask = current_mask ^ (1 << payload.index)
+    setattr(settings, attribute_name, toggled_mask)
+    bump(settings)
+    commit_or_conflict(session)
+
+
+def rename_debug_io(session: Session, payload: RenameDebugIo) -> None:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if payload.bank == "tool" and payload.index > 1:
+        raise problem(422, "Tool I/O indices only allow 0 or 1.")
+
+    labels = _load_debug_io_labels(settings)
+    key = _debug_io_label_key(payload.direction, payload.bank, payload.index)
+    if payload.label:
+        labels[key] = payload.label
+    else:
+        labels.pop(key, None)
+    _store_debug_io_labels(settings, labels)
+    bump(settings)
+    commit_or_conflict(session)
 
 
 def refresh_programs(session: Session, expected_revision: int) -> list[str]:

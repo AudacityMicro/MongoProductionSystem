@@ -1,6 +1,7 @@
 from collections.abc import Generator
 from contextlib import asynccontextmanager
 from pathlib import Path
+import subprocess
 
 from fastapi import Depends, FastAPI, Query, Request, status
 from fastapi.responses import FileResponse
@@ -17,9 +18,11 @@ from app.schemas import (
     CreatePallet,
     MovePallet,
     QueuePallet,
+    RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
     SettingsUpdate,
+    ToggleDebugIo,
     UpdatePallet,
 )
 from app.service import (
@@ -31,8 +34,11 @@ from app.service import (
     move_pallet,
     queue_pallet,
     refresh_programs,
+    rename_debug_io,
     reorder_queue,
+    robot_io_snapshot,
     simulate_signal,
+    toggle_debug_io,
     update_pallet,
     update_settings,
 )
@@ -40,6 +46,22 @@ from app.settings import settings
 
 
 STATIC_DIR = Path(__file__).parent / "static"
+PROJECT_ROOT = STATIC_DIR.parent.parent
+
+
+def queue_backend_relaunch() -> None:
+    helper = PROJECT_ROOT / "restart_backend.ps1"
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+        ],
+        cwd=PROJECT_ROOT,
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+    )
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -74,6 +96,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @application.get("/settings", include_in_schema=False)
     def settings_page() -> FileResponse:
         return FileResponse(STATIC_DIR / "settings.html")
+
+    @application.get("/debugging", include_in_schema=False)
+    def debugging_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "debugging.html")
 
     @application.get("/api/health")
     def health() -> dict[str, str]:
@@ -183,6 +209,35 @@ def create_app(database_url: str | None = None) -> FastAPI:
     ) -> dict:
         simulate_signal(session, signal, payload.expected_revision)
         return board_snapshot(session)
+
+    @application.get("/api/debug/robot-io")
+    def get_robot_io(session: Session = Depends(get_session)) -> dict:
+        return robot_io_snapshot(session)
+
+    @application.post("/api/debug/io/toggle")
+    def toggle_debug_io_value(
+        payload: ToggleDebugIo,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        toggle_debug_io(session, payload)
+        return robot_io_snapshot(session)
+
+    @application.post("/api/debug/io/label")
+    def rename_debug_io_value(
+        payload: RenameDebugIo,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        rename_debug_io(session, payload)
+        return robot_io_snapshot(session)
+
+    @application.post("/api/system/relaunch", status_code=status.HTTP_202_ACCEPTED)
+    def relaunch_system() -> dict[str, str]:
+        queue_backend_relaunch()
+        return {
+            "status": "relaunching",
+            "message": "Backend relaunch has been queued.",
+            "version": __version__,
+        }
 
     return application
 

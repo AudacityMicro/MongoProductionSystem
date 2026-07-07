@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mongo-production-system"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pallet scheduling and machine coordination for Mongo and the mill."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
     "sqlalchemy>=2.0,<3",
+    "UrRtde @ git+https://github.com/UniversalRobots/RTDE_Python_Client_Library.git@v2.7.12",
     "uvicorn[standard]>=0.34,<1",
 ]
 

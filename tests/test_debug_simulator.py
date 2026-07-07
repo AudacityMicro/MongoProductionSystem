@@ -26,6 +26,11 @@ def enable_debug(client: TestClient, board: dict) -> dict:
             "weight_unit": board["settings"]["weight_unit"],
             "pool_slot_count": board["settings"]["pool_slot_count"],
             "debug_menu_enabled": True,
+            "robot_connection_mode": board["settings"]["robot_connection_mode"],
+            "robot_host": board["settings"]["robot_host"],
+            "robot_port": board["settings"]["robot_port"],
+            "robot_poll_hz": board["settings"]["robot_poll_hz"],
+            "robot_timeout_seconds": board["settings"]["robot_timeout_seconds"],
         },
     )
     assert response.status_code == 200
@@ -122,6 +127,11 @@ def test_debug_completion_rejects_full_pool(client: TestClient) -> None:
             "weight_unit": "lb",
             "pool_slot_count": 1,
             "debug_menu_enabled": True,
+            "robot_connection_mode": "simulated",
+            "robot_host": "",
+            "robot_port": 30004,
+            "robot_poll_hz": 10,
+            "robot_timeout_seconds": 1.0,
         },
     ).json()["board"]
 
@@ -135,3 +145,134 @@ def test_debug_completion_rejects_full_pool(client: TestClient) -> None:
     machine = next(item for item in unchanged["pallets"] if item["id"] == first_id)
     assert machine["location"] == "machine"
     assert machine["content_status"] == "raw_stock"
+
+
+def test_debug_robot_io_snapshot_reflects_simulated_state(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    board = enable_debug(client, board)
+    pallet = board["pallets"][0]
+
+    board = client.post(
+        f"/api/pallets/{pallet['id']}/queue",
+        json={
+            "expected_revision": board["revision"],
+            "queue_index": 0,
+        },
+    ).json()
+
+    snapshot = client.get("/api/debug/robot-io").json()
+
+    assert snapshot["connected"] is True
+    assert snapshot["source"] == "simulated"
+    assert snapshot["summary"]["queue_count"] == 1
+    assert snapshot["summary"]["pool_count"] == 1
+    assert snapshot["summary"]["machine_pallet"] is None
+    row = snapshot["digital_input_groups"][0]["rows"][4]
+    assert row["channel"] == "DI4"
+    assert row["label"] == "DI4"
+    assert row["custom_label"] is None
+    assert row["label_key"] == "input:standard:4"
+    assert row["index"] == 4
+    assert row["bit"] == 4
+    assert row["value"] is False
+    assert row["writable"] is True
+    assert row["direction"] == "input"
+    assert row["bank"] == "standard"
+
+
+def test_toggle_debug_io_updates_simulated_masks(client: TestClient) -> None:
+    board = enable_debug(client, client.get("/api/board").json())
+
+    response = client.post(
+        "/api/debug/io/toggle",
+        json={
+            "expected_revision": board["revision"],
+            "direction": "input",
+            "bank": "standard",
+            "index": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    snapshot = response.json()
+    assert snapshot["source"] == "simulated"
+    assert snapshot["digital_input_groups"][0]["rows"][4]["value"] is True
+    assert snapshot["revision"] == board["revision"] + 1
+
+
+def test_rename_debug_io_updates_label(client: TestClient) -> None:
+    board = enable_debug(client, client.get("/api/board").json())
+
+    response = client.post(
+        "/api/debug/io/label",
+        json={
+            "expected_revision": board["revision"],
+            "direction": "input",
+            "bank": "standard",
+            "index": 4,
+            "label": "Door Closed",
+        },
+    )
+
+    assert response.status_code == 200
+    snapshot = response.json()
+    row = snapshot["digital_input_groups"][0]["rows"][4]
+    assert row["channel"] == "DI4"
+    assert row["label"] == "Door Closed"
+    assert row["custom_label"] == "Door Closed"
+    assert row["label_key"] == "input:standard:4"
+
+
+def test_toggle_debug_io_rejects_live_robot_mode(client: TestClient, monkeypatch) -> None:
+    board = enable_debug(client, client.get("/api/board").json())
+    result = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "debug_menu_enabled": True,
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+            "robot_port": 30004,
+            "robot_poll_hz": 10,
+            "robot_timeout_seconds": 1.0,
+        },
+    )
+    board = result.json()["board"]
+
+    monkeypatch.setattr(
+        "app.service.read_robot_snapshot",
+        lambda *args, **kwargs: {
+            "revision": board["revision"],
+            "timestamp": "2026-07-07T00:00:00+00:00",
+            "source": "robot",
+            "connected": True,
+            "connection_label": "Live RTDE",
+            "robot": {"host": "192.168.0.10", "port": 30004, "controller_version": "5.14.0.0", "recipe_fields": []},
+            "digital_input_groups": [],
+            "digital_output_groups": [],
+            "analog_inputs": [],
+            "analog_outputs": [],
+            "state_rows": [],
+            "pose_rows": [],
+            "tcp_speed_rows": [],
+            "joint_rows": [],
+            "extra_actual_rows": [],
+            "notes": "live",
+        },
+    )
+
+    response = client.post(
+        "/api/debug/io/toggle",
+        json={
+            "expected_revision": board["revision"],
+            "direction": "output",
+            "bank": "standard",
+            "index": 0,
+        },
+    )
+
+    assert response.status_code == 409

@@ -21,6 +21,18 @@ class AppSettings(Base):
     pool_slot_count: Mapped[int] = mapped_column(Integer, default=16)
     debug_menu_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     machine_state: Mapped[str] = mapped_column(String(20), default="idle")
+    robot_connection_mode: Mapped[str] = mapped_column(String(20), default="simulated")
+    robot_host: Mapped[str] = mapped_column(String(255), default="")
+    robot_port: Mapped[int] = mapped_column(Integer, default=30004)
+    robot_poll_hz: Mapped[int] = mapped_column(Integer, default=10)
+    robot_timeout_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    debug_standard_input_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_configurable_input_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_tool_input_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_standard_output_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_configurable_output_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_tool_output_mask: Mapped[int] = mapped_column(Integer, default=0)
+    debug_io_labels: Mapped[str] = mapped_column(String, default="{}")
     revision: Mapped[int] = mapped_column(Integer, default=0)
 
     __mapper_args__ = {

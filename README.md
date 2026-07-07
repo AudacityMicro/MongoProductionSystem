@@ -16,6 +16,7 @@ The application currently contains:
 - automatic unique pallet names selected from a curated artist catalog;
 - program discovery from a configurable server-side source folder;
 - configurable numbered pool positions and weight display units;
+- configurable simulated/physical robot mode and RTDE connection settings;
 - transactional APIs with optimistic revision conflict detection;
 - an automated API and persistence test suite.
 
@@ -69,9 +70,11 @@ file extensions, display weight unit, and Pool position count. Program scans
 are recursive. If a previously assigned program disappears, refreshing the
 program list clears that assignment and reports the affected pallet.
 
-Settings can also enable a fixed debug simulator on the Schedule page. Its
-signals can mark the Mill pallet complete or defective and unload it to the
-first open Pool position, or place the simulated machine into an error state.
+Settings can also enable a fixed debug simulator on the Schedule page and
+choose between a simulated robot and a physical robot connection. In simulated
+mode, the Debugging page allows manual digital I/O toggles. In physical mode,
+the Debugging page uses only live RTDE data from the configured controller and
+never falls back to simulated values.
 
 ## Lessons retained from the proof of concept
 

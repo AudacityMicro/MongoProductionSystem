@@ -125,6 +125,12 @@ nav {
   padding: clamp(1.25rem, 3vw, 2.5rem) clamp(1rem, 3vw, 3rem) 3rem;
 }
 
+.debugging-page {
+  width: min(1400px, 100%);
+  margin: auto;
+  padding: clamp(1.25rem, 3vw, 2.5rem) clamp(1rem, 3vw, 3rem) 3rem;
+}
+
 .settings-page {
   padding-top: clamp(2rem, 5vw, 5rem);
   padding-bottom: 6rem;
@@ -777,6 +783,10 @@ a:focus-visible {
   max-width: 1100px;
 }
 
+.debugging-page {
+  max-width: 1320px;
+}
+
 .settings-heading {
   display: block;
 }
@@ -808,6 +818,313 @@ a:focus-visible {
   border-top: 1px solid var(--ink);
 }
 
+.debug-overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.debug-overview-card,
+.debug-section {
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.debug-overview-card {
+  padding: 1rem;
+}
+
+.debug-overview-card h2,
+.debug-section h2 {
+  margin-bottom: 0.85rem;
+}
+
+.debug-connection-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-bottom: 0.95rem;
+}
+
+.debug-connection-light,
+.debug-channel-light {
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 4px rgba(107, 116, 111, 0.14);
+}
+
+.debug-connection-light.active,
+.debug-channel-light.active {
+  background: var(--healthy);
+  box-shadow: 0 0 0 4px rgba(115, 169, 66, 0.14);
+}
+
+.debug-connection-light.idle,
+.debug-channel-light.idle {
+  background: var(--warning);
+  box-shadow: 0 0 0 4px rgba(217, 155, 40, 0.14);
+}
+
+.debug-connection-light.unknown,
+.debug-channel-light.unknown {
+  background: var(--signal);
+  box-shadow: 0 0 0 4px rgba(228, 86, 43, 0.14);
+}
+
+.debug-summary-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.debug-summary-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--line);
+}
+
+.debug-summary-list dt {
+  color: var(--muted);
+}
+
+.debug-summary-list dd {
+  margin: 0;
+  font-weight: 800;
+  text-align: right;
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.debug-section {
+  padding: 1rem;
+}
+
+.debug-section-wide {
+  grid-column: 1 / -1;
+}
+
+.debug-digital-help {
+  margin-bottom: 0.75rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.debug-controller-layout {
+  overflow-x: auto;
+}
+
+.debug-faceplate-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(7.5rem, 1fr));
+  gap: 0.35rem;
+}
+
+.debug-faceplate-column {
+  border: 1px solid #212121;
+  background: #f3f2ed;
+}
+
+.debug-faceplate-column header {
+  padding: 0.28rem 0.35rem;
+  border-bottom: 1px solid rgba(23, 33, 29, 0.25);
+  font: 0.68rem "DM Mono", Consolas, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.debug-faceplate-column.signal-red header {
+  background: #ff8d67;
+}
+
+.debug-faceplate-column.signal-yellow header {
+  background: #f2e454;
+}
+
+.debug-faceplate-column.signal-gray header {
+  background: #c6c7cb;
+}
+
+.debug-faceplate-column.signal-teal header {
+  background: #00d9c0;
+}
+
+.debug-faceplate-stack {
+  display: grid;
+  gap: 0.16rem;
+  padding: 0.16rem;
+}
+
+.debug-faceplate-cell {
+  position: relative;
+  min-height: 3.05rem;
+  border: 1px solid #212121;
+  background: #f8f8f5;
+}
+
+.debug-faceplate-cell.signal-red {
+  background: #fff2d9;
+}
+
+.debug-faceplate-cell.signal-yellow {
+  background: #fffbd6;
+}
+
+.debug-faceplate-cell.signal-gray {
+  background: #efefef;
+}
+
+.debug-faceplate-cell.signal-teal,
+.debug-faceplate-cell.signal-green {
+  background: #ecfffa;
+}
+
+.debug-faceplate-cell.blank {
+  opacity: 0.35;
+}
+
+.debug-faceplate-port {
+  display: grid;
+  width: 100%;
+  min-height: 3.05rem;
+  gap: 0.2rem;
+  padding: 0.28rem 2.2rem 0.24rem 0.3rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font: 0.66rem "DM Mono", Consolas, monospace;
+}
+
+.debug-faceplate-port:disabled {
+  cursor: default;
+}
+
+.debug-faceplate-cell.writable:hover,
+.debug-faceplate-edit:hover {
+  box-shadow: inset 0 0 0 1px #17211d;
+}
+
+.debug-faceplate-cell.active {
+  background: #faffd2;
+}
+
+.debug-faceplate-name-row {
+  display: flex;
+  align-items: center;
+  gap: 0.34rem;
+}
+
+.debug-faceplate-name {
+  font-weight: 700;
+  line-height: 1.15;
+  font-size: 0.76rem;
+}
+
+.debug-faceplate-code {
+  color: var(--muted);
+  font-size: 0.58rem;
+  line-height: 1.15;
+}
+
+.debug-faceplate-edit {
+  position: absolute;
+  top: 0.12rem;
+  right: 0.12rem;
+  padding: 0.06rem 0.18rem;
+  border: 1px solid #212121;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--ink);
+  font: 0.52rem "DM Mono", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.debug-faceplate-analog {
+  display: grid;
+  gap: 0.18rem;
+  padding: 0.24rem 0.3rem;
+  font: 0.64rem "DM Mono", Consolas, monospace;
+}
+
+.debug-faceplate-analog strong {
+  font-size: 0.76rem;
+}
+
+.debug-table-shell {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: white;
+}
+
+.debug-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.debug-table th,
+.debug-table td {
+  padding: 0.6rem 0.7rem;
+  border-bottom: 1px solid rgba(23, 33, 29, 0.08);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.debug-table th {
+  background: var(--paper-deep);
+  font: 0.72rem "DM Mono", Consolas, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.debug-table tbody tr:nth-child(even) td {
+  background: rgba(242, 239, 231, 0.35);
+}
+
+.debug-table-empty {
+  color: var(--muted);
+  text-align: center;
+}
+
+.debug-led-table td:nth-child(2),
+.debug-led-table td:nth-child(3),
+.debug-led-table td:nth-child(4) {
+  text-align: center;
+}
+
+.debug-led {
+  display: inline-block;
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 4px rgba(107, 116, 111, 0.12);
+}
+
+.debug-led.active {
+  background: var(--healthy);
+  box-shadow: 0 0 10px rgba(115, 169, 66, 0.5), 0 0 0 4px rgba(115, 169, 66, 0.12);
+}
+
+.debug-led.idle {
+  background: #394640;
+  box-shadow: 0 0 0 4px rgba(57, 70, 64, 0.12);
+}
+
+.debug-led.unknown {
+  background: var(--signal);
+  box-shadow: 0 0 10px rgba(228, 86, 43, 0.35), 0 0 0 4px rgba(228, 86, 43, 0.12);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -830,8 +1147,14 @@ a:focus-visible {
   }
 
   .board-layout,
-  .settings-panel {
+  .settings-panel,
+  .debug-overview,
+  .debug-grid {
     grid-template-columns: 1fr;
+  }
+
+  .debug-faceplate-grid {
+    min-width: 62rem;
   }
 
   .operations-rail {
@@ -898,6 +1221,10 @@ a:focus-visible {
 
   .program-picker {
     grid-template-columns: 1fr;
+  }
+
+  .debug-table {
+    table-layout: auto;
   }
 
 }
