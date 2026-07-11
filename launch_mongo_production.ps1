@@ -28,17 +28,28 @@ if ($userPath) {
 Remove-Item Env:Path -ErrorAction SilentlyContinue
 $env:Path = $cleanPath
 
+# Uvicorn can create a worker process on Windows, leaving the PID file pointing
+# at its venv parent. netstat reliably exposes the actual port owner here.
+$processIds = [System.Collections.Generic.HashSet[int]]::new()
 if (Test-Path -LiteralPath $PidFile) {
     $previousPid = Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue
     if ($previousPid -match '^\d+$') {
-        Stop-Process -Id ([int]$previousPid) -Force -ErrorAction SilentlyContinue
+        [void]$processIds.Add([int]$previousPid)
     }
     Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
 }
 
-$existingListener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
-if ($existingListener) {
-    throw "Port 8000 is already used by process $($existingListener.OwningProcess). Stop that process and try again."
+& netstat.exe -ano -p tcp |
+    Select-String -Pattern '^\s*TCP\s+\S+:8000\s+\S+\s+LISTENING\s+(\d+)\s*$' |
+    ForEach-Object {
+        [void]$processIds.Add([int]$_.Matches[0].Groups[1].Value)
+    }
+
+foreach ($processId in $processIds) {
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+}
+if ($processIds.Count -gt 0) {
+    Start-Sleep -Milliseconds 500
 }
 
 $process = Start-Process `

@@ -1,5 +1,7 @@
 from collections.abc import Generator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import os
 from pathlib import Path
 import subprocess
 
@@ -47,6 +49,7 @@ from app.settings import settings
 
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_ROOT = STATIC_DIR.parent.parent
+STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
 def queue_backend_relaunch() -> None:
@@ -54,13 +57,16 @@ def queue_backend_relaunch() -> None:
     subprocess.Popen(
         [
             "powershell.exe",
+            "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
             str(helper),
         ],
         cwd=PROJECT_ROOT,
-        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        # A separate process group survives the current Uvicorn worker. Using
+        # DETACHED_PROCESS here prevented PowerShell from executing on Windows.
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
     )
 
 
@@ -85,6 +91,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
     )
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    @application.middleware("http")
+    async def prevent_stale_frontend_assets(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path in {"/", "/settings", "/debugging"} or path.endswith((".js", ".css")):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
     def get_session(request: Request) -> Generator[Session, None, None]:
         with request.app.state.session_factory() as session:
             yield session
@@ -102,8 +116,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return FileResponse(STATIC_DIR / "debugging.html")
 
     @application.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+    def health() -> dict:
+        return {
+            "status": "ok",
+            "version": __version__,
+            "process_id": os.getpid(),
+            "started_at": STARTED_AT,
+        }
 
     @application.get("/api/board")
     def get_board(session: Session = Depends(get_session)) -> dict:

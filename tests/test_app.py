@@ -5,12 +5,18 @@ from app.main import create_app
 
 def test_health_and_pages(client: TestClient) -> None:
     response = client.get("/api/health")
+    payload = response.json()
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "version": "0.3.0"}
+    assert payload["status"] == "ok"
+    assert payload["version"] == "0.3.0"
+    assert isinstance(payload["process_id"], int)
+    assert payload["started_at"]
     assert "Pallet schedule" in client.get("/").text
     assert "Robot readable I/O" in client.get("/debugging").text
-    assert "Scheduling settings" in client.get("/settings").text
+    settings_page = client.get("/settings").text
+    assert "Scheduling settings" in settings_page
+    assert "Close and relaunch" in settings_page
 
 
 def test_initial_board(client: TestClient) -> None:
@@ -34,6 +40,63 @@ def test_initial_board(client: TestClient) -> None:
         ".cnc",
         ".urp",
     ]
+    assert board["settings"]["manual_io_control_enabled"] is False
+
+
+def test_settings_update_persists_manual_io_control(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "debug_menu_enabled": board["settings"]["debug_menu_enabled"],
+            "manual_io_control_enabled": True,
+            "robot_connection_mode": board["settings"]["robot_connection_mode"],
+            "robot_host": board["settings"]["robot_host"],
+            "robot_port": board["settings"]["robot_port"],
+            "robot_poll_hz": board["settings"]["robot_poll_hz"],
+            "robot_timeout_seconds": board["settings"]["robot_timeout_seconds"],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["board"]["settings"]["manual_io_control_enabled"] is True
+    assert client.get("/api/settings").json()["settings"]["manual_io_control_enabled"] is True
+
+
+def test_legacy_settings_save_does_not_reset_manual_io_control(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+    enabled = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "manual_io_control_enabled": True,
+        },
+    ).json()["board"]
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": enabled["revision"],
+            "source_folder": enabled["settings"]["source_folder"],
+            "program_extensions": enabled["settings"]["program_extensions"],
+            "weight_unit": enabled["settings"]["weight_unit"],
+            "pool_slot_count": enabled["settings"]["pool_slot_count"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["board"]["settings"]["manual_io_control_enabled"] is True
 
 
 def test_debug_robot_io_snapshot_defaults_to_unavailable(client: TestClient) -> None:

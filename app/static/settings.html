@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <script src="/static/settings.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260711-2">
+    <script src="/static/settings.js?v=20260711-2" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -46,7 +46,7 @@
             </label>
             <label>
               Allowed extensions
-              <input id="program-extensions" placeholder=".nc, .tap, .gcode, .cnc, .urp" required>
+              <input id="program-extensions" placeholder=".nc, .tap, .gcode, .cnc, .urp">
             </label>
             <p class="field-help">Subfolders are scanned recursively. Program headers are not parsed yet.</p>
           </div>
@@ -73,6 +73,13 @@
                 <small>Shows a fixed signal panel on the Schedule page.</small>
               </span>
             </label>
+            <label class="checkbox-control">
+              <input id="manual-io-control-enabled" type="checkbox">
+              <span>
+                Unlock manual I/O control
+                <small>Allows output LEDs on the Debugging page to write to the configured physical robot. Press Save settings to apply this change. Locked by default.</small>
+              </span>
+            </label>
           </div>
         </section>
 
@@ -97,17 +104,17 @@
               </label>
               <label>
                 RTDE port
-                <input id="robot-port" type="number" min="1" max="65535" step="1" required>
+                <input id="robot-port" type="number" min="1" max="65535" step="1">
               </label>
             </div>
             <div class="form-row">
               <label>
                 Poll rate (Hz)
-                <input id="robot-poll-hz" type="number" min="1" max="125" step="1" required>
+                <input id="robot-poll-hz" type="number" min="1" max="125" step="1">
               </label>
               <label>
                 Timeout (seconds)
-                <input id="robot-timeout-seconds" type="number" min="0.1" max="10" step="0.1" required>
+                <input id="robot-timeout-seconds" type="number" min="0.1" max="10" step="0.1">
               </label>
             </div>
             <p class="field-help" id="robot-connection-help">Simulated mode allows manual input/output toggles on the Debugging page. Physical mode reads only live RTDE data from the configured robot.</p>
@@ -123,7 +130,7 @@
           <div class="panel-fields">
             <label>
               Number of pool positions
-              <input id="pool-slot-count" type="number" min="1" max="256" step="1" required>
+              <input id="pool-slot-count" type="number" min="1" max="256" step="1">
             </label>
             <p class="field-help">Default: 16. Occupied positions must be cleared before reducing this number below them.</p>
           </div>
@@ -134,8 +141,23 @@
           <button class="button secondary" id="relaunch-system" type="button">Close and relaunch</button>
           <button class="button primary" type="submit">Save settings</button>
         </div>
+        <div class="relaunch-status hidden" id="relaunch-status" role="status" aria-live="polite"></div>
       </form>
     </main>
+    <div class="modal-shell hidden" id="unsaved-modal" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
+      <div class="dialog-card">
+        <div class="dialog-header">
+          <p class="eyebrow">Unsaved changes</p>
+          <h2 id="unsaved-title">Save settings before leaving?</h2>
+        </div>
+        <p>Your pending settings changes have not been saved yet.</p>
+        <div class="dialog-actions">
+          <button class="button ghost" id="unsaved-cancel" type="button">Stay here</button>
+          <button class="button secondary" id="unsaved-discard" type="button">Leave without saving</button>
+          <button class="button primary" id="unsaved-save" type="button">Save and continue</button>
+        </div>
+      </div>
+    </div>
     <div class="toast hidden" id="toast" role="status"></div>
   </body>
 </html>

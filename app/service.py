@@ -14,7 +14,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.models import AppSettings, Pallet
 from app.pallet_names import PALLET_NAMES
-from app.robot_rtde import RobotTelemetryError, read_robot_snapshot
+from app.robot_rtde import RobotTelemetryError, read_robot_snapshot, toggle_robot_digital_output
 from app.schemas import (
     CreatePallet,
     MovePallet,
@@ -118,6 +118,7 @@ def board_snapshot(session: Session) -> dict:
             "weight_unit": settings.weight_unit,
             "pool_slot_count": settings.pool_slot_count,
             "debug_menu_enabled": settings.debug_menu_enabled,
+            "manual_io_control_enabled": settings.manual_io_control_enabled,
             "machine_state": settings.machine_state,
             "robot_connection_mode": settings.robot_connection_mode,
             "robot_host": settings.robot_host,
@@ -207,6 +208,10 @@ def _apply_debug_labels(snapshot: dict, settings: AppSettings) -> dict:
                     else None
                 )
                 custom = labels.get(key) if key else None
+                if not settings.manual_io_control_enabled:
+                    row["writable"] = False
+                elif settings.robot_connection_mode == "physical":
+                    row["writable"] = direction == "output" and row.get("value") is not None
                 row["label_key"] = key
                 row["label"] = custom or row.get("channel")
                 row["custom_label"] = custom
@@ -775,6 +780,8 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     settings.weight_unit = payload.weight_unit
     settings.pool_slot_count = payload.pool_slot_count
     settings.debug_menu_enabled = payload.debug_menu_enabled
+    if payload.manual_io_control_enabled is not None:
+        settings.manual_io_control_enabled = payload.manual_io_control_enabled
     settings.robot_connection_mode = payload.robot_connection_mode
     settings.robot_host = payload.robot_host
     settings.robot_port = payload.robot_port
@@ -791,26 +798,33 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
 def toggle_debug_io(session: Session, payload: ToggleDebugIo) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    if not settings.debug_menu_enabled:
-        raise problem(403, "Debug simulation is disabled in Settings.")
+    if not settings.manual_io_control_enabled:
+        raise problem(403, "Manual I/O control is locked in Settings.")
 
     if payload.bank == "tool" and payload.index > 1:
         raise problem(422, "Tool I/O indices only allow 0 or 1.")
 
-    if settings.robot_host.strip():
+    if settings.robot_connection_mode == "physical":
+        if payload.direction != "output":
+            raise problem(409, "Physical robot inputs are read-only.")
+        if not settings.robot_host.strip():
+            raise problem(409, "Physical robot mode requires a configured robot host.")
         try:
-            read_robot_snapshot(
+            toggle_robot_digital_output(
                 settings.robot_host.strip(),
                 settings.robot_port,
-                settings.robot_poll_hz,
                 settings.robot_timeout_seconds,
+                payload.bank,
+                payload.index,
             )
-            raise problem(409, "Physical robot mode is active. Digital toggles only apply in simulated mode.")
-        except RobotTelemetryError:
-            pass
+        except RobotTelemetryError as exc:
+            raise problem(502, f"Could not toggle physical robot output: {exc}") from exc
+        bump(settings)
+        commit_or_conflict(session)
+        return
 
-    if settings.robot_connection_mode != "simulated":
-        raise problem(409, "Digital toggles only apply in simulated robot mode.")
+    if not settings.debug_menu_enabled:
+        raise problem(403, "Enable the debug simulator before changing simulated I/O.")
 
     attribute_name = f"debug_{payload.bank}_{payload.direction}_mask"
     current_mask = getattr(settings, attribute_name)

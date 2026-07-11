@@ -73,6 +73,9 @@ class SettingsUpdate(RevisionRequest):
     weight_unit: WeightUnit
     pool_slot_count: int = Field(ge=1, le=256)
     debug_menu_enabled: bool = False
+    # Older cached Settings pages did not send this field. Keep it optional so
+    # those pages cannot silently re-lock an operator's saved I/O permission.
+    manual_io_control_enabled: bool | None = None
     robot_connection_mode: RobotConnectionMode = "simulated"
     robot_host: str = Field(default="", max_length=255)
     robot_port: int = Field(default=30004, ge=1, le=65535)

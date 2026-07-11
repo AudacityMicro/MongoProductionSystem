@@ -20,6 +20,7 @@ class AppSettings(Base):
     weight_unit: Mapped[str] = mapped_column(String, default="lb")
     pool_slot_count: Mapped[int] = mapped_column(Integer, default=16)
     debug_menu_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    manual_io_control_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     machine_state: Mapped[str] = mapped_column(String(20), default="idle")
     robot_connection_mode: Mapped[str] = mapped_column(String(20), default="simulated")
     robot_host: Mapped[str] = mapped_column(String(255), default="")

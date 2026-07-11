@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import socket
+import struct
+from threading import RLock
 from typing import Any
 
 try:
@@ -83,6 +86,21 @@ CORE_OUTPUT_RECIPE = [
     "safety_mode",
     "runtime_state",
 ]
+
+LEGACY_OUTPUT_RECIPE = [
+    "timestamp",
+    "actual_digital_input_bits",
+    "actual_digital_output_bits",
+    "robot_mode",
+    "safety_mode",
+]
+
+
+_LIVE_CONNECTION_LOCK = RLock()
+_LIVE_CONNECTION: Any | None = None
+_LIVE_CONNECTION_KEY: tuple[str, int, int] | None = None
+_LIVE_CONTROLLER_VERSION: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
+_LIVE_RECIPE: list[str] = []
 
 
 @dataclass
@@ -169,46 +187,279 @@ def _read_attr(sample: Any, name: str) -> Any:
     return getattr(sample, name, None)
 
 
-def _connect_and_sample(host: str, port: int, poll_hz: int, timeout_seconds: float) -> tuple[Any, tuple[int | None, int | None, int | None, int | None], list[str]]:
+def _read_modbus_registers(
+    host: str,
+    address: int,
+    count: int,
+    timeout_seconds: float,
+) -> list[int]:
+    """Read controller-owned Modbus holding registers without writing."""
+    transaction_id = address + 1
+    pdu = struct.pack(">BHH", 3, address, count)  # Read Holding Registers.
+    request = struct.pack(">HHHB", transaction_id, 0, len(pdu) + 1, 0) + pdu
+    with socket.create_connection((host, 502), timeout=timeout_seconds) as connection:
+        connection.settimeout(timeout_seconds)
+        connection.sendall(request)
+        response = b""
+        expected_length = 9 + (count * 2)
+        while len(response) < expected_length:
+            chunk = connection.recv(expected_length - len(response))
+            if not chunk:
+                break
+            response += chunk
+    if (
+        len(response) != expected_length
+        or response[7] != 3
+        or response[8] != count * 2
+    ):
+        raise RobotTelemetryError("The robot returned an invalid Modbus I/O response.")
+    return list(struct.unpack(f">{count}H", response[9:]))
+
+
+def _read_modbus_register(host: str, address: int, timeout_seconds: float) -> int:
+    return _read_modbus_registers(host, address, 1, timeout_seconds)[0]
+
+
+def _write_modbus_register(host: str, address: int, value: int, timeout_seconds: float) -> None:
+    transaction_id = address + 101
+    pdu = struct.pack(">BHH", 6, address, value)  # Write Single Register.
+    request = struct.pack(">HHHB", transaction_id, 0, len(pdu) + 1, 0) + pdu
+    with socket.create_connection((host, 502), timeout=timeout_seconds) as connection:
+        connection.settimeout(timeout_seconds)
+        connection.sendall(request)
+        response = connection.recv(260)
+    if len(response) != 12 or response[7] != 6 or response[8:] != pdu[1:]:
+        raise RobotTelemetryError("The robot rejected the Modbus output write.")
+
+
+def toggle_robot_digital_output(
+    host: str,
+    port: int,
+    timeout_seconds: float,
+    bank: str,
+    index: int,
+) -> None:
+    """Toggle one physical digital output through the controller Modbus server."""
+    del port  # RTDE port is configured separately; the Modbus server is always TCP 502.
+    if bank == "standard":
+        register, bit = 1, index
+    elif bank == "configurable":
+        register, bit = 31, index
+    elif bank == "tool":
+        register, bit = 1, index + 8
+    else:
+        raise RobotTelemetryError(f"Unknown digital output bank: {bank}")
+
+    if not 0 <= index <= (1 if bank == "tool" else 7):
+        raise RobotTelemetryError(f"Invalid {bank} output index: {index}")
+
+    current_value = _read_modbus_register(host, register, timeout_seconds)
+    _write_modbus_register(host, register, current_value ^ (1 << bit), timeout_seconds)
+
+
+def _read_legacy_controller_io(host: str, timeout_seconds: float) -> dict[int, int]:
+    # UR CB-series Modbus registers 0/1 are standard input/output and 30/31
+    # are configurable input/output. This avoids RTDE v1's unreliable masks.
+    addresses = (0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 30, 31)
+    return {
+        address: _read_modbus_register(host, address, timeout_seconds)
+        for address in addresses
+    }
+
+
+def _install_protocol_fallback() -> None:
+    if rtde_client is None:
+        return
+
+    if getattr(rtde_client.RTDE, "_mongo_rtde_compat_installed", False):
+        return
+
+    def negotiate_protocol_version(self: Any) -> bool:
+        for version in (
+            rtde_client.RTDE_PROTOCOL_VERSION_2,
+            rtde_client.RTDE_PROTOCOL_VERSION_1,
+        ):
+            payload = struct.pack(">H", version)
+            success = self._RTDE__sendAndReceive(  # noqa: SLF001 - UR client has no public hook.
+                rtde_client.Command.RTDE_REQUEST_PROTOCOL_VERSION,
+                payload,
+            )
+            if success:
+                self._RTDE__protocolVersion = version  # noqa: SLF001
+                return True
+        return False
+
+    rtde_client.RTDE.negotiate_protocol_version = negotiate_protocol_version
+
+    original_output_setup = rtde_client.RTDE.send_output_setup
+    original_unpack_output_setup = rtde_client.RTDE._RTDE__unpack_setup_outputs_package
+    original_unpack_data = rtde_client.RTDE._RTDE__unpack_data_package
+
+    def unpack_output_setup(self: Any, payload: bytes) -> Any:
+        if self._RTDE__protocolVersion != rtde_client.RTDE_PROTOCOL_VERSION_1:  # noqa: SLF001
+            return original_unpack_output_setup(self, payload)
+        if not payload:
+            return None
+        # v1 replies with just the comma-separated types, while the client's
+        # generic decoder expects an initial recipe-id byte (a v2 addition).
+        return rtde_client.serialize.DataConfig.unpack_recipe(b"\x00" + payload)
+
+    rtde_client.RTDE._RTDE__unpack_setup_outputs_package = unpack_output_setup
+
+    def unpack_data(self: Any, payload: bytes, output_config: Any) -> Any:
+        if self._RTDE__protocolVersion != rtde_client.RTDE_PROTOCOL_VERSION_1:  # noqa: SLF001
+            return original_unpack_data(self, payload, output_config)
+        if output_config is None:
+            return None
+        # v1 data packets have no recipe-id byte. Decode each configured field
+        # directly rather than using the v2 DataObject.unpack helper.
+        sample = rtde_client.serialize.DataObject()
+        sample.recipe_id = 0
+        offset = 0
+        for name, field_type in zip(output_config.names, output_config.types, strict=True):
+            sample.__dict__[name] = rtde_client.serialize.unpack_field(payload, offset, field_type)
+            offset += rtde_client.serialize.get_item_size(field_type)
+        return sample
+
+    rtde_client.RTDE._RTDE__unpack_data_package = unpack_data
+
+    def send_output_setup(
+        self: Any,
+        variables: list[str],
+        types: list[str] | None = None,
+        frequency: int = 125,
+    ) -> bool:
+        if self._RTDE__protocolVersion != rtde_client.RTDE_PROTOCOL_VERSION_1:  # noqa: SLF001
+            return original_output_setup(self, variables, types or [], frequency)
+
+        # Protocol v1 (used by the installed PolyScope 3.2 controller) accepts
+        # only comma-separated field names. Frequency was added in v2.
+        result = self._RTDE__sendAndReceive(  # noqa: SLF001
+            rtde_client.Command.RTDE_CONTROL_PACKAGE_SETUP_OUTPUTS,
+            ",".join(variables).encode("utf-8"),
+        )
+        if result is None:
+            return False
+        requested_types = types or []
+        if requested_types and result.types != requested_types:
+            return False
+        result.names = variables
+        self._RTDE__output_config = result  # noqa: SLF001
+        return True
+
+    rtde_client.RTDE.send_output_setup = send_output_setup
+    rtde_client.RTDE._mongo_rtde_compat_installed = True
+
+
+def _disconnect_live_connection() -> None:
+    global _LIVE_CONNECTION, _LIVE_CONNECTION_KEY, _LIVE_RECIPE
+
+    if _LIVE_CONNECTION is not None:
+        try:
+            _LIVE_CONNECTION.send_pause()
+        except Exception:
+            pass
+        try:
+            _LIVE_CONNECTION.disconnect()
+        except Exception:
+            pass
+    _LIVE_CONNECTION = None
+    _LIVE_CONNECTION_KEY = None
+    _LIVE_RECIPE = []
+
+
+def _open_live_connection(
+    host: str,
+    port: int,
+    poll_hz: int,
+    timeout_seconds: float,
+) -> tuple[Any, tuple[int | None, int | None, int | None, int | None], list[str]]:
     if rtde_client is None:
         raise RobotTelemetryError("The RTDE Python client library is not installed.")
 
+    _install_protocol_fallback()
     original_timeout = rtde_client.DEFAULT_TIMEOUT
     rtde_client.DEFAULT_TIMEOUT = timeout_seconds
     try:
         connection = rtde_client.RTDE(host, port)
         connection.connect()
         try:
-            controller_version = connection.get_controller_version()
             recipe_used: list[str] | None = None
-            for recipe in (FULL_OUTPUT_RECIPE, MID_OUTPUT_RECIPE, CORE_OUTPUT_RECIPE):
-                if connection.send_output_setup(recipe, frequency=poll_hz):
-                    recipe_used = recipe
-                    break
+            recipes = (
+                (LEGACY_OUTPUT_RECIPE, CORE_OUTPUT_RECIPE, MID_OUTPUT_RECIPE, FULL_OUTPUT_RECIPE)
+                if connection._RTDE__protocolVersion == rtde_client.RTDE_PROTOCOL_VERSION_1  # noqa: SLF001
+                else (FULL_OUTPUT_RECIPE, MID_OUTPUT_RECIPE, CORE_OUTPUT_RECIPE, LEGACY_OUTPUT_RECIPE)
+            )
+            for recipe in recipes:
+                try:
+                    if connection.send_output_setup(recipe, frequency=poll_hz):
+                        recipe_used = recipe
+                        break
+                except (ValueError, TypeError):
+                    # The controller replies NOT_FOUND for unsupported fields.
+                    # Keep trying smaller recipes instead of failing the page.
+                    continue
             if recipe_used is None:
                 raise RobotTelemetryError(
                     "The robot rejected the RTDE output recipe. Check controller RTDE support."
                 )
             if not connection.send_start():
                 raise RobotTelemetryError("The robot refused to start RTDE data synchronization.")
-
-            sample = None
-            for _ in range(3):
-                sample = connection.receive()
-                if sample is not None:
-                    break
-            connection.send_pause()
-            if sample is None:
-                raise RobotTelemetryError("No RTDE sample was received before timeout.")
-            return sample, controller_version, recipe_used
-        finally:
+            return connection, (None, None, None, None), recipe_used
+        except Exception:
             connection.disconnect()
+            raise
     except Exception as exc:  # pragma: no cover - exercised via endpoint behavior
         if isinstance(exc, RobotTelemetryError):
             raise
         raise RobotTelemetryError(str(exc)) from exc
     finally:
         rtde_client.DEFAULT_TIMEOUT = original_timeout
+
+
+def _connect_and_sample(host: str, port: int, poll_hz: int, timeout_seconds: float) -> tuple[Any, tuple[int | None, int | None, int | None, int | None], list[str]]:
+    global _LIVE_CONNECTION, _LIVE_CONNECTION_KEY, _LIVE_CONTROLLER_VERSION, _LIVE_RECIPE
+
+    if rtde_client is None:
+        raise RobotTelemetryError("The RTDE Python client library is not installed.")
+
+    key = (host, port, poll_hz)
+    with _LIVE_CONNECTION_LOCK:
+        if _LIVE_CONNECTION is None or _LIVE_CONNECTION_KEY != key:
+            _disconnect_live_connection()
+            (
+                _LIVE_CONNECTION,
+                _LIVE_CONTROLLER_VERSION,
+                _LIVE_RECIPE,
+            ) = _open_live_connection(host, port, poll_hz, timeout_seconds)
+            _LIVE_CONNECTION_KEY = key
+
+        original_timeout = rtde_client.DEFAULT_TIMEOUT
+        rtde_client.DEFAULT_TIMEOUT = timeout_seconds
+        try:
+            sample = _LIVE_CONNECTION.receive()
+            # Protocol v1 streams at the controller's fixed rate. The UI polls
+            # far more slowly, so discard buffered history and report the most
+            # recent packet instead of replaying stale I/O transitions.
+            while True:
+                buffered = _LIVE_CONNECTION._RTDE__recv_from_buffer(  # noqa: SLF001
+                    rtde_client.Command.RTDE_DATA_PACKAGE,
+                )
+                if buffered is not None:
+                    sample = buffered
+                    continue
+                if not _LIVE_CONNECTION._RTDE__recv_to_buffer(0):  # noqa: SLF001
+                    break
+            if sample is None:
+                raise RobotTelemetryError("No RTDE sample was received before timeout.")
+            return sample, _LIVE_CONTROLLER_VERSION, _LIVE_RECIPE
+        except Exception as exc:
+            _disconnect_live_connection()
+            if isinstance(exc, RobotTelemetryError):
+                raise
+            raise RobotTelemetryError(str(exc)) from exc
+        finally:
+            rtde_client.DEFAULT_TIMEOUT = original_timeout
 
 
 def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: float) -> dict[str, Any]:
@@ -220,8 +471,43 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
     )
     digital_inputs = _read_attr(sample, "actual_digital_input_bits")
     digital_outputs = _read_attr(sample, "actual_digital_output_bits")
+    configurable_inputs: int | None = None
+    configurable_outputs: int | None = None
+    legacy_registers: dict[int, int] | None = None
+    legacy_standard_io = recipe_used == LEGACY_OUTPUT_RECIPE
+    if legacy_standard_io:
+        try:
+            legacy_registers = _read_legacy_controller_io(host, timeout_seconds)
+            digital_inputs = legacy_registers[0]
+            digital_outputs = legacy_registers[1]
+            configurable_inputs = legacy_registers[30]
+            configurable_outputs = legacy_registers[31]
+        except RobotTelemetryError:
+            legacy_standard_io = False
     analog_modes = _read_attr(sample, "analog_io_types")
     tool_analog_modes = _read_attr(sample, "tool_analog_input_types")
+    analog_inputs = [
+        _analog_row("AI0", "Standard analog input 0", _read_attr(sample, "standard_analog_input0"), analog_modes, 0),
+        _analog_row("AI1", "Standard analog input 1", _read_attr(sample, "standard_analog_input1"), analog_modes, 1),
+        _analog_row("TAI0", "Tool analog input 0", _read_attr(sample, "tool_analog_input0"), tool_analog_modes, 0),
+        _analog_row("TAI1", "Tool analog input 1", _read_attr(sample, "tool_analog_input1"), tool_analog_modes, 1),
+    ]
+    analog_outputs = [
+        _analog_row("AO0", "Standard analog output 0", _read_attr(sample, "standard_analog_output0"), analog_modes, 2),
+        _analog_row("AO1", "Standard analog output 1", _read_attr(sample, "standard_analog_output1"), analog_modes, 3),
+    ]
+    if legacy_registers is not None:
+        domain = lambda value: "voltage" if value else "current"
+        analog_inputs = [
+            _analog_row("AI0", f"Standard analog input 0 ({domain(legacy_registers[5])}, raw)", legacy_registers[4], legacy_registers[5]),
+            _analog_row("AI1", f"Standard analog input 1 ({domain(legacy_registers[7])}, raw)", legacy_registers[6], legacy_registers[7]),
+            _analog_row("TAI0", f"Tool analog input 0 ({domain(legacy_registers[9])}, raw)", legacy_registers[8], legacy_registers[9]),
+            _analog_row("TAI1", f"Tool analog input 1 ({domain(legacy_registers[11])}, raw)", legacy_registers[10], legacy_registers[11]),
+        ]
+        analog_outputs = [
+            _analog_row("AO0", f"Standard analog output 0 ({domain(legacy_registers[17])}, raw)", legacy_registers[16], legacy_registers[17]),
+            _analog_row("AO1", f"Standard analog output 1 ({domain(legacy_registers[19])}, raw)", legacy_registers[18], legacy_registers[19]),
+        ]
     sample_values = dict(getattr(sample, "__dict__", {}))
 
     handled_vector_fields = {
@@ -265,11 +551,25 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
             },
             {
                 "title": "Configurable inputs",
-                "rows": _bit_rows(digital_inputs, "CI", 8, 8, direction="input", bank="configurable"),
+                "rows": _bit_rows(
+                    configurable_inputs if legacy_standard_io else digital_inputs,
+                    "CI",
+                    8,
+                    0 if legacy_standard_io else 8,
+                    direction="input",
+                    bank="configurable",
+                ),
             },
             {
                 "title": "Tool inputs",
-                "rows": _bit_rows(digital_inputs, "TI", 2, 16, direction="input", bank="tool"),
+                "rows": _bit_rows(
+                    digital_inputs,
+                    "TI",
+                    2,
+                    8 if legacy_standard_io else 16,
+                    direction="input",
+                    bank="tool",
+                ),
             },
         ],
         "digital_output_groups": [
@@ -279,59 +579,29 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
             },
             {
                 "title": "Configurable outputs",
-                "rows": _bit_rows(digital_outputs, "CO", 8, 8, direction="output", bank="configurable"),
+                "rows": _bit_rows(
+                    configurable_outputs if legacy_standard_io else digital_outputs,
+                    "CO",
+                    8,
+                    0 if legacy_standard_io else 8,
+                    direction="output",
+                    bank="configurable",
+                ),
             },
             {
                 "title": "Tool outputs",
-                "rows": _bit_rows(digital_outputs, "TO", 2, 16, direction="output", bank="tool"),
+                "rows": _bit_rows(
+                    digital_outputs,
+                    "TO",
+                    2,
+                    8 if legacy_standard_io else 16,
+                    direction="output",
+                    bank="tool",
+                ),
             },
         ],
-        "analog_inputs": [
-            _analog_row(
-                "AI0",
-                "Standard analog input 0",
-                _read_attr(sample, "standard_analog_input0"),
-                analog_modes,
-                0,
-            ),
-            _analog_row(
-                "AI1",
-                "Standard analog input 1",
-                _read_attr(sample, "standard_analog_input1"),
-                analog_modes,
-                1,
-            ),
-            _analog_row(
-                "TAI0",
-                "Tool analog input 0",
-                _read_attr(sample, "tool_analog_input0"),
-                tool_analog_modes,
-                0,
-            ),
-            _analog_row(
-                "TAI1",
-                "Tool analog input 1",
-                _read_attr(sample, "tool_analog_input1"),
-                tool_analog_modes,
-                1,
-            ),
-        ],
-        "analog_outputs": [
-            _analog_row(
-                "AO0",
-                "Standard analog output 0",
-                _read_attr(sample, "standard_analog_output0"),
-                analog_modes,
-                2,
-            ),
-            _analog_row(
-                "AO1",
-                "Standard analog output 1",
-                _read_attr(sample, "standard_analog_output1"),
-                analog_modes,
-                3,
-            ),
-        ],
+        "analog_inputs": analog_inputs,
+        "analog_outputs": analog_outputs,
         "state_rows": [
             {"label": "Robot mode", "value": _read_attr(sample, "robot_mode")},
             {"label": "Safety mode", "value": _read_attr(sample, "safety_mode")},
@@ -356,5 +626,10 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
             ["Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"],
         ),
         "extra_actual_rows": extra_actual_rows,
-        "notes": "Reading live robot telemetry over RTDE port 30004.",
+        "notes": (
+            "Reading standard digital I/O from the controller Modbus server and live telemetry over RTDE. "
+            "Configurable I/O is read from the controller's dedicated Modbus registers."
+            if legacy_standard_io
+            else "Reading live robot telemetry over RTDE port 30004."
+        ),
     }

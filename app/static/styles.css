@@ -221,6 +221,35 @@ p {
   background: var(--danger);
 }
 
+.modal-shell {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(23, 33, 29, 0.42);
+  backdrop-filter: blur(4px);
+}
+
+.dialog-card {
+  width: min(34rem, 100%);
+  padding: 1.4rem;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.dialog-header {
+  margin-bottom: 0.9rem;
+}
+
+.dialog-header h2 {
+  margin-bottom: 0;
+  font-size: clamp(1.6rem, 4vw, 2.4rem);
+  line-height: 0.96;
+}
+
 .notice {
   margin-bottom: 1.25rem;
   padding: 0.9rem 1rem;
@@ -816,6 +845,29 @@ a:focus-visible {
   justify-content: flex-end;
   padding-top: 2rem;
   border-top: 1px solid var(--ink);
+}
+
+.relaunch-status {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  font-weight: 700;
+}
+
+.relaunch-status.working {
+  border-color: var(--warning);
+  background: #fff3d7;
+}
+
+.relaunch-status.success {
+  border-color: var(--healthy);
+  background: #eef8e5;
+}
+
+.relaunch-status.error {
+  border-color: var(--danger);
+  background: #ffe6e2;
 }
 
 .debug-overview {
