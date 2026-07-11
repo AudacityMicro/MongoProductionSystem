@@ -224,6 +224,135 @@ def test_rename_debug_io_updates_label(client: TestClient) -> None:
     assert row["label_key"] == "input:standard:4"
 
 
+def test_debug_program_button_configuration_persists(client: TestClient) -> None:
+    board = client.get("/api/board").json()
+
+    response = client.post(
+        "/api/debug/programs/configure",
+        json={
+            "expected_revision": board["revision"],
+            "index": 1,
+            "display_name": "Inspect part",
+            "filename": "/programs/inspect.urp",
+            "color": "cyan",
+        },
+    )
+
+    assert response.status_code == 200
+    button = response.json()["program_controls"]["buttons"][1]
+    assert button["display_name"] == "Inspect part"
+    assert button["filename"] == "/programs/inspect.urp"
+    assert button["color"] == "cyan"
+
+
+def test_debug_program_button_rejects_mill_program_extension(client: TestClient) -> None:
+    board = client.get("/api/debug/robot-io").json()
+
+    response = client.post(
+        "/api/debug/programs/configure",
+        json={
+            "expected_revision": board["revision"],
+            "index": 0,
+            "display_name": "Mill cycle",
+            "filename": "/programs/mill_cycle.nc",
+            "color": "green",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Robot program extensions" in response.json()["detail"]
+
+
+def test_debug_program_run_uses_dashboard(client: TestClient, monkeypatch) -> None:
+    board = client.get("/api/board").json()
+    board = client.post(
+        "/api/debug/programs/configure",
+        json={
+            "expected_revision": board["revision"],
+            "index": 0,
+            "display_name": "Cycle start",
+            "filename": "/programs/cycle.urp",
+            "color": "green",
+        },
+    ).json()
+    board = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+            "robot_port": 30004,
+            "robot_poll_hz": 10,
+            "robot_timeout_seconds": 1.0,
+        },
+    ).json()["board"]
+    called = {}
+    monkeypatch.setattr(
+        "app.service.run_robot_program",
+        lambda *args: called.update(args=args),
+    )
+    monkeypatch.setattr("app.service.read_robot_snapshot", lambda *args: {"robot": {}})
+    monkeypatch.setattr("app.service.loaded_robot_program", lambda *args: None)
+
+    response = client.post(
+        "/api/debug/programs/run",
+        json={"expected_revision": board["revision"], "index": 0},
+    )
+
+    assert response.status_code == 200
+    assert called["args"] == ("192.168.0.10", "/programs/cycle.urp", 1.0)
+
+
+def test_robot_program_files_use_configured_sftp(client: TestClient, monkeypatch) -> None:
+    board = client.get("/api/board").json()
+    board = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".urp", ".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+            "robot_port": 30004,
+            "robot_poll_hz": 10,
+            "robot_timeout_seconds": 1.5,
+            "robot_file_access_enabled": True,
+            "robot_file_host": "",
+            "robot_file_port": 22,
+            "robot_file_username": "robot",
+            "robot_file_password": "secret",
+            "robot_file_directory": "/programs",
+            "robot_program_extensions": [".urp"],
+        },
+    ).json()["board"]
+    called = {}
+    monkeypatch.setattr(
+        "app.service.list_robot_program_files",
+        lambda **kwargs: called.update(kwargs) or ["/programs/open.urp"],
+    )
+
+    response = client.get("/api/debug/programs/files")
+
+    assert response.status_code == 200
+    assert response.json() == {"files": ["/programs/open.urp"]}
+    assert called["host"] == "192.168.0.10"
+    assert called["port"] == 22
+    assert called["username"] == "robot"
+    assert called["directory"] == "/programs"
+    assert called["extensions"] == {".urp"}
+
+    response = client.get("/api/debug/programs/files?include_all=true")
+
+    assert response.status_code == 200
+    assert called["extensions"] is None
+
+
 def test_toggle_physical_output_requires_manual_io_unlock(client: TestClient) -> None:
     board = enable_debug(client, client.get("/api/board").json())
     result = client.put(

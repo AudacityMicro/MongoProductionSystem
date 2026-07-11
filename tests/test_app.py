@@ -99,17 +99,16 @@ def test_legacy_settings_save_does_not_reset_manual_io_control(client: TestClien
     assert response.json()["board"]["settings"]["manual_io_control_enabled"] is True
 
 
-def test_debug_robot_io_snapshot_defaults_to_unavailable(client: TestClient) -> None:
+def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> None:
     snapshot = client.get("/api/debug/robot-io").json()
 
-    assert snapshot["connected"] is False
-    assert snapshot["source"] == "unavailable"
+    assert snapshot["connected"] is True
     assert snapshot["machine_state"] == "idle"
     assert snapshot["summary"]["queue_count"] == 0
     assert snapshot["summary"]["pool_open_positions"] == 16
     assert snapshot["source"] == "simulated"
     assert snapshot["robot"]["mode"] == "simulated"
-    assert snapshot["digital_input_groups"][0]["rows"][0]["writable"] is True
+    assert snapshot["digital_input_groups"][0]["rows"][0]["writable"] is False
 
 
 def test_debug_robot_io_snapshot_uses_live_robot_reader_when_configured(

@@ -70,6 +70,42 @@ MID_OUTPUT_RECIPE = [
     "actual_q",
 ]
 
+MOTION_OUTPUT_RECIPE = [
+    "timestamp",
+    "actual_digital_input_bits",
+    "actual_digital_output_bits",
+    "robot_mode",
+    "safety_mode",
+    "runtime_state",
+    "actual_TCP_pose",
+    "actual_TCP_speed",
+    "actual_TCP_force",
+    "actual_q",
+    "actual_qd",
+    "actual_current",
+]
+
+POSE_OUTPUT_RECIPE = [
+    "timestamp",
+    "actual_digital_input_bits",
+    "actual_digital_output_bits",
+    "robot_mode",
+    "safety_mode",
+    "actual_TCP_pose",
+    "actual_TCP_speed",
+]
+
+JOINT_OUTPUT_RECIPE = [
+    "timestamp",
+    "actual_digital_input_bits",
+    "actual_digital_output_bits",
+    "robot_mode",
+    "safety_mode",
+    "actual_q",
+    "actual_qd",
+    "actual_current",
+]
+
 CORE_OUTPUT_RECIPE = [
     "timestamp",
     "actual_digital_input_bits",
@@ -181,6 +217,53 @@ def _flatten_named_vector(name: str, value: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _vector_component(value: Any, index: int) -> Any:
+    if not isinstance(value, (list, tuple)) or index >= len(value):
+        return None
+    return value[index]
+
+
+def _joint_detail_rows(sample: Any) -> list[dict[str, Any]]:
+    joint_names = ["Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"]
+    fields = {
+        "actual_position": _read_attr(sample, "actual_q"),
+        "actual_velocity": _read_attr(sample, "actual_qd"),
+        "actual_current": _read_attr(sample, "actual_current"),
+        "target_position": _read_attr(sample, "target_q"),
+        "target_velocity": _read_attr(sample, "target_qd"),
+        "target_current": _read_attr(sample, "target_current"),
+    }
+    if not any(isinstance(value, (list, tuple)) for value in fields.values()):
+        return []
+    return [
+        {
+            "joint": name,
+            **{key: _vector_component(value, index) for key, value in fields.items()},
+        }
+        for index, name in enumerate(joint_names)
+    ]
+
+
+def _tcp_detail_rows(sample: Any) -> list[dict[str, Any]]:
+    labels = ["X", "Y", "Z", "Rx", "Ry", "Rz"]
+    fields = {
+        "actual_pose": _read_attr(sample, "actual_TCP_pose"),
+        "actual_speed": _read_attr(sample, "actual_TCP_speed"),
+        "actual_force": _read_attr(sample, "actual_TCP_force"),
+        "target_pose": _read_attr(sample, "target_TCP_pose"),
+        "target_speed": _read_attr(sample, "target_TCP_speed"),
+    }
+    if not any(isinstance(value, (list, tuple)) for value in fields.values()):
+        return []
+    return [
+        {
+            "axis": label,
+            **{key: _vector_component(value, index) for key, value in fields.items()},
+        }
+        for index, label in enumerate(labels)
+    ]
 
 
 def _read_attr(sample: Any, name: str) -> Any:
@@ -311,13 +394,18 @@ def _install_protocol_fallback() -> None:
             return original_unpack_data(self, payload, output_config)
         if output_config is None:
             return None
-        # v1 data packets have no recipe-id byte. Decode each configured field
-        # directly rather than using the v2 DataObject.unpack helper.
+        # v1 data packets have no recipe-id byte. The client helper expects a
+        # decoded value sequence, not raw bytes, so unpack the configured
+        # scalar/vector types before building the sample.
+        values = struct.unpack_from(
+            ">" + output_config.fmt[2:],  # Drop the v2-only recipe-id byte.
+            payload,
+        )
         sample = rtde_client.serialize.DataObject()
         sample.recipe_id = 0
         offset = 0
         for name, field_type in zip(output_config.names, output_config.types, strict=True):
-            sample.__dict__[name] = rtde_client.serialize.unpack_field(payload, offset, field_type)
+            sample.__dict__[name] = rtde_client.serialize.unpack_field(values, offset, field_type)
             offset += rtde_client.serialize.get_item_size(field_type)
         return sample
 
@@ -385,10 +473,17 @@ def _open_live_connection(
         connection.connect()
         try:
             recipe_used: list[str] | None = None
+            # Older controllers use RTDE protocol v1, but still support many
+            # motion fields. Try richer compatible recipes before accepting
+            # the minimal legacy I/O-only recipe.
             recipes = (
-                (LEGACY_OUTPUT_RECIPE, CORE_OUTPUT_RECIPE, MID_OUTPUT_RECIPE, FULL_OUTPUT_RECIPE)
-                if connection._RTDE__protocolVersion == rtde_client.RTDE_PROTOCOL_VERSION_1  # noqa: SLF001
-                else (FULL_OUTPUT_RECIPE, MID_OUTPUT_RECIPE, CORE_OUTPUT_RECIPE, LEGACY_OUTPUT_RECIPE)
+                FULL_OUTPUT_RECIPE,
+                MID_OUTPUT_RECIPE,
+                MOTION_OUTPUT_RECIPE,
+                POSE_OUTPUT_RECIPE,
+                JOINT_OUTPUT_RECIPE,
+                CORE_OUTPUT_RECIPE,
+                LEGACY_OUTPUT_RECIPE,
             )
             for recipe in recipes:
                 try:
@@ -513,7 +608,10 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
     handled_vector_fields = {
         "actual_TCP_pose",
         "actual_TCP_speed",
+        "actual_TCP_force",
         "actual_q",
+        "actual_qd",
+        "actual_current",
     }
     extra_actual_rows: list[dict[str, Any]] = []
     for name in sorted(sample_values):
@@ -607,6 +705,10 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
             {"label": "Safety mode", "value": _read_attr(sample, "safety_mode")},
             {"label": "Runtime state", "value": _read_attr(sample, "runtime_state")},
             {"label": "Speed scaling", "value": _read_attr(sample, "speed_scaling")},
+            {"label": "Execution time (s)", "value": _read_attr(sample, "actual_execution_time")},
+            {"label": "Robot voltage (V)", "value": _read_attr(sample, "actual_robot_voltage")},
+            {"label": "Robot current (A)", "value": _read_attr(sample, "actual_robot_current")},
+            {"label": "Main voltage (V)", "value": _read_attr(sample, "actual_main_voltage")},
             {"label": "Robot status bits", "value": _read_attr(sample, "robot_status_bits")},
             {"label": "Safety status bits", "value": _read_attr(sample, "safety_status_bits")},
         ],
@@ -625,6 +727,8 @@ def read_robot_snapshot(host: str, port: int, poll_hz: int, timeout_seconds: flo
             "J",
             ["Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"],
         ),
+        "tcp_detail_rows": _tcp_detail_rows(sample),
+        "joint_detail_rows": _joint_detail_rows(sample),
         "extra_actual_rows": extra_actual_rows,
         "notes": (
             "Reading standard digital I/O from the controller Modbus server and live telemetry over RTDE. "

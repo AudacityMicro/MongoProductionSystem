@@ -54,6 +54,25 @@ class RenameDebugIo(RevisionRequest):
         return value.strip()
 
 
+DebugProgramColor = Literal["amber", "blue", "cyan", "green", "lime", "orange", "red", "violet"]
+
+
+class ConfigureDebugProgram(RevisionRequest):
+    index: int = Field(ge=0, le=15)
+    display_name: str = Field(default="", max_length=80)
+    filename: str = Field(default="", max_length=500)
+    color: DebugProgramColor
+
+    @field_validator("display_name", "filename")
+    @classmethod
+    def strip_program_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class RunDebugProgram(RevisionRequest):
+    index: int = Field(ge=0, le=15)
+
+
 class MovePallet(RevisionRequest):
     destination: Location
     pool_slot_number: int | None = Field(default=None, ge=1)
@@ -81,8 +100,21 @@ class SettingsUpdate(RevisionRequest):
     robot_port: int = Field(default=30004, ge=1, le=65535)
     robot_poll_hz: int = Field(default=10, ge=1, le=125)
     robot_timeout_seconds: float = Field(default=1.0, gt=0, le=10)
+    debug_program_button_count: int | None = Field(default=None, ge=1, le=16)
+    robot_file_access_enabled: bool | None = None
+    robot_file_host: str | None = Field(default=None, max_length=255)
+    robot_file_port: int | None = Field(default=None, ge=1, le=65535)
+    robot_file_username: str | None = Field(default=None, max_length=255)
+    robot_file_password: str | None = Field(default=None, max_length=500)
+    robot_file_directory: str | None = Field(default=None, max_length=500)
+    robot_program_extensions: list[str] | None = Field(default=None, min_length=1)
 
     @field_validator("robot_host")
     @classmethod
     def strip_robot_host(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("robot_file_host", "robot_file_username", "robot_file_directory")
+    @classmethod
+    def strip_robot_file_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None

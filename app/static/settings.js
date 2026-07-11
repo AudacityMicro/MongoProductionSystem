@@ -12,6 +12,21 @@ const ui = {
   robotPort: document.querySelector("#robot-port"),
   robotPollHz: document.querySelector("#robot-poll-hz"),
   robotTimeoutSeconds: document.querySelector("#robot-timeout-seconds"),
+  debugProgramButtonCount: document.querySelector("#debug-program-button-count"),
+  robotFileAccessEnabled: document.querySelector("#robot-file-access-enabled"),
+  robotFileHost: document.querySelector("#robot-file-host"),
+  robotFilePort: document.querySelector("#robot-file-port"),
+  robotFileUsername: document.querySelector("#robot-file-username"),
+  robotFilePassword: document.querySelector("#robot-file-password"),
+  robotFileDirectory: document.querySelector("#robot-file-directory"),
+  robotProgramExtensions: document.querySelector("#robot-program-extensions"),
+  openRobotDirectory: document.querySelector("#open-robot-directory"),
+  robotFileAccessStatus: document.querySelector("#robot-file-access-status"),
+  robotDirectoryModal: document.querySelector("#robot-directory-modal"),
+  robotDirectoryPath: document.querySelector("#robot-directory-path"),
+  robotDirectorySummary: document.querySelector("#robot-directory-summary"),
+  robotDirectoryFiles: document.querySelector("#robot-directory-files"),
+  robotDirectoryClose: document.querySelector("#robot-directory-close"),
   robotConnectionHelp: document.querySelector("#robot-connection-help"),
   appVersion: document.querySelector("#app-version"),
   relaunchSystem: document.querySelector("#relaunch-system"),
@@ -94,6 +109,11 @@ function programExtensions() {
   return values.length ? values : board.settings.program_extensions;
 }
 
+function robotProgramExtensions() {
+  const values = ui.robotProgramExtensions.value.split(",").map(value => value.trim()).filter(Boolean);
+  return values.length ? values : board.settings.robot_program_extensions;
+}
+
 function settingsDraft() {
   return {
     source_folder: ui.source.value,
@@ -107,6 +127,14 @@ function settingsDraft() {
     robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30004),
     robot_poll_hz: fieldNumber(ui.robotPollHz, board.settings.robot_poll_hz || 10),
     robot_timeout_seconds: fieldNumber(ui.robotTimeoutSeconds, board.settings.robot_timeout_seconds || 1.0),
+    debug_program_button_count: fieldNumber(ui.debugProgramButtonCount, board.settings.debug_program_button_count || 4),
+    robot_file_access_enabled: ui.robotFileAccessEnabled.checked,
+    robot_file_host: ui.robotFileHost.value.trim(),
+    robot_file_port: fieldNumber(ui.robotFilePort, board.settings.robot_file_port || 22),
+    robot_file_username: ui.robotFileUsername.value.trim() || "root",
+    robot_file_password: ui.robotFilePassword.value,
+    robot_file_directory: ui.robotFileDirectory.value.trim() || "/programs",
+    robot_program_extensions: robotProgramExtensions(),
   };
 }
 
@@ -138,6 +166,14 @@ async function loadSettings() {
     ui.robotPort.value = board.settings.robot_port;
     ui.robotPollHz.value = board.settings.robot_poll_hz;
     ui.robotTimeoutSeconds.value = board.settings.robot_timeout_seconds;
+    ui.debugProgramButtonCount.value = board.settings.debug_program_button_count || 4;
+    ui.robotFileAccessEnabled.checked = board.settings.robot_file_access_enabled;
+    ui.robotFileHost.value = board.settings.robot_file_host || "";
+    ui.robotFilePort.value = board.settings.robot_file_port || 22;
+    ui.robotFileUsername.value = board.settings.robot_file_username || "root";
+    ui.robotFilePassword.value = board.settings.robot_file_password;
+    ui.robotFileDirectory.value = board.settings.robot_file_directory || "/programs";
+    ui.robotProgramExtensions.value = board.settings.robot_program_extensions.join(", ");
     savedSettingsSignature = JSON.stringify(settingsDraft());
     setDirtyState(false);
     syncRobotModeUi();
@@ -196,6 +232,25 @@ for (const field of ui.form.querySelectorAll("input, select, textarea")) {
 function closeUnsavedModal() {
   pendingNavigation = null;
   ui.unsavedModal.classList.add("hidden");
+}
+
+function showRobotDirectory(files) {
+  const directory = board.settings.robot_file_directory;
+  ui.robotDirectoryPath.textContent = directory;
+  ui.robotDirectorySummary.textContent = files.length
+    ? `${files.length} ${files.length === 1 ? "file" : "files"} read from the controller.`
+    : "Connected successfully. This directory is empty.";
+  ui.robotDirectoryFiles.replaceChildren();
+  for (const file of files) {
+    const item = document.createElement("li");
+    item.textContent = file;
+    ui.robotDirectoryFiles.append(item);
+  }
+  ui.robotDirectoryModal.classList.remove("hidden");
+}
+
+function closeRobotDirectory() {
+  ui.robotDirectoryModal.classList.add("hidden");
 }
 
 function openUnsavedModal(navigate) {
@@ -307,6 +362,41 @@ ui.relaunchSystem.addEventListener("click", async () => {
   button.textContent = "Close and relaunch";
   setRelaunchStatus("Relaunch timed out. The backend may still be restarting; refresh this page once in a few seconds.", "error");
   showToast("Relaunch timed out. If the backend did restart, refresh this page once.", "error");
+});
+
+ui.openRobotDirectory.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save the Robot file access settings before opening the controller directory.", "error");
+    return;
+  }
+  if (!board.settings.robot_file_access_enabled) {
+    showToast("Enable SFTP file browser and save settings before opening the controller directory.", "error");
+    return;
+  }
+
+  const button = ui.openRobotDirectory;
+  button.disabled = true;
+  button.textContent = "Opening directory...";
+  ui.robotFileAccessStatus.textContent = "Connecting to the controller...";
+  try {
+    const result = await api("/api/debug/programs/files?include_all=true", {cache: "no-store"});
+    const count = result.files.length;
+    const message = `Connected. ${board.settings.robot_file_directory} opened; ${count} ${count === 1 ? "file" : "files"} found.`;
+    ui.robotFileAccessStatus.textContent = message;
+    showRobotDirectory(result.files);
+    showToast(message);
+  } catch (error) {
+    ui.robotFileAccessStatus.textContent = `Could not open directory: ${error.message}`;
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Open robot directory";
+  }
+});
+
+ui.robotDirectoryClose.addEventListener("click", closeRobotDirectory);
+ui.robotDirectoryModal.addEventListener("click", event => {
+  if (event.target === ui.robotDirectoryModal) closeRobotDirectory();
 });
 
 loadSettings();

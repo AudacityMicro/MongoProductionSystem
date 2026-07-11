@@ -17,11 +17,23 @@ const ui = {
   analogOutputs: document.querySelector("#analog-outputs"),
   stateRows: document.querySelector("#state-rows"),
   motionRows: document.querySelector("#motion-rows"),
+  tcpDetailRows: document.querySelector("#tcp-detail-rows"),
+  jointDetailRows: document.querySelector("#joint-detail-rows"),
   actualRows: document.querySelector("#actual-rows"),
+  programButtons: document.querySelector("#debug-program-buttons"),
+  loadedControllerProgram: document.querySelector("#loaded-controller-program"),
+  programFileNote: document.querySelector("#program-file-note"),
+  programDialog: document.querySelector("#program-button-dialog"),
+  programForm: document.querySelector("#program-button-form"),
+  programName: document.querySelector("#program-button-name"),
+  programFilename: document.querySelector("#program-button-filename"),
+  programColor: document.querySelector("#program-button-color"),
+  programCancel: document.querySelector("#program-button-cancel"),
 };
 
 let lastError = "";
 let snapshotState = null;
+let editingProgramIndex = null;
 
 function showToast(message, kind = "success") {
   ui.toast.textContent = message;
@@ -240,6 +252,47 @@ function motionRow(row) {
     </tr>`;
 }
 
+function tcpDetailRow(row) {
+  return `
+    <tr>
+      <td>${escapeHtml(row.axis)}</td>
+      <td>${escapeHtml(formatValue(row.actual_pose))}</td>
+      <td>${escapeHtml(formatValue(row.actual_speed))}</td>
+      <td>${escapeHtml(formatValue(row.actual_force))}</td>
+      <td>${escapeHtml(formatValue(row.target_pose))}</td>
+      <td>${escapeHtml(formatValue(row.target_speed))}</td>
+    </tr>`;
+}
+
+function jointDetailRow(row) {
+  return `
+    <tr>
+      <td>${escapeHtml(row.joint)}</td>
+      <td>${escapeHtml(formatValue(row.actual_position))}</td>
+      <td>${escapeHtml(formatValue(row.actual_velocity))}</td>
+      <td>${escapeHtml(formatValue(row.actual_current))}</td>
+      <td>${escapeHtml(formatValue(row.target_position))}</td>
+      <td>${escapeHtml(formatValue(row.target_velocity))}</td>
+      <td>${escapeHtml(formatValue(row.target_current))}</td>
+    </tr>`;
+}
+
+function renderProgramControls(snapshot) {
+  const controls = snapshot.program_controls || {buttons: [], loaded_program: null, file_list_note: "Program controls are unavailable."};
+  ui.loadedControllerProgram.textContent = controls.loaded_program || "No program reported";
+  ui.programFileNote.textContent = controls.file_list_note;
+  ui.programButtons.innerHTML = controls.buttons.length
+    ? controls.buttons.map(button => `
+      <div class="debug-program-card program-${escapeHtml(button.color)}">
+        <button class="debug-program-run" type="button" data-run-debug-program="${button.index}" ${button.can_run ? "" : "disabled"}>
+          <span class="debug-io-title"><span class="debug-led ${button.can_run ? "active" : "unknown"}"></span><span class="debug-io-name">${escapeHtml(button.display_name)}</span></span>
+          <span class="debug-io-meta">${escapeHtml(button.filename || "No controller file configured")}</span>
+        </button>
+        <button class="debug-io-rename" type="button" data-edit-debug-program="${button.index}">Edit</button>
+      </div>`).join("")
+    : `<p class="debug-table-empty">Enable one or more program buttons in Settings.</p>`;
+}
+
 function render(snapshot) {
   snapshotState = snapshot;
   ui.notes.textContent = snapshot.notes;
@@ -256,6 +309,7 @@ function render(snapshot) {
   ui.summaryPoolOpen.textContent = String(snapshot.summary.pool_open_positions);
 
   renderControllerLayout(snapshot);
+  renderProgramControls(snapshot);
 
   ui.analogInputs.innerHTML = snapshot.analog_inputs.length
     ? snapshot.analog_inputs.map(analogRow).join("")
@@ -275,6 +329,14 @@ function render(snapshot) {
   ui.motionRows.innerHTML = motionRows.length
     ? motionRows.map(motionRow).join("")
     : tableEmpty(3, "No motion data in the current telemetry recipe.");
+  const tcpDetailRows = snapshot.tcp_detail_rows || [];
+  ui.tcpDetailRows.innerHTML = tcpDetailRows.length
+    ? tcpDetailRows.map(tcpDetailRow).join("")
+    : tableEmpty(6, "TCP detail is not available in the current telemetry recipe.");
+  const jointDetailRows = snapshot.joint_detail_rows || [];
+  ui.jointDetailRows.innerHTML = jointDetailRows.length
+    ? jointDetailRows.map(jointDetailRow).join("")
+    : tableEmpty(7, "Joint detail is not available in the current telemetry recipe.");
   ui.actualRows.innerHTML = (snapshot.extra_actual_rows || []).length
     ? snapshot.extra_actual_rows.map(motionRow).join("")
     : tableEmpty(3, "No additional actual values in the current telemetry recipe.");
@@ -298,6 +360,43 @@ async function loadDebugging() {
 }
 
 document.addEventListener("click", async event => {
+  const editProgramButton = event.target.closest("[data-edit-debug-program]");
+  if (editProgramButton && snapshotState) {
+    editingProgramIndex = Number(editProgramButton.dataset.editDebugProgram);
+    const button = snapshotState.program_controls?.buttons?.[editingProgramIndex];
+    if (!button) return;
+    ui.programName.value = button.display_name;
+    ui.programFilename.innerHTML = `<option value="">No Robot program assigned</option>`;
+    ui.programColor.value = button.color;
+    ui.programDialog.showModal();
+    try {
+      const result = await api("/api/debug/programs/files");
+      const files = [...new Set([button.filename, ...result.files].filter(Boolean))];
+      ui.programFilename.innerHTML = ["", ...files]
+        .map(file => `<option value="${escapeHtml(file)}">${escapeHtml(file || "No Robot program assigned")}</option>`)
+        .join("");
+      ui.programFilename.value = button.filename;
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+    return;
+  }
+
+  const runProgramButton = event.target.closest("[data-run-debug-program]");
+  if (runProgramButton && snapshotState) {
+    try {
+      const updated = await api("/api/debug/programs/run", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: snapshotState.revision, index: Number(runProgramButton.dataset.runDebugProgram)}),
+      });
+      render(updated);
+      showToast("Controller accepted the program start command.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+    return;
+  }
+
   const renameButton = event.target.closest("[data-rename-debug-io]");
   if (renameButton && snapshotState) {
     const currentLabel = renameButton.dataset.debugLabel || "";
@@ -337,6 +436,29 @@ document.addEventListener("click", async event => {
     });
     render(updated);
     showToast(`Toggled ${button.dataset.debugBank} ${button.dataset.debugDirection} ${button.dataset.debugIndex}.`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+});
+
+ui.programCancel.addEventListener("click", () => ui.programDialog.close());
+ui.programForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (editingProgramIndex === null || !snapshotState) return;
+  try {
+    const updated = await api("/api/debug/programs/configure", {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: snapshotState.revision,
+        index: editingProgramIndex,
+        display_name: ui.programName.value,
+        filename: ui.programFilename.value,
+        color: ui.programColor.value,
+      }),
+    });
+    ui.programDialog.close();
+    render(updated);
+    showToast("Program button saved.");
   } catch (error) {
     showToast(error.message, "error");
   }

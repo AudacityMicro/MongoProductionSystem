@@ -19,17 +19,20 @@ from app.database import (
 from app.schemas import (
     CreatePallet,
     MovePallet,
+    ConfigureDebugProgram,
     QueuePallet,
     RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
     SettingsUpdate,
     ToggleDebugIo,
+    RunDebugProgram,
     UpdatePallet,
 )
 from app.service import (
     board_snapshot,
     create_pallet,
+    configure_debug_program,
     dequeue_pallet,
     delete_pallet,
     duplicate_pallet,
@@ -39,6 +42,8 @@ from app.service import (
     rename_debug_io,
     reorder_queue,
     robot_io_snapshot,
+    robot_program_files,
+    run_debug_program,
     simulate_signal,
     toggle_debug_io,
     update_pallet,
@@ -247,6 +252,29 @@ def create_app(database_url: str | None = None) -> FastAPI:
         session: Session = Depends(get_session),
     ) -> dict:
         rename_debug_io(session, payload)
+        return robot_io_snapshot(session)
+
+    @application.post("/api/debug/programs/configure")
+    def configure_debug_program_button(
+        payload: ConfigureDebugProgram,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        configure_debug_program(session, payload)
+        return robot_io_snapshot(session)
+
+    @application.get("/api/debug/programs/files")
+    def get_debug_program_files(
+        include_all: bool = False,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return {"files": robot_program_files(session, include_all=include_all)}
+
+    @application.post("/api/debug/programs/run")
+    def run_debug_program_button(
+        payload: RunDebugProgram,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        run_debug_program(session, payload)
         return robot_io_snapshot(session)
 
     @application.post("/api/system/relaunch", status_code=status.HTTP_202_ACCEPTED)

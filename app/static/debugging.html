@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Debugging | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <script src="/static/debugging.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260711-5">
+    <script src="/static/debugging.js?v=20260711-5" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -68,14 +68,26 @@
               <h2>Digital I/O faceplate</h2>
             </div>
           </header>
-          <p class="debug-digital-help">Simulator mode lets you click I/O tiles to toggle states. Use Rename on any port to assign a custom operator-facing name. Live robot values remain read-only.</p>
+          <p class="debug-digital-help">Use Rename on any port to assign a custom operator-facing name. When manual I/O control is unlocked, live digital outputs can be toggled; inputs remain read-only.</p>
           <div class="debug-controller-layout" id="digital-io-layout"></div>
+        </article>
+
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">04 / Controller programs</p>
+              <h2>Program run buttons</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help" id="program-file-note">Loading controller-program details.</p>
+          <p class="debug-digital-help">Currently loaded: <strong id="loaded-controller-program">Unavailable</strong></p>
+          <div class="debug-program-grid" id="debug-program-buttons"></div>
         </article>
 
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">04 / Analog</p>
+              <p class="section-number">05 / Analog</p>
               <h2>Analog and I/O values</h2>
             </div>
           </header>
@@ -95,10 +107,59 @@
           </div>
         </article>
 
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">09 / TCP motion</p>
+              <h2>TCP pose, speed, and force</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Axis</th>
+                  <th>Actual pose</th>
+                  <th>Actual speed</th>
+                  <th>Actual force</th>
+                  <th>Target pose</th>
+                  <th>Target speed</th>
+                </tr>
+              </thead>
+              <tbody id="tcp-detail-rows"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">10 / Joints</p>
+              <h2>Joint positions, velocities, and current</h2>
+            </div>
+          </header>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead>
+                <tr>
+                  <th>Joint</th>
+                  <th>Actual position</th>
+                  <th>Actual velocity</th>
+                  <th>Actual current</th>
+                  <th>Target position</th>
+                  <th>Target velocity</th>
+                  <th>Target current</th>
+                </tr>
+              </thead>
+              <tbody id="joint-detail-rows"></tbody>
+            </table>
+          </div>
+        </article>
+
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">05 / Analog</p>
+              <p class="section-number">06 / Analog</p>
               <h2>Analog outputs</h2>
             </div>
           </header>
@@ -121,7 +182,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">06 / State</p>
+              <p class="section-number">07 / State</p>
               <h2>Robot state</h2>
             </div>
           </header>
@@ -141,7 +202,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">07 / Motion</p>
+              <p class="section-number">08 / Motion</p>
               <h2>Pose and joints</h2>
             </div>
           </header>
@@ -162,7 +223,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">08 / Actual</p>
+              <p class="section-number">11 / Actual</p>
               <h2>Additional actual values</h2>
             </div>
           </header>
@@ -181,6 +242,41 @@
         </article>
       </section>
     </main>
+
+    <dialog class="debug-program-dialog" id="program-button-dialog" aria-labelledby="program-button-dialog-title">
+      <form id="program-button-form">
+        <div class="dialog-header">
+          <p class="eyebrow">Controller program</p>
+          <h2 id="program-button-dialog-title">Edit program button</h2>
+        </div>
+        <label>
+          Display name
+          <input id="program-button-name" maxlength="80" placeholder="Open door">
+        </label>
+        <label>
+          Controller filename
+          <select id="program-button-filename"></select>
+        </label>
+        <p class="field-help">Choose a Robot program read from the controller through SFTP. The list is filtered by Robot program extensions in Settings.</p>
+        <label>
+          Button color
+          <select id="program-button-color">
+            <option value="amber">Amber</option>
+            <option value="blue">Blue</option>
+            <option value="cyan">Cyan</option>
+            <option value="green">Green</option>
+            <option value="lime">Lime</option>
+            <option value="orange">Orange</option>
+            <option value="red">Red</option>
+            <option value="violet">Violet</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" type="button" id="program-button-cancel">Cancel</button>
+          <button class="button primary" type="submit">Save button</button>
+        </div>
+      </form>
+    </dialog>
 
     <div class="toast hidden" id="toast" role="status"></div>
   </body>

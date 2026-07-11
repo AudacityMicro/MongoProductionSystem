@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260711-2">
-    <script src="/static/settings.js?v=20260711-2" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260712-1">
+    <script src="/static/settings.js?v=20260712-1" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -36,17 +36,17 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">01</p>
-            <h2>Program source</h2>
-            <p>The folder must be available to the computer running this server.</p>
+            <h2>Mill programs</h2>
+            <p>These local programs are assigned to pallets and must be available to the server computer.</p>
           </div>
           <div class="panel-fields">
             <label>
-              Source folder
+              Mill program source folder
               <input id="source-folder" placeholder="C:\Programs\Mongo" maxlength="1000">
             </label>
             <label>
-              Allowed extensions
-              <input id="program-extensions" placeholder=".nc, .tap, .gcode, .cnc, .urp">
+              Mill program extensions
+              <input id="program-extensions" placeholder=".nc, .tap, .gcode, .cnc">
             </label>
             <p class="field-help">Subfolders are scanned recursively. Program headers are not parsed yet.</p>
           </div>
@@ -136,6 +136,71 @@
           </div>
         </section>
 
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">05</p>
+            <h2>Robot file access</h2>
+            <p>Use SFTP to browse program files stored on the robot controller.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="robot-file-access-enabled" type="checkbox">
+              <span>
+                Enable SFTP file browser
+                <small>Used only when selecting files for Debugging program buttons.</small>
+              </span>
+            </label>
+            <div class="form-row">
+              <label>
+                File server host
+                <input id="robot-file-host" placeholder="Leave blank to use Robot IP" maxlength="255">
+              </label>
+              <label>
+                SFTP port
+                <input id="robot-file-port" type="number" min="1" max="65535" step="1">
+              </label>
+            </div>
+            <div class="form-row">
+              <label>
+                SFTP username
+                <input id="robot-file-username" maxlength="255" autocomplete="off" placeholder="root">
+              </label>
+              <label>
+                SFTP password
+                <input id="robot-file-password" type="text" maxlength="500" autocomplete="off" placeholder="easybot">
+              </label>
+            </div>
+            <label>
+              Robot program directory
+              <input id="robot-file-directory" placeholder="/programs" maxlength="500">
+            </label>
+            <label>
+              Robot program extensions
+              <input id="robot-program-extensions" placeholder=".urp">
+            </label>
+            <div class="inline-actions">
+              <button class="button secondary" id="open-robot-directory" type="button">Open robot directory</button>
+              <span class="field-help" id="robot-file-access-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="field-help">Robot extensions filter the controller-program button chooser; <code>.urp</code> is the default. Universal Robots defaults are preconfigured: <code>root</code> / <code>easybot</code>. The password is shown and editable here, and is returned to browsers that can access this trusted local-network application.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">06</p>
+            <h2>Debug programs</h2>
+            <p>Configure a compact set of controller-program buttons on the Debugging page.</p>
+          </div>
+          <div class="panel-fields">
+            <label>
+              Number of program buttons
+              <input id="debug-program-button-count" type="number" min="1" max="16" step="1">
+            </label>
+            <p class="field-help">Each button has its own display name, controller filename, and color. Reducing the count hides higher-numbered buttons without deleting their saved configuration.</p>
+          </div>
+        </section>
+
         <div class="settings-actions">
           <a class="button ghost" href="/">Cancel</a>
           <button class="button secondary" id="relaunch-system" type="button">Close and relaunch</button>
@@ -155,6 +220,20 @@
           <button class="button ghost" id="unsaved-cancel" type="button">Stay here</button>
           <button class="button secondary" id="unsaved-discard" type="button">Leave without saving</button>
           <button class="button primary" id="unsaved-save" type="button">Save and continue</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-shell hidden" id="robot-directory-modal" role="dialog" aria-modal="true" aria-labelledby="robot-directory-title">
+      <div class="dialog-card directory-browser">
+        <div class="dialog-header">
+          <p class="eyebrow">Controller file browser</p>
+          <h2 id="robot-directory-title">Robot program directory</h2>
+        </div>
+        <p class="directory-browser-path" id="robot-directory-path"></p>
+        <p class="field-help" id="robot-directory-summary"></p>
+        <ul class="directory-file-list" id="robot-directory-files"></ul>
+        <div class="dialog-actions">
+          <button class="button primary" id="robot-directory-close" type="button">Close</button>
         </div>
       </div>
     </div>

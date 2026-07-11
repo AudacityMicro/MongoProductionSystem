@@ -240,6 +240,39 @@ p {
   box-shadow: var(--shadow);
 }
 
+.directory-browser {
+  width: min(48rem, 100%);
+}
+
+.directory-browser-path {
+  margin-bottom: 0.55rem;
+  overflow-wrap: anywhere;
+  font-family: "IBM Plex Mono", monospace;
+  font-weight: 700;
+}
+
+.directory-file-list {
+  max-height: min(50vh, 28rem);
+  margin: 1rem 0 0;
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--ink);
+  background: #f7f4eb;
+  list-style: none;
+}
+
+.directory-file-list:empty { display: none; }
+
+.directory-file-list li {
+  padding: 0.65rem 0.8rem;
+  border-bottom: 1px solid #c8c3b5;
+  overflow-wrap: anywhere;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.8rem;
+}
+
+.directory-file-list li:last-child { border-bottom: 0; }
+
 .dialog-header {
   margin-bottom: 0.9rem;
 }
@@ -746,6 +779,17 @@ a:focus-visible {
   font-size: 0.72rem;
 }
 
+.inline-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.inline-actions .field-help {
+  margin: 0;
+}
+
 .checkbox-control {
   display: flex;
   gap: 0.75rem;
@@ -1146,6 +1190,51 @@ a:focus-visible {
   color: var(--muted);
   text-align: center;
 }
+
+.debug-program-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.6rem;
+}
+
+.debug-program-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  padding: 0.35rem;
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.debug-program-run {
+  min-width: 0;
+  border: 0;
+  padding: 0.55rem 0.65rem;
+  color: #111b18;
+  cursor: pointer;
+  text-align: left;
+}
+
+.debug-program-run:disabled { cursor: not-allowed; opacity: 0.62; }
+.program-amber .debug-program-run { background: #f2c14e; }
+.program-blue .debug-program-run { background: #87bfff; }
+.program-cyan .debug-program-run { background: #76d7e5; }
+.program-green .debug-program-run { background: #8fd694; }
+.program-lime .debug-program-run { background: #c7df6a; }
+.program-orange .debug-program-run { background: #f5a65b; }
+.program-red .debug-program-run { background: #ef8a8a; }
+.program-violet .debug-program-run { background: #c8a5e8; }
+
+.debug-program-dialog {
+  width: min(34rem, calc(100vw - 2rem));
+  border: 1px solid var(--line-strong);
+  padding: 1.25rem;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.debug-program-dialog::backdrop { background: rgba(21, 31, 26, 0.55); }
+.debug-program-dialog form { display: grid; gap: 0.9rem; }
 
 .debug-led-table td:nth-child(2),
 .debug-led-table td:nth-child(3),

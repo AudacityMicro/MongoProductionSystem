@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.models import AppSettings, Pallet
+from app.robot_dashboard import RobotDashboardError, loaded_robot_program, run_robot_program
+from app.robot_files import RobotFileAccessError, list_robot_program_files
 from app.pallet_names import PALLET_NAMES
 from app.robot_rtde import RobotTelemetryError, read_robot_snapshot, toggle_robot_digital_output
 from app.schemas import (
@@ -20,9 +22,11 @@ from app.schemas import (
     MovePallet,
     QueuePallet,
     RenameDebugIo,
+    ConfigureDebugProgram,
     ReorderQueue,
     SettingsUpdate,
     ToggleDebugIo,
+    RunDebugProgram,
     UpdatePallet,
 )
 
@@ -125,10 +129,93 @@ def board_snapshot(session: Session) -> dict:
             "robot_port": settings.robot_port,
             "robot_poll_hz": settings.robot_poll_hz,
             "robot_timeout_seconds": settings.robot_timeout_seconds,
+            "debug_program_button_count": settings.debug_program_button_count,
+            "robot_file_access_enabled": settings.robot_file_access_enabled,
+            "robot_file_host": settings.robot_file_host,
+            "robot_file_port": settings.robot_file_port,
+            "robot_file_username": settings.robot_file_username,
+            "robot_file_password": settings.robot_file_password,
+            "robot_file_password_configured": bool(settings.robot_file_password),
+            "robot_file_directory": settings.robot_file_directory,
+            "robot_program_extensions": json.loads(settings.robot_program_extensions),
         },
         "programs": programs,
         "program_warning": warning,
     }
+
+
+DEBUG_PROGRAM_COLORS = ("amber", "blue", "cyan", "green", "lime", "orange", "red", "violet")
+
+
+def _load_debug_program_buttons(settings: AppSettings) -> list[dict[str, str]]:
+    try:
+        stored = json.loads(settings.debug_program_buttons or "[]")
+    except json.JSONDecodeError:
+        stored = []
+    if not isinstance(stored, list):
+        stored = []
+    buttons: list[dict[str, str]] = []
+    for index in range(settings.debug_program_button_count):
+        raw = stored[index] if index < len(stored) and isinstance(stored[index], dict) else {}
+        color = raw.get("color") if isinstance(raw.get("color"), str) else "blue"
+        buttons.append(
+            {
+                "display_name": raw.get("display_name", "").strip() or f"Program {index + 1}",
+                "filename": raw.get("filename", "").strip(),
+                "color": color if color in DEBUG_PROGRAM_COLORS else "blue",
+            }
+        )
+    return buttons
+
+
+def _store_debug_program_buttons(settings: AppSettings, buttons: list[dict[str, str]]) -> None:
+    settings.debug_program_buttons = json.dumps(buttons, separators=(",", ":"))
+
+
+def _apply_debug_program_controls(snapshot: dict, settings: AppSettings) -> dict:
+    buttons = _load_debug_program_buttons(settings)
+    snapshot["program_controls"] = {
+        "buttons": [
+            {
+                "index": index,
+                **button,
+                "can_run": bool(
+                    settings.robot_connection_mode == "physical"
+                    and settings.robot_host.strip()
+                    and button["filename"]
+                ),
+            }
+            for index, button in enumerate(buttons)
+        ],
+        "loaded_program": None,
+        "file_list_note": (
+            f"SFTP file browser is enabled. Open Edit to retrieve programs from {settings.robot_file_directory}."
+            if settings.robot_file_access_enabled
+            else "The Universal Robots Dashboard server does not provide a controller file listing. Enable SFTP file access in Settings to browse controller programs."
+        ),
+    }
+    return snapshot
+
+
+def robot_program_files(session: Session, include_all: bool = False) -> list[str]:
+    settings = get_settings(session)
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Robot file browsing requires a configured physical robot.")
+    if not settings.robot_file_access_enabled:
+        raise problem(409, "Enable SFTP robot file access in Settings first.")
+    host = settings.robot_file_host or settings.robot_host.strip()
+    try:
+        return list_robot_program_files(
+            host=host,
+            port=settings.robot_file_port,
+            username=settings.robot_file_username,
+            password=settings.robot_file_password,
+            directory=settings.robot_file_directory,
+            extensions=None if include_all else set(json.loads(settings.robot_program_extensions)),
+            timeout_seconds=settings.robot_timeout_seconds,
+        )
+    except RobotFileAccessError as exc:
+        raise problem(502, str(exc)) from exc
 
 
 def _board_summary(settings: AppSettings, pallets: list[Pallet]) -> dict:
@@ -327,7 +414,7 @@ def _simulated_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
         "extra_actual_rows": [],
         "notes": "Showing simulated I/O derived from the current board state because debug mode is enabled.",
     }
-    return _apply_debug_labels(snapshot, settings)
+    return _apply_debug_program_controls(_apply_debug_labels(snapshot, settings), settings)
 
 
 def robot_io_snapshot(session: Session) -> dict:
@@ -374,6 +461,14 @@ def robot_io_snapshot(session: Session) -> dict:
             snapshot["summary"] = summary
             snapshot["machine_state"] = settings.machine_state
             snapshot["robot"]["mode"] = settings.robot_connection_mode
+            try:
+                snapshot["program_controls"] = _apply_debug_program_controls({}, settings)["program_controls"]
+                snapshot["program_controls"]["loaded_program"] = loaded_robot_program(
+                    settings.robot_host.strip(), settings.robot_timeout_seconds
+                )
+            except RobotDashboardError as exc:
+                snapshot = _apply_debug_program_controls(snapshot, settings)
+                snapshot["program_controls"]["file_list_note"] = f"Controller program query unavailable: {exc}"
             return _apply_debug_labels(snapshot, settings)
         except RobotTelemetryError as exc:
             return {
@@ -787,12 +882,71 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     settings.robot_port = payload.robot_port
     settings.robot_poll_hz = payload.robot_poll_hz
     settings.robot_timeout_seconds = payload.robot_timeout_seconds
+    if payload.debug_program_button_count is not None:
+        settings.debug_program_button_count = payload.debug_program_button_count
+    if payload.robot_file_access_enabled is not None:
+        settings.robot_file_access_enabled = payload.robot_file_access_enabled
+    if payload.robot_file_host is not None:
+        settings.robot_file_host = payload.robot_file_host
+    if payload.robot_file_port is not None:
+        settings.robot_file_port = payload.robot_file_port
+    if payload.robot_file_username is not None:
+        settings.robot_file_username = payload.robot_file_username
+    if payload.robot_file_directory is not None:
+        settings.robot_file_directory = payload.robot_file_directory
+    if payload.robot_file_password is not None:
+        settings.robot_file_password = payload.robot_file_password
+    if payload.robot_program_extensions is not None:
+        settings.robot_program_extensions = json.dumps(
+            normalize_extensions(payload.robot_program_extensions),
+            separators=(",", ":"),
+        )
     if not payload.debug_menu_enabled:
         settings.machine_state = "idle"
     cleared = reconcile_programs(session, settings)
     bump(settings)
     commit_or_conflict(session)
     return cleared
+
+
+def configure_debug_program(session: Session, payload: ConfigureDebugProgram) -> None:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if payload.index >= settings.debug_program_button_count:
+        raise problem(422, "That program button is not enabled in Settings.")
+    filename = payload.filename.strip()
+    if filename:
+        path = PurePosixPath(filename)
+        if not path.is_absolute() or ".." in path.parts:
+            raise problem(422, "Robot program filename must be an absolute controller path without '..'.")
+        if path.suffix.lower() not in set(json.loads(settings.robot_program_extensions)):
+            raise problem(422, "Robot program filename does not match the configured Robot program extensions.")
+    buttons = _load_debug_program_buttons(settings)
+    buttons[payload.index] = {
+        "display_name": payload.display_name or f"Program {payload.index + 1}",
+        "filename": filename,
+        "color": payload.color,
+    }
+    _store_debug_program_buttons(settings, buttons)
+    bump(settings)
+    commit_or_conflict(session)
+
+
+def run_debug_program(session: Session, payload: RunDebugProgram) -> None:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Running controller programs requires a configured physical robot.")
+    buttons = _load_debug_program_buttons(settings)
+    if payload.index >= len(buttons):
+        raise problem(422, "That program button is not enabled in Settings.")
+    filename = buttons[payload.index]["filename"]
+    if not filename:
+        raise problem(422, "Configure a controller filename for this program button first.")
+    try:
+        run_robot_program(settings.robot_host.strip(), filename, settings.robot_timeout_seconds)
+    except RobotDashboardError as exc:
+        raise problem(502, str(exc)) from exc
 
 
 def toggle_debug_io(session: Session, payload: ToggleDebugIo) -> None:

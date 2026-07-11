@@ -34,6 +34,15 @@ class AppSettings(Base):
     debug_configurable_output_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_tool_output_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_io_labels: Mapped[str] = mapped_column(String, default="{}")
+    debug_program_button_count: Mapped[int] = mapped_column(Integer, default=4)
+    debug_program_buttons: Mapped[str] = mapped_column(String, default="[]")
+    robot_file_access_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    robot_file_host: Mapped[str] = mapped_column(String(255), default="")
+    robot_file_port: Mapped[int] = mapped_column(Integer, default=22)
+    robot_file_username: Mapped[str] = mapped_column(String(255), default="root")
+    robot_file_password: Mapped[str] = mapped_column(String, default="easybot")
+    robot_file_directory: Mapped[str] = mapped_column(String(500), default="/programs")
+    robot_program_extensions: Mapped[str] = mapped_column(String, default='[".urp"]')
     revision: Mapped[int] = mapped_column(Integer, default=0)
 
     __mapper_args__ = {
