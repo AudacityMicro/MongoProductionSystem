@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260712-1">
-    <script src="/static/settings.js?v=20260712-1" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260712-5">
+    <script src="/static/settings.js?v=20260712-5" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -16,7 +16,11 @@
       </a>
       <nav aria-label="Main navigation">
         <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/tools">Tools</a>
         <a class="nav-link" href="/debugging">Debugging</a>
+        <a class="nav-link" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
         <a class="nav-link active" href="/settings">Settings</a>
       </nav>
       <span class="system-state" id="system-state">
@@ -124,6 +128,34 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">04</p>
+            <h2>CNC telemetry</h2>
+            <p>Read-only PathPilot/LinuxCNC status is collected over SSH. No machine commands are enabled in this stage.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="cnc-telemetry-enabled" type="checkbox">
+              <span>Enable CNC telemetry<small>Polls LinuxCNC status only. It never sends a command to the Tormach controller.</small></span>
+            </label>
+            <div class="form-row">
+              <label>PathPilot IP or hostname<input id="cnc-host" placeholder="192.168.86.40" maxlength="255"></label>
+              <label>SSH port<input id="cnc-ssh-port" type="number" min="1" max="65535" step="1"></label>
+            </div>
+            <div class="form-row">
+              <label>LinuxCNC SSH username<input id="cnc-ssh-username" maxlength="255" placeholder="operator"></label>
+              <label>SSH password<input id="cnc-ssh-password" type="password" maxlength="500" autocomplete="new-password"></label>
+            </div>
+            <label>Connection timeout (seconds)<input id="cnc-timeout-seconds" type="number" min="0.1" max="15" step="0.1"></label>
+            <div class="inline-actions">
+              <button class="button secondary" id="test-cnc-telemetry" type="button">Test CNC telemetry</button>
+              <span class="field-help" id="cnc-telemetry-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="field-help">The controller must allow SSH access for this LinuxCNC user. The application runs <code>linuxcnc.stat().poll()</code> remotely and reads its JSON response.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">05</p>
             <h2>Pallet pool</h2>
             <p>Pool positions are numbered sequentially and each holds one pallet.</p>
           </div>
@@ -133,6 +165,22 @@
               <input id="pool-slot-count" type="number" min="1" max="256" step="1">
             </label>
             <p class="field-help">Default: 16. Occupied positions must be cleared before reducing this number below them.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">05</p>
+            <h2>Pallet locations</h2>
+            <p>Robot-reference positions in millimeters. These values are stored for future pallet-handling automation.</p>
+          </div>
+          <div class="panel-fields">
+            <div class="location-grid" id="pool-location-grid"></div>
+            <div class="form-row location-stations">
+              <fieldset class="location-fieldset" id="on-deck-location-fields"><legend>On deck location</legend></fieldset>
+              <fieldset class="location-fieldset" id="dripping-location-fields"><legend>Dripping location</legend></fieldset>
+            </div>
+            <p class="field-help">Coordinates are not sent to the robot yet. Save them now to prepare for future robot and mill integration.</p>
           </div>
         </section>
 
@@ -178,6 +226,10 @@
               Robot program extensions
               <input id="robot-program-extensions" placeholder=".urp">
             </label>
+            <label class="checkbox-control">
+              <input id="robot-programs-filter-enabled" type="checkbox">
+              <span>Filter Robot Programs page<small>When enabled, the file manager shows only files matching the Robot program extensions above. Folders remain visible.</small></span>
+            </label>
             <div class="inline-actions">
               <button class="button secondary" id="open-robot-directory" type="button">Open robot directory</button>
               <span class="field-help" id="robot-file-access-status" role="status" aria-live="polite"></span>
@@ -198,6 +250,69 @@
               <input id="debug-program-button-count" type="number" min="1" max="16" step="1">
             </label>
             <p class="field-help">Each button has its own display name, controller filename, and color. Reducing the count hides higher-numbered buttons without deleting their saved configuration.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">07</p>
+            <h2>Robot Programs page</h2>
+            <p>Manage controller files through SFTP and optionally open downloaded files in a local editor.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="robot-programs-page-enabled" type="checkbox">
+              <span>Show Robot Programs page<small>Enables the Robot Programs navigation tab and its SFTP file-management tools.</small></span>
+            </label>
+            <label>
+              Local editor command
+              <input id="robot-editor-command" maxlength="500" placeholder="code">
+            </label>
+            <p class="field-help">The command runs on this server computer with a downloaded copy of the selected controller file. Default: <code>code</code> for Visual Studio Code.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">08</p>
+            <h2>Mill Programs page</h2>
+            <p>Manage PathPilot user program files through the configured CNC SSH connection.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="mill-programs-page-enabled" type="checkbox">
+              <span>Show Mill Programs page<small>Enables the Mill Programs navigation tab and its PathPilot file-management tools.</small></span>
+            </label>
+            <label>
+              PathPilot program directory
+              <input id="mill-file-directory" maxlength="500" placeholder="/home/operator/gcode">
+            </label>
+            <label>
+              Mill program extensions
+              <input id="mill-program-extensions" maxlength="500" placeholder=".nc, .tap, .gcode, .cnc">
+            </label>
+            <label class="checkbox-control">
+              <input id="mill-programs-filter-enabled" type="checkbox">
+              <span>Filter Mill Programs files<small>When enabled, the browser only displays files matching the configured mill extensions.</small></span>
+            </label>
+            <label>
+              Local editor command
+              <input id="mill-editor-command" maxlength="500" placeholder="code">
+            </label>
+            <p class="field-help">Uses the PathPilot host, SSH port, username, password, and timeout above. All file operations stay inside this program directory. Default: <code>/home/operator/gcode</code>.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">09</p>
+            <h2>Fusion 360 tools</h2>
+            <p>Load tool numbers and descriptions from a Fusion 360 tool-library JSON file.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="button secondary file-upload-label">Upload Fusion tool libraries<input id="fusion-tool-library-upload" type="file" accept=".tools,.json,application/json" multiple hidden></label>
+            <div class="managed-library-list" id="fusion-tool-library-list"></div>
+            <p class="field-help">Upload one or more <code>.tools</code> or JSON libraries. The server stores them locally and merges their tool numbers into the Tools page.</p>
           </div>
         </section>
 

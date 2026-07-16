@@ -2,6 +2,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.service import program_metadata
+
 
 def configure_folder(client: TestClient, folder: Path, revision: int) -> dict:
     response = client.put(
@@ -70,3 +72,16 @@ def test_program_path_must_be_discovered(client: TestClient, tmp_path: Path) -> 
         },
     )
     assert response.status_code == 422
+
+
+def test_dummy_program_metadata_is_stable_and_hidden_after_completion() -> None:
+    active = program_metadata("jobs/part-a.nc", "raw_stock")
+
+    assert active["program_tools"]
+    assert all(tool.startswith("T") for tool in active["program_tools"])
+    assert active["expected_cycle_seconds"] is not None
+    assert active == program_metadata("jobs/part-a.nc", "raw_stock")
+    assert program_metadata("jobs/part-a.nc", "complete_parts") == {
+        "program_tools": [],
+        "expected_cycle_seconds": None,
+    }

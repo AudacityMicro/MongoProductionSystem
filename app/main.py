@@ -1,12 +1,16 @@
 from collections.abc import Generator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Query, Request, status
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -18,12 +22,14 @@ from app.database import (
 )
 from app.schemas import (
     CreatePallet,
+    CncTelemetryConnectionTest,
     MovePallet,
     ConfigureDebugProgram,
     QueuePallet,
     RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
+    RobotFileAction,
     SettingsUpdate,
     ToggleDebugIo,
     RunDebugProgram,
@@ -31,6 +37,13 @@ from app.schemas import (
 )
 from app.service import (
     board_snapshot,
+    autoschedule_queue_preview,
+    cnc_debug_snapshot,
+    cnc_io_labels_snapshot,
+    test_cnc_telemetry_connection,
+    add_fusion_tool_library,
+    dashboard_snapshot,
+    tools_snapshot,
     create_pallet,
     configure_debug_program,
     dequeue_pallet,
@@ -42,12 +55,30 @@ from app.service import (
     rename_debug_io,
     reorder_queue,
     robot_io_snapshot,
+    robot_file_manager_settings,
+    robot_programs_page_settings,
+    mill_file_manager_settings,
+    mill_programs_page_settings,
     robot_program_files,
+    remove_fusion_tool_library,
     run_debug_program,
     simulate_signal,
     toggle_debug_io,
     update_pallet,
     update_settings,
+)
+from app.robot_files import (
+    RobotFileAccessError,
+    RobotFileConflict,
+    copy_robot_file,
+    create_robot_directory,
+    delete_robot_path,
+    download_robot_file,
+    list_robot_directory,
+    move_robot_file,
+    rename_robot_file,
+    read_robot_file,
+    upload_robot_file,
 )
 from app.settings import settings
 
@@ -75,6 +106,19 @@ def queue_backend_relaunch() -> None:
     )
 
 
+def resolve_editor_command(command: str) -> list[str]:
+    parts = shlex.split(command, posix=False)
+    if not parts:
+        raise OSError("Configure an editor command in Settings first.")
+    if parts[0].casefold() == "code":
+        candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft VS Code" / "Code.exe"
+        if candidate.is_file():
+            return [str(candidate), *parts[1:]]
+    if shutil.which(parts[0]):
+        return parts
+    raise OSError(f"Editor command was not found: {parts[0]}")
+
+
 def create_app(database_url: str | None = None) -> FastAPI:
     url = database_url or settings.database_url
 
@@ -100,7 +144,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
     async def prevent_stale_frontend_assets(request: Request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path in {"/", "/settings", "/debugging"} or path.endswith((".js", ".css")):
+        if path in {"/", "/settings", "/debugging", "/robot-programs", "/mill-programs", "/dashboard", "/tools"} or path.endswith((".js", ".css")):
             response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -120,6 +164,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def debugging_page() -> FileResponse:
         return FileResponse(STATIC_DIR / "debugging.html")
 
+    @application.get("/dashboard", include_in_schema=False)
+    def dashboard_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "dashboard.html")
+
+    @application.get("/tools", include_in_schema=False)
+    def tools_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "tools.html")
+
+    @application.get("/robot-programs", include_in_schema=False)
+    def robot_programs_page(session: Session = Depends(get_session)) -> FileResponse:
+        robot_programs_page_settings(session)
+        return FileResponse(STATIC_DIR / "robot-programs.html")
+
+    @application.get("/mill-programs", include_in_schema=False)
+    def mill_programs_page(session: Session = Depends(get_session)) -> FileResponse:
+        mill_programs_page_settings(session)
+        return FileResponse(STATIC_DIR / "mill-programs.html")
+
     @application.get("/api/health")
     def health() -> dict:
         return {
@@ -132,6 +194,86 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @application.get("/api/board")
     def get_board(session: Session = Depends(get_session)) -> dict:
         return board_snapshot(session)
+
+    @application.get("/api/dashboard")
+    def get_dashboard(session: Session = Depends(get_session)) -> dict:
+        return dashboard_snapshot(session)
+
+    @application.get("/api/tools")
+    def get_tools(session: Session = Depends(get_session)) -> dict:
+        return tools_snapshot(session)
+
+    @application.post("/api/tool-libraries/upload")
+    def upload_fusion_tool_libraries(
+        files: list[UploadFile] = File(...),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        library_directory = PROJECT_ROOT / "runtime" / "fusion-tool-libraries"
+        library_directory.mkdir(parents=True, exist_ok=True)
+        added: list[str] = []
+        try:
+            for file in files:
+                original_name = Path(file.filename or "").name
+                if not original_name or Path(original_name).suffix.lower() not in {".json", ".tools"}:
+                    raise HTTPException(status_code=422, detail="Upload Fusion tool library files ending in .json or .tools.")
+                content = file.file.read(10_000_001)
+                if len(content) > 10_000_000:
+                    raise HTTPException(status_code=422, detail="Fusion tool library uploads are limited to 10 MB each.")
+                target = library_directory / f"{uuid4().hex}_{original_name}"
+                target.write_bytes(content)
+                add_fusion_tool_library(session, str(target))
+                added.append(str(target))
+            return {"libraries": added, "tools": tools_snapshot(session)}
+        finally:
+            for file in files:
+                file.file.close()
+
+    @application.delete("/api/tool-libraries")
+    def delete_fusion_tool_library(
+        path: str = Query(min_length=1, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        library_directory = (PROJECT_ROOT / "runtime" / "fusion-tool-libraries").resolve()
+        target = Path(path).resolve()
+        if library_directory not in target.parents:
+            raise HTTPException(status_code=422, detail="Only uploaded Fusion tool libraries can be removed here.")
+        remove_fusion_tool_library(session, str(target))
+        target.unlink(missing_ok=True)
+        return {"tools": tools_snapshot(session)}
+
+    def robot_file_connection(session: Session) -> tuple[dict, object]:
+        robot_settings = robot_file_manager_settings(session)
+        return (
+            {
+                "host": robot_settings.robot_file_host or robot_settings.robot_host.strip(),
+                "port": robot_settings.robot_file_port,
+                "username": robot_settings.robot_file_username,
+                "password": robot_settings.robot_file_password,
+                "directory": robot_settings.robot_file_directory,
+                "timeout_seconds": robot_settings.robot_timeout_seconds,
+            },
+            robot_settings,
+        )
+
+    def robot_file_error(error: RobotFileAccessError) -> HTTPException:
+        return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error))
+
+    def mill_file_connection(session: Session) -> tuple[dict, object]:
+        mill_settings = mill_file_manager_settings(session)
+        return (
+            {
+                "host": mill_settings.cnc_host.strip(),
+                "port": mill_settings.cnc_ssh_port,
+                "username": mill_settings.cnc_ssh_username,
+                "password": mill_settings.cnc_ssh_password,
+                "directory": mill_settings.mill_file_directory,
+                "timeout_seconds": mill_settings.cnc_timeout_seconds,
+            },
+            mill_settings,
+        )
+
+    def mill_file_error(error: RobotFileAccessError) -> HTTPException:
+        return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error))
 
     @application.post("/api/pallets", status_code=status.HTTP_201_CREATED)
     def add_pallet(
@@ -203,6 +345,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
         reorder_queue(session, payload)
         return board_snapshot(session)
 
+    @application.post("/api/queue/autoschedule/preview")
+    def preview_queue_autoschedule(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return autoschedule_queue_preview(session, payload.expected_revision)
+
     @application.get("/api/settings")
     def get_application_settings(
         session: Session = Depends(get_session),
@@ -238,6 +387,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def get_robot_io(session: Session = Depends(get_session)) -> dict:
         return robot_io_snapshot(session)
 
+    @application.get("/api/debug/cnc")
+    def get_cnc_debug(session: Session = Depends(get_session)) -> dict:
+        return cnc_debug_snapshot(session)
+
+    @application.get("/api/debug/cnc/io-labels")
+    def get_cnc_io_labels(session: Session = Depends(get_session)) -> dict:
+        return cnc_io_labels_snapshot(session)
+
+    @application.post("/api/debug/cnc/test")
+    def test_cnc_debug_connection(payload: CncTelemetryConnectionTest) -> dict:
+        return test_cnc_telemetry_connection(
+            payload.host,
+            payload.port,
+            payload.username,
+            payload.password,
+            payload.timeout_seconds,
+        )
+
     @application.post("/api/debug/io/toggle")
     def toggle_debug_io_value(
         payload: ToggleDebugIo,
@@ -268,6 +435,202 @@ def create_app(database_url: str | None = None) -> FastAPI:
         session: Session = Depends(get_session),
     ) -> dict:
         return {"files": robot_program_files(session, include_all=include_all)}
+
+    @application.get("/api/robot-files")
+    def get_robot_files(
+        path: str | None = Query(default=None, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, robot_settings = robot_file_connection(session)
+        try:
+            return list_robot_directory(
+                path=path,
+                extensions=set(json.loads(robot_settings.robot_program_extensions))
+                if robot_settings.robot_programs_filter_enabled else None,
+                **connection,
+            )
+        except RobotFileAccessError as error:
+            raise robot_file_error(error) from error
+
+    @application.get("/api/robot-files/preview")
+    def preview_robot_file(
+        path: str = Query(min_length=1, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, _ = robot_file_connection(session)
+        try:
+            return read_robot_file(path=path, **connection)
+        except RobotFileAccessError as error:
+            raise robot_file_error(error) from error
+
+    @application.get("/api/robot-files/download")
+    def download_robot_program_file(
+        path: str = Query(min_length=1, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> StreamingResponse:
+        connection, _ = robot_file_connection(session)
+        try:
+            name, content = download_robot_file(path=path, **connection)
+        except RobotFileAccessError as error:
+            raise robot_file_error(error) from error
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    @application.post("/api/robot-files/upload")
+    def upload_robot_program_file(
+        file: UploadFile = File(...),
+        destination_directory: str = Form(default=""),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, _ = robot_file_connection(session)
+        try:
+            path = upload_robot_file(
+                destination=destination_directory,
+                filename=file.filename or "",
+                content=file.file,
+                **connection,
+            )
+            return {"path": path}
+        except RobotFileAccessError as error:
+            raise robot_file_error(error) from error
+        finally:
+            file.file.close()
+
+    @application.post("/api/robot-files/action")
+    def manage_robot_program_file(
+        payload: RobotFileAction,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, robot_settings = robot_file_connection(session)
+        try:
+            if payload.action == "copy":
+                path = copy_robot_file(source=payload.path, destination_directory=payload.destination_directory, conflict_strategy=payload.conflict_strategy, **connection)
+                return {"path": path, "skipped": path is None}
+            if payload.action == "move":
+                path = move_robot_file(source=payload.path, destination_directory=payload.destination_directory, conflict_strategy=payload.conflict_strategy, **connection)
+                return {"path": path, "skipped": path is None}
+            if payload.action == "rename":
+                return {"path": rename_robot_file(path=payload.path, name=payload.name, **connection)}
+            if payload.action == "delete":
+                delete_robot_path(path=payload.path, **connection)
+                return {"deleted": payload.path}
+            if payload.action == "create_folder":
+                return {"path": create_robot_directory(parent=payload.destination_directory, name=payload.folder_name, **connection)}
+            name, content = download_robot_file(path=payload.path, **connection)
+            command = resolve_editor_command(robot_settings.robot_editor_command)
+            editor_directory = PROJECT_ROOT / "runtime" / "robot-editor"
+            editor_directory.mkdir(parents=True, exist_ok=True)
+            local_path = editor_directory / name
+            local_path.write_bytes(content)
+            subprocess.Popen(command + [str(local_path)], cwd=PROJECT_ROOT, creationflags=subprocess.CREATE_NO_WINDOW)
+            return {"path": payload.path, "local_path": str(local_path)}
+        except RobotFileConflict as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"message": str(error), "destination": error.destination}) from error
+        except RobotFileAccessError as error:
+            raise robot_file_error(error) from error
+        except OSError as error:
+            raise HTTPException(status_code=422, detail=f"Could not open the editor: {error}") from error
+
+    @application.get("/api/mill-files")
+    def get_mill_files(
+        path: str | None = Query(default=None, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, mill_settings = mill_file_connection(session)
+        try:
+            return list_robot_directory(
+                path=path,
+                extensions=set(json.loads(mill_settings.mill_program_extensions))
+                if mill_settings.mill_programs_filter_enabled else None,
+                **connection,
+            )
+        except RobotFileAccessError as error:
+            raise mill_file_error(error) from error
+
+    @application.get("/api/mill-files/preview")
+    def preview_mill_file(
+        path: str = Query(min_length=1, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, _ = mill_file_connection(session)
+        try:
+            return read_robot_file(path=path, **connection)
+        except RobotFileAccessError as error:
+            raise mill_file_error(error) from error
+
+    @application.get("/api/mill-files/download")
+    def download_mill_program_file(
+        path: str = Query(min_length=1, max_length=1000),
+        session: Session = Depends(get_session),
+    ) -> StreamingResponse:
+        connection, _ = mill_file_connection(session)
+        try:
+            name, content = download_robot_file(path=path, **connection)
+        except RobotFileAccessError as error:
+            raise mill_file_error(error) from error
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    @application.post("/api/mill-files/upload")
+    def upload_mill_program_file(
+        file: UploadFile = File(...),
+        destination_directory: str = Form(default=""),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, _ = mill_file_connection(session)
+        try:
+            path = upload_robot_file(
+                destination=destination_directory,
+                filename=file.filename or "",
+                content=file.file,
+                **connection,
+            )
+            return {"path": path}
+        except RobotFileAccessError as error:
+            raise mill_file_error(error) from error
+        finally:
+            file.file.close()
+
+    @application.post("/api/mill-files/action")
+    def manage_mill_program_file(
+        payload: RobotFileAction,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        connection, mill_settings = mill_file_connection(session)
+        try:
+            if payload.action == "copy":
+                path = copy_robot_file(source=payload.path, destination_directory=payload.destination_directory, conflict_strategy=payload.conflict_strategy, **connection)
+                return {"path": path, "skipped": path is None}
+            if payload.action == "move":
+                path = move_robot_file(source=payload.path, destination_directory=payload.destination_directory, conflict_strategy=payload.conflict_strategy, **connection)
+                return {"path": path, "skipped": path is None}
+            if payload.action == "rename":
+                return {"path": rename_robot_file(path=payload.path, name=payload.name, **connection)}
+            if payload.action == "delete":
+                delete_robot_path(path=payload.path, **connection)
+                return {"deleted": payload.path}
+            if payload.action == "create_folder":
+                return {"path": create_robot_directory(parent=payload.destination_directory, name=payload.folder_name, **connection)}
+            name, content = download_robot_file(path=payload.path, **connection)
+            command = resolve_editor_command(mill_settings.mill_editor_command)
+            editor_directory = PROJECT_ROOT / "runtime" / "mill-editor"
+            editor_directory.mkdir(parents=True, exist_ok=True)
+            local_path = editor_directory / name
+            local_path.write_bytes(content)
+            subprocess.Popen(command + [str(local_path)], cwd=PROJECT_ROOT, creationflags=subprocess.CREATE_NO_WINDOW)
+            return {"path": payload.path, "local_path": str(local_path)}
+        except RobotFileConflict as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"message": str(error), "destination": error.destination}) from error
+        except RobotFileAccessError as error:
+            raise mill_file_error(error) from error
+        except OSError as error:
+            raise HTTPException(status_code=422, detail=f"Could not open the editor: {error}") from error
 
     @application.post("/api/debug/programs/run")
     def run_debug_program_button(

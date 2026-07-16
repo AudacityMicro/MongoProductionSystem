@@ -11,12 +11,19 @@ const ui = {
   queue: document.querySelector("#queue-list"),
   pool: document.querySelector("#pool-list"),
   machine: document.querySelector("#machine-slot"),
+  onDeck: document.querySelector("#on-deck-slot"),
+  dripping: document.querySelector("#dripping-slot"),
   storage: document.querySelector("#storage-list"),
   warning: document.querySelector("#program-warning"),
   toast: document.querySelector("#toast"),
   palletDialog: document.querySelector("#pallet-dialog"),
   palletForm: document.querySelector("#pallet-form"),
   confirmDialog: document.querySelector("#confirm-dialog"),
+  autoscheduleDialog: document.querySelector("#autoschedule-dialog"),
+  autoscheduleSummary: document.querySelector("#autoschedule-summary"),
+  autoscheduleWarning: document.querySelector("#autoschedule-warning"),
+  autoscheduleSteps: document.querySelector("#autoschedule-steps"),
+  autoscheduleNote: document.querySelector("#autoschedule-note"),
   debugPanel: document.querySelector("#debug-panel"),
   debugState: document.querySelector("#debug-state"),
 };
@@ -25,6 +32,7 @@ let board = null;
 let draggedPalletId = null;
 let draggedCardContext = null;
 let confirmCallback = null;
+let autoschedulePlan = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -39,6 +47,22 @@ function displayWeight(weightKg) {
     return `${(weightKg * KG_TO_LB).toFixed(2)} lb`;
   }
   return `${weightKg.toFixed(2)} kg`;
+}
+
+function displayCycleTime(seconds) {
+  if (!seconds) return "";
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
+}
+
+function syncRobotProgramsNav() {
+  document.querySelectorAll("[data-robot-programs-nav]").forEach(link => {
+    link.classList.toggle("hidden", !board?.settings.robot_programs_page_enabled);
+  });
+  document.querySelectorAll("[data-mill-programs-nav]").forEach(link => {
+    link.classList.toggle("hidden", !board?.settings.mill_programs_page_enabled);
+  });
 }
 
 function inputWeight(weightKg) {
@@ -82,6 +106,10 @@ function palletCard(pallet, position = null) {
     ? `<span class="queue-chip">Queued #${pallet.queue_position + 1}</span>`
     : "";
   const cardContext = position === null ? "physical" : "queue";
+  const programDetails = pallet.program_tools?.length && pallet.expected_cycle_seconds
+    ? `<div><dt>Tools</dt><dd>${escapeHtml(pallet.program_tools.join(", "))}</dd></div>
+       <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
+    : "";
   return `
     <article class="pallet-card content-${pallet.content_status}" draggable="true"
       data-pallet-id="${pallet.id}" data-card-context="${cardContext}" tabindex="0">
@@ -94,6 +122,7 @@ function palletCard(pallet, position = null) {
         <div><dt>Holding</dt><dd>${escapeHtml(pallet.workholding)}</dd></div>
         <div><dt>Weight</dt><dd>${displayWeight(pallet.weight_kg)}</dd></div>
         <div><dt>Program</dt><dd class="${pallet.program_path ? "" : "muted"}">${escapeHtml(program)}</dd></div>
+        ${programDetails}
       </dl>
       <div class="card-actions">
         ${queueAction}
@@ -105,12 +134,15 @@ function palletCard(pallet, position = null) {
 }
 
 function renderBoard() {
+  syncRobotProgramsNav();
   const pallets = board.pallets;
   const queue = pallets.filter(item => item.queue_position !== null)
     .sort((a, b) => a.queue_position - b.queue_position);
   const pool = pallets.filter(item => item.location === "pool")
     .sort((a, b) => a.pool_slot_number - b.pool_slot_number);
   const machine = pallets.find(item => item.location === "machine");
+  const onDeck = pallets.find(item => item.location === "on_deck");
+  const dripping = pallets.find(item => item.location === "dripping");
   const stored = pallets.filter(item => item.location === "storage")
     .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -132,12 +164,19 @@ function renderBoard() {
   ui.machine.innerHTML = machine
     ? palletCard(machine)
     : emptyState("Machine is available");
+  ui.onDeck.innerHTML = onDeck
+    ? palletCard(onDeck)
+    : emptyState("Stage the next pallet here");
+  ui.dripping.innerHTML = dripping
+    ? palletCard(dripping)
+    : emptyState("Stage finished pallets here");
 
   ui.storage.innerHTML = stored.length
     ? stored.map(item => palletCard(item)).join("")
     : emptyState("Stored pallets appear here");
 
   document.querySelector("#queue-count").textContent = `${queue.length} pallet${queue.length === 1 ? "" : "s"}`;
+  document.querySelector("#autoschedule-queue").disabled = queue.filter(item => item.program_tools?.length).length < 2;
   document.querySelector("#pool-count").textContent = `${pool.length} pallet${pool.length === 1 ? "" : "s"}`;
   document.querySelector("#storage-count").textContent = `${stored.length} pallet${stored.length === 1 ? "" : "s"}`;
   document.querySelector("#weight-unit-label").textContent = `(${board.settings.weight_unit})`;
@@ -251,7 +290,59 @@ async function queuePallet(id, queueIndex = null) {
   }, `Queued ${palletById(id)?.name || "pallet"}.`);
 }
 
+function toolList(values) {
+  return values?.length ? values.join(", ") : "None";
+}
+
+function renderAutoschedulePlan(plan) {
+  const savings = plan.savings.tool_movements;
+  ui.autoscheduleSummary.innerHTML = `
+    <article><span>Current movements</span><strong>${plan.original.tool_movements}</strong></article>
+    <article><span>Optimized movements</span><strong>${plan.optimized.tool_movements}</strong></article>
+    <article><span>Estimated savings</span><strong>${savings}</strong></article>
+    <article><span>ATC baseline</span><strong>${plan.atc.initial_tools.length}/${plan.atc.capacity}</strong></article>`;
+  ui.autoscheduleWarning.classList.toggle("hidden", !plan.warning);
+  ui.autoscheduleWarning.textContent = plan.warning || "";
+  ui.autoscheduleSteps.innerHTML = plan.optimized.steps.length
+    ? plan.optimized.steps.map((step, index) => `
+      <li>
+        <span class="autoschedule-position">${index + 1}</span>
+        <div><strong>${escapeHtml(step.name)}</strong><small>${escapeHtml(step.program)}</small></div>
+        <div><span>Required</span><b>${escapeHtml(toolList(step.required_tools))}</b></div>
+        <div><span>Before job</span><b class="tool-load">Load: ${escapeHtml(toolList(step.load_before))}</b><b class="tool-unload">Remove: ${escapeHtml(toolList(step.unload_before))}</b></div>
+      </li>`).join("")
+    : `<li class="autoschedule-empty">No queued pallets have active program tool requirements.</li>`;
+  const fixedNote = plan.fixed_pallets.length
+    ? ` ${plan.fixed_pallets.length} pallet${plan.fixed_pallets.length === 1 ? "" : "s"} without active tool requirements will remain in place.`
+    : "";
+  ui.autoscheduleNote.textContent = `${plan.algorithm}. ${plan.automation.note}${fixedNote}`;
+  document.querySelector("#apply-autoschedule").disabled = !plan.can_apply;
+  document.querySelector("#apply-autoschedule").textContent = plan.can_apply ? "Apply optimized order" : "Already optimized";
+}
+
+async function previewAutoschedule() {
+  const button = document.querySelector("#autoschedule-queue");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Analyzing ATC...";
+  try {
+    autoschedulePlan = await api("/api/queue/autoschedule/preview", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision}),
+    });
+    renderAutoschedulePlan(autoschedulePlan);
+    ui.autoscheduleDialog.showModal();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    button.textContent = label;
+    const activeCount = board.pallets.filter(item => item.queue_position !== null && item.program_tools?.length).length;
+    button.disabled = activeCount < 2;
+  }
+}
+
 document.querySelector("#create-pallet").addEventListener("click", () => openPalletDialog());
+document.querySelector("#autoschedule-queue").addEventListener("click", previewAutoschedule);
 ui.palletForm.addEventListener("submit", savePallet);
 document.querySelectorAll("[data-close-pallet]").forEach(button => {
   button.addEventListener("click", () => ui.palletDialog.close());
@@ -292,6 +383,30 @@ document.querySelector("#confirm-action").addEventListener("click", async event 
   ui.confirmDialog.close();
   if (confirmCallback) await confirmCallback();
   confirmCallback = null;
+});
+
+document.querySelector("#apply-autoschedule").addEventListener("click", async () => {
+  if (!autoschedulePlan?.can_apply) return;
+  const button = document.querySelector("#apply-autoschedule");
+  button.disabled = true;
+  button.textContent = "Applying...";
+  try {
+    board = await api("/api/queue", {
+      method: "PUT",
+      body: JSON.stringify({
+        expected_revision: autoschedulePlan.revision,
+        pallet_ids: autoschedulePlan.optimized.pallet_ids,
+      }),
+    });
+    ui.autoscheduleDialog.close();
+    renderBoard();
+    showToast(`Queue optimized. Estimated ${autoschedulePlan.savings.tool_movements} fewer tool movements.`);
+    autoschedulePlan = null;
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Apply optimized order";
+    showToast(error.message, "error");
+  }
 });
 
 document.addEventListener("dragstart", event => {

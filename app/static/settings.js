@@ -5,6 +5,9 @@ const ui = {
   extensions: document.querySelector("#program-extensions"),
   unit: document.querySelector("#weight-unit"),
   poolSlotCount: document.querySelector("#pool-slot-count"),
+  poolLocationGrid: document.querySelector("#pool-location-grid"),
+  onDeckLocationFields: document.querySelector("#on-deck-location-fields"),
+  drippingLocationFields: document.querySelector("#dripping-location-fields"),
   debugMenuEnabled: document.querySelector("#debug-menu-enabled"),
   manualIoControlEnabled: document.querySelector("#manual-io-control-enabled"),
   robotConnectionMode: document.querySelector("#robot-connection-mode"),
@@ -12,6 +15,14 @@ const ui = {
   robotPort: document.querySelector("#robot-port"),
   robotPollHz: document.querySelector("#robot-poll-hz"),
   robotTimeoutSeconds: document.querySelector("#robot-timeout-seconds"),
+  cncTelemetryEnabled: document.querySelector("#cnc-telemetry-enabled"),
+  cncHost: document.querySelector("#cnc-host"),
+  cncSshPort: document.querySelector("#cnc-ssh-port"),
+  cncSshUsername: document.querySelector("#cnc-ssh-username"),
+  cncSshPassword: document.querySelector("#cnc-ssh-password"),
+  cncTimeoutSeconds: document.querySelector("#cnc-timeout-seconds"),
+  testCncTelemetry: document.querySelector("#test-cnc-telemetry"),
+  cncTelemetryStatus: document.querySelector("#cnc-telemetry-status"),
   debugProgramButtonCount: document.querySelector("#debug-program-button-count"),
   robotFileAccessEnabled: document.querySelector("#robot-file-access-enabled"),
   robotFileHost: document.querySelector("#robot-file-host"),
@@ -20,6 +31,16 @@ const ui = {
   robotFilePassword: document.querySelector("#robot-file-password"),
   robotFileDirectory: document.querySelector("#robot-file-directory"),
   robotProgramExtensions: document.querySelector("#robot-program-extensions"),
+  robotProgramsFilterEnabled: document.querySelector("#robot-programs-filter-enabled"),
+  robotProgramsPageEnabled: document.querySelector("#robot-programs-page-enabled"),
+  robotEditorCommand: document.querySelector("#robot-editor-command"),
+  millFileDirectory: document.querySelector("#mill-file-directory"),
+  millProgramExtensions: document.querySelector("#mill-program-extensions"),
+  millProgramsFilterEnabled: document.querySelector("#mill-programs-filter-enabled"),
+  millProgramsPageEnabled: document.querySelector("#mill-programs-page-enabled"),
+  millEditorCommand: document.querySelector("#mill-editor-command"),
+  fusionToolLibraryUpload: document.querySelector("#fusion-tool-library-upload"),
+  fusionToolLibraryList: document.querySelector("#fusion-tool-library-list"),
   openRobotDirectory: document.querySelector("#open-robot-directory"),
   robotFileAccessStatus: document.querySelector("#robot-file-access-status"),
   robotDirectoryModal: document.querySelector("#robot-directory-modal"),
@@ -50,8 +71,9 @@ let pendingNavigation = null;
 let suppressNextPopstatePrompt = false;
 
 async function api(url, options = {}) {
+  const headers = options.body instanceof FormData ? {} : {"Content-Type": "application/json"};
   const response = await fetch(url, {
-    headers: {"Content-Type": "application/json"},
+    headers,
     ...options,
   });
   const data = await response.json().catch(() => ({}));
@@ -114,12 +136,64 @@ function robotProgramExtensions() {
   return values.length ? values : board.settings.robot_program_extensions;
 }
 
+function millProgramExtensions() {
+  const values = ui.millProgramExtensions.value.split(",").map(value => value.trim()).filter(Boolean);
+  return values.length ? values : board.settings.mill_program_extensions;
+}
+
+function locationInput(axis, value, scope, slot = "") {
+  const label = axis.replace("_mm", "").toUpperCase();
+  return `<label>${label} (mm)<input type="number" step="0.001" data-location-scope="${scope}" data-location-slot="${slot}" data-location-axis="${axis}" value="${Number(value || 0)}"></label>`;
+}
+
+function bindLocationInputs(container) {
+  for (const input of container.querySelectorAll("input")) {
+    input.addEventListener("input", () => { if (!isLoadingSettings) refreshDirtyState(); });
+  }
+}
+
+function readLocation(scope, slot = "") {
+  const values = {};
+  for (const axis of ["x_mm", "y_mm", "z_mm"]) {
+    const input = ui.form.querySelector(`[data-location-scope="${scope}"][data-location-slot="${slot}"][data-location-axis="${axis}"]`);
+    values[axis] = Number(input?.value || 0);
+  }
+  return values;
+}
+
+function poolLocationsDraft() {
+  const count = fieldNumber(ui.poolSlotCount, board.settings.pool_slot_count);
+  return Array.from({length: count}, (_, index) => ({slot: index + 1, ...readLocation("pool", String(index + 1))}));
+}
+
+function renderLocationFields() {
+  const hasCurrentInputs = Boolean(ui.poolLocationGrid.querySelector("[data-location-scope='pool']"));
+  const current = hasCurrentInputs ? new Map(poolLocationsDraft().map(location => [location.slot, location])) : new Map();
+  const saved = new Map((board?.settings.pool_locations || []).map(location => [location.slot, location]));
+  const count = fieldNumber(ui.poolSlotCount, board?.settings.pool_slot_count || 16);
+  ui.poolLocationGrid.innerHTML = Array.from({length: count}, (_, index) => {
+    const slot = index + 1;
+    const location = current.get(slot) || saved.get(slot) || {};
+    return `<fieldset class="location-fieldset"><legend>Pool ${String(slot).padStart(2, "0")}</legend><div class="location-axis-row">${locationInput("x_mm", location.x_mm, "pool", slot)}${locationInput("y_mm", location.y_mm, "pool", slot)}${locationInput("z_mm", location.z_mm, "pool", slot)}</div></fieldset>`;
+  }).join("");
+  const onDeck = ui.onDeckLocationFields.querySelector("input") ? readLocation("on_deck") : board?.settings.on_deck_location || {};
+  const dripping = ui.drippingLocationFields.querySelector("input") ? readLocation("dripping") : board?.settings.dripping_location || {};
+  ui.onDeckLocationFields.innerHTML = `<div class="location-axis-row">${locationInput("x_mm", onDeck.x_mm, "on_deck")}${locationInput("y_mm", onDeck.y_mm, "on_deck")}${locationInput("z_mm", onDeck.z_mm, "on_deck")}</div>`;
+  ui.drippingLocationFields.innerHTML = `<div class="location-axis-row">${locationInput("x_mm", dripping.x_mm, "dripping")}${locationInput("y_mm", dripping.y_mm, "dripping")}${locationInput("z_mm", dripping.z_mm, "dripping")}</div>`;
+  bindLocationInputs(ui.poolLocationGrid);
+  bindLocationInputs(ui.onDeckLocationFields);
+  bindLocationInputs(ui.drippingLocationFields);
+}
+
 function settingsDraft() {
   return {
     source_folder: ui.source.value,
     program_extensions: programExtensions(),
     weight_unit: ui.unit.value,
     pool_slot_count: fieldNumber(ui.poolSlotCount, board.settings.pool_slot_count),
+    pool_locations: poolLocationsDraft(),
+    on_deck_location: readLocation("on_deck"),
+    dripping_location: readLocation("dripping"),
     debug_menu_enabled: ui.debugMenuEnabled.checked,
     manual_io_control_enabled: ui.manualIoControlEnabled.checked,
     robot_connection_mode: ui.robotConnectionMode.value,
@@ -127,6 +201,12 @@ function settingsDraft() {
     robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30004),
     robot_poll_hz: fieldNumber(ui.robotPollHz, board.settings.robot_poll_hz || 10),
     robot_timeout_seconds: fieldNumber(ui.robotTimeoutSeconds, board.settings.robot_timeout_seconds || 1.0),
+    cnc_telemetry_enabled: ui.cncTelemetryEnabled.checked,
+    cnc_host: ui.cncHost.value.trim(),
+    cnc_ssh_port: fieldNumber(ui.cncSshPort, board.settings.cnc_ssh_port || 22),
+    cnc_ssh_username: ui.cncSshUsername.value.trim() || "operator",
+    cnc_ssh_password: ui.cncSshPassword.value,
+    cnc_timeout_seconds: fieldNumber(ui.cncTimeoutSeconds, board.settings.cnc_timeout_seconds || 2),
     debug_program_button_count: fieldNumber(ui.debugProgramButtonCount, board.settings.debug_program_button_count || 4),
     robot_file_access_enabled: ui.robotFileAccessEnabled.checked,
     robot_file_host: ui.robotFileHost.value.trim(),
@@ -135,6 +215,14 @@ function settingsDraft() {
     robot_file_password: ui.robotFilePassword.value,
     robot_file_directory: ui.robotFileDirectory.value.trim() || "/programs",
     robot_program_extensions: robotProgramExtensions(),
+    robot_programs_filter_enabled: ui.robotProgramsFilterEnabled.checked,
+    robot_programs_page_enabled: ui.robotProgramsPageEnabled.checked,
+    robot_editor_command: ui.robotEditorCommand.value.trim() || "code",
+    mill_file_directory: ui.millFileDirectory.value.trim() || "/home/operator/gcode",
+    mill_program_extensions: millProgramExtensions(),
+    mill_programs_filter_enabled: ui.millProgramsFilterEnabled.checked,
+    mill_programs_page_enabled: ui.millProgramsPageEnabled.checked,
+    mill_editor_command: ui.millEditorCommand.value.trim() || "code",
   };
 }
 
@@ -159,6 +247,7 @@ async function loadSettings() {
     ui.extensions.value = board.settings.program_extensions.join(", ");
     ui.unit.value = board.settings.weight_unit;
     ui.poolSlotCount.value = board.settings.pool_slot_count;
+    renderLocationFields();
     ui.debugMenuEnabled.checked = board.settings.debug_menu_enabled;
     ui.manualIoControlEnabled.checked = board.settings.manual_io_control_enabled;
     ui.robotConnectionMode.value = board.settings.robot_connection_mode;
@@ -166,6 +255,12 @@ async function loadSettings() {
     ui.robotPort.value = board.settings.robot_port;
     ui.robotPollHz.value = board.settings.robot_poll_hz;
     ui.robotTimeoutSeconds.value = board.settings.robot_timeout_seconds;
+    ui.cncTelemetryEnabled.checked = board.settings.cnc_telemetry_enabled;
+    ui.cncHost.value = board.settings.cnc_host || "";
+    ui.cncSshPort.value = board.settings.cnc_ssh_port || 22;
+    ui.cncSshUsername.value = board.settings.cnc_ssh_username || "operator";
+    ui.cncSshPassword.value = board.settings.cnc_ssh_password || "";
+    ui.cncTimeoutSeconds.value = board.settings.cnc_timeout_seconds || 2;
     ui.debugProgramButtonCount.value = board.settings.debug_program_button_count || 4;
     ui.robotFileAccessEnabled.checked = board.settings.robot_file_access_enabled;
     ui.robotFileHost.value = board.settings.robot_file_host || "";
@@ -174,6 +269,17 @@ async function loadSettings() {
     ui.robotFilePassword.value = board.settings.robot_file_password;
     ui.robotFileDirectory.value = board.settings.robot_file_directory || "/programs";
     ui.robotProgramExtensions.value = board.settings.robot_program_extensions.join(", ");
+    ui.robotProgramsFilterEnabled.checked = board.settings.robot_programs_filter_enabled;
+    ui.robotProgramsPageEnabled.checked = board.settings.robot_programs_page_enabled;
+    ui.robotEditorCommand.value = board.settings.robot_editor_command || "code";
+    ui.millFileDirectory.value = board.settings.mill_file_directory || "/home/operator/gcode";
+    ui.millProgramExtensions.value = board.settings.mill_program_extensions.join(", ");
+    ui.millProgramsFilterEnabled.checked = board.settings.mill_programs_filter_enabled;
+    ui.millProgramsPageEnabled.checked = board.settings.mill_programs_page_enabled;
+    ui.millEditorCommand.value = board.settings.mill_editor_command || "code";
+    renderFusionToolLibraries(board.settings.fusion_tool_libraries || []);
+    document.querySelectorAll("[data-robot-programs-nav]").forEach(link => link.classList.toggle("hidden", !board.settings.robot_programs_page_enabled));
+    document.querySelectorAll("[data-mill-programs-nav]").forEach(link => link.classList.toggle("hidden", !board.settings.mill_programs_page_enabled));
     savedSettingsSignature = JSON.stringify(settingsDraft());
     setDirtyState(false);
     syncRobotModeUi();
@@ -219,6 +325,84 @@ ui.form.addEventListener("submit", async event => {
 });
 
 ui.robotConnectionMode.addEventListener("change", syncRobotModeUi);
+ui.testCncTelemetry.addEventListener("click", async () => {
+  const originalLabel = ui.testCncTelemetry.textContent;
+  ui.testCncTelemetry.disabled = true;
+  ui.testCncTelemetry.textContent = "Testing...";
+  ui.cncTelemetryStatus.textContent = "Connecting to PathPilot...";
+  try {
+    const result = await api("/api/debug/cnc/test", {
+      method: "POST",
+      body: JSON.stringify({
+        host: ui.cncHost.value.trim(),
+        port: fieldNumber(ui.cncSshPort, 22),
+        username: ui.cncSshUsername.value.trim() || "operator",
+        password: ui.cncSshPassword.value,
+        timeout_seconds: fieldNumber(ui.cncTimeoutSeconds, 2),
+      }),
+    });
+    ui.cncTelemetryStatus.textContent = `${result.message} Program: ${result.program}.`;
+  } catch (error) {
+    ui.cncTelemetryStatus.textContent = error.message;
+  } finally {
+    ui.testCncTelemetry.disabled = false;
+    ui.testCncTelemetry.textContent = originalLabel;
+  }
+});
+ui.poolSlotCount.addEventListener("change", () => {
+  if (!board) return;
+  renderLocationFields();
+  refreshDirtyState();
+});
+
+function renderFusionToolLibraries(libraries) {
+  ui.fusionToolLibraryList.replaceChildren();
+  if (!libraries.length) {
+    ui.fusionToolLibraryList.textContent = "No uploaded Fusion tool libraries.";
+    return;
+  }
+  for (const library of libraries) {
+    const row = document.createElement("div");
+    row.className = "managed-library-row";
+    const name = document.createElement("span");
+    name.textContent = library.name;
+    const remove = document.createElement("button");
+    remove.className = "button ghost";
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.dataset.fusionLibraryPath = library.path;
+    row.append(name, remove);
+    ui.fusionToolLibraryList.append(row);
+  }
+}
+
+ui.fusionToolLibraryUpload.addEventListener("change", async () => {
+  const files = [...ui.fusionToolLibraryUpload.files];
+  if (!files.length) return;
+  const body = new FormData();
+  for (const file of files) body.append("files", file);
+  try {
+    await api("/api/tool-libraries/upload", {method: "POST", body});
+    showToast(`${files.length} Fusion tool librar${files.length === 1 ? "y" : "ies"} uploaded.`);
+    await loadSettings();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.fusionToolLibraryUpload.value = "";
+  }
+});
+
+ui.fusionToolLibraryList.addEventListener("click", async event => {
+  const button = event.target.closest("[data-fusion-library-path]");
+  if (!button || !window.confirm("Remove this uploaded Fusion tool library?")) return;
+  try {
+    await api(`/api/tool-libraries?path=${encodeURIComponent(button.dataset.fusionLibraryPath)}`, {method: "DELETE"});
+    showToast("Fusion tool library removed.");
+    await loadSettings();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+});
 
 for (const field of ui.form.querySelectorAll("input, select, textarea")) {
   const eventName = field.type === "checkbox" || field.tagName === "SELECT" ? "change" : "input";

@@ -14,9 +14,118 @@ def test_health_and_pages(client: TestClient) -> None:
     assert payload["started_at"]
     assert "Pallet schedule" in client.get("/").text
     assert "Robot readable I/O" in client.get("/debugging").text
+    assert "Tormach 1500MX / PathPilot" in client.get("/debugging").text
     settings_page = client.get("/settings").text
     assert "Scheduling settings" in settings_page
     assert "Close and relaunch" in settings_page
+
+
+def test_cnc_debug_baseline(client: TestClient) -> None:
+    response = client.get("/api/debug/cnc")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["machine_model"] == "Tormach 1500MX"
+    assert payload["connected"] is False
+    assert payload["connection_label"] == "Telemetry disabled"
+    assert payload["axis_rows"] == []
+
+
+def test_cnc_debug_reports_extended_machine_diagnostics(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.service.read_linuxcnc_snapshot",
+        lambda *args: {
+            "task_state": 4,
+            "task_mode": 2,
+            "interp_state": 1,
+            "program": "/home/operator/program.nc",
+            "tool_in_spindle": 20,
+            "spindle_speed": 5000,
+            "spindle_enabled": 1,
+            "flood": False,
+            "mist": False,
+            "feedrate": 1.0,
+            "axis_rows": [{"axis": "X", "position": 1.0, "commanded": 1.1, "velocity": 2.0, "following_error": 0.0, "homed": True, "limit": 0, "distance_to_go": 0.1}],
+            "atc": {"slots": []},
+            "tool_table": [],
+            "health": {"enabled": True, "homed": [True], "limits": [0]},
+            "motion": {"distance_to_go": 0.1},
+            "coordinates": {"g5x_index": 1},
+            "program_execution": {"g_codes": ["G54"], "m_codes": ["M5"]},
+            "spindle_details": {"feedback_speed": 4999},
+            "probe": {"tripped": False},
+            "tooling": {"prepared_pocket": 3},
+            "production": {"m30_a": 12},
+            "io": {"digital_inputs": [False, True], "digital_outputs": [True], "analog_inputs": [0.0], "analog_outputs": [1.0]},
+        },
+    )
+    board = client.get("/api/board").json()
+    saved = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "cnc_telemetry_enabled": True,
+            "cnc_host": "tormach",
+            "cnc_ssh_username": "operator",
+        },
+    )
+    assert saved.status_code == 200
+
+    payload = client.get("/api/debug/cnc").json()
+
+    assert payload["connected"] is True
+    assert payload["health"]["enabled"] is True
+    assert payload["motion"]["distance_to_go"] == 0.1
+    assert payload["coordinates"]["g5x_index"] == 1
+    assert payload["program_execution"]["m_codes"] == ["M5"]
+    assert payload["spindle_details"]["feedback_speed"] == 4999
+    assert payload["probe"]["tripped"] is False
+    assert payload["tooling"]["prepared_pocket"] == 3
+    assert payload["production"]["m30_a"] == 12
+    assert payload["io"]["digital_inputs"] == [False, True]
+
+
+def test_cnc_io_labels_are_read_from_pathpilot_hal_map(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.service.read_linuxcnc_io_labels",
+        lambda *args: {
+            "digital_inputs": {"17": "atc-tray-in"},
+            "digital_outputs": {"36": "chip-conveyor-enable"},
+            "analog_inputs": {"6": "atc-slot"},
+            "analog_outputs": {"20": "chip-conveyor-active-time"},
+        },
+    )
+    board = client.get("/api/board").json()
+    saved = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "cnc_telemetry_enabled": True,
+            "cnc_host": "tormach",
+            "cnc_ssh_username": "operator",
+        },
+    )
+    assert saved.status_code == 200
+
+    payload = client.get("/api/debug/cnc/io-labels").json()
+
+    assert payload["connected"] is True
+    assert payload["labels"]["digital_inputs"]["17"] == "atc-tray-in"
+    assert payload["labels"]["digital_outputs"]["36"] == "chip-conveyor-enable"
+
+
+def test_cnc_connection_test_requires_connection_details(client: TestClient) -> None:
+    response = client.post("/api/debug/cnc/test", json={"host": "", "username": "operator"})
+
+    assert response.status_code == 422
 
 
 def test_initial_board(client: TestClient) -> None:
@@ -97,6 +206,41 @@ def test_legacy_settings_save_does_not_reset_manual_io_control(client: TestClien
 
     assert response.status_code == 200
     assert response.json()["board"]["settings"]["manual_io_control_enabled"] is True
+
+
+def test_dashboard_reports_pending_atc_telemetry(client: TestClient) -> None:
+    dashboard = client.get("/api/dashboard")
+
+    assert dashboard.status_code == 200
+    assert dashboard.json()["atc_tools"] == []
+    assert dashboard.json()["atc_source"] == "Mill telemetry is not connected yet."
+
+
+def test_pallet_location_positions_persist(client: TestClient) -> None:
+    board = client.get("/api/board").json()
+    locations = [
+        {"slot": slot, "x_mm": slot * 10, "y_mm": slot * 20, "z_mm": slot * 30}
+        for slot in range(1, 17)
+    ]
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "pool_locations": locations,
+            "on_deck_location": {"x_mm": 1, "y_mm": 2, "z_mm": 3},
+            "dripping_location": {"x_mm": 4, "y_mm": 5, "z_mm": 6},
+        },
+    )
+
+    assert response.status_code == 200
+    settings = client.get("/api/settings").json()["settings"]
+    assert settings["pool_locations"][4] == {"slot": 5, "x_mm": 50.0, "y_mm": 100.0, "z_mm": 150.0}
+    assert settings["on_deck_location"] == {"x_mm": 1.0, "y_mm": 2.0, "z_mm": 3.0}
+    assert settings["dripping_location"] == {"x_mm": 4.0, "y_mm": 5.0, "z_mm": 6.0}
 
 
 def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> None:

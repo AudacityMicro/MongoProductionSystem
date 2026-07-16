@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -13,6 +14,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.models import AppSettings, Pallet
+from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
+from app.cnc_linuxcnc import CncTelemetryError, read_linuxcnc_io_labels, read_linuxcnc_snapshot
 from app.robot_dashboard import RobotDashboardError, loaded_robot_program, run_robot_program
 from app.robot_files import RobotFileAccessError, list_robot_program_files
 from app.pallet_names import PALLET_NAMES
@@ -95,6 +98,82 @@ def validate_program(program_path: str | None, programs: set[str]) -> str | None
     return normalized
 
 
+def program_metadata(program_path: str | None, content_status: str) -> dict:
+    if not program_path or content_status in {"complete_parts", "defective_parts"}:
+        return {"program_tools": [], "expected_cycle_seconds": None}
+    # Placeholder metadata until program headers are parsed. It is stable per file path.
+    digest = hashlib.sha256(program_path.casefold().encode("utf-8")).digest()
+    tool_count = 2 + digest[0] % 4
+    tools = sorted({1 + int.from_bytes(digest[index:index + 2], "big") % 999 for index in range(1, tool_count + 5)})[:tool_count]
+    cycle_seconds = 180 + int.from_bytes(digest[8:10], "big") % 2101
+    return {"program_tools": [f"T{tool}" for tool in tools], "expected_cycle_seconds": cycle_seconds}
+
+
+def _nested_value(item: dict, *paths: tuple[str, ...]) -> object | None:
+    for path in paths:
+        value: object = item
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def fusion_tool_library(path_value: str) -> tuple[list[dict], str | None]:
+    if not path_value.strip():
+        return [], "No Fusion 360 tool library is configured."
+    path = Path(path_value).expanduser()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except OSError:
+        return [], "The Fusion 360 tool library file is unavailable."
+    except json.JSONDecodeError:
+        return [], "The Fusion 360 tool library is not valid JSON."
+    entries = payload.get("data", payload.get("tools", [])) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        return [], "The Fusion 360 tool library does not contain a tool list."
+    tools: dict[int, dict] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        number = _nested_value(item, ("post-process", "number"), ("post_process", "number"), ("number",))
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= number <= 999:
+            continue
+        description = _nested_value(item, ("description",), ("comment",), ("product-id",), ("type",))
+        tools[number] = {"number": number, "tool": f"T{number}", "description": str(description or "Fusion tool")}
+    return [tools[number] for number in sorted(tools)], None
+
+
+def fusion_tool_library_paths(settings: AppSettings) -> list[str]:
+    try:
+        paths = json.loads(settings.fusion_tool_library_paths or "[]")
+    except json.JSONDecodeError:
+        paths = []
+    result = [path for path in paths if isinstance(path, str) and path.strip()]
+    if settings.fusion_tool_library_path.strip() and settings.fusion_tool_library_path not in result:
+        result.insert(0, settings.fusion_tool_library_path)
+    return result
+
+
+def fusion_tool_libraries(paths: list[str]) -> tuple[list[dict], list[str]]:
+    merged: dict[int, dict] = {}
+    warnings: list[str] = [] if paths else ["No Fusion 360 tool libraries are uploaded."]
+    for path in paths:
+        tools, warning = fusion_tool_library(path)
+        if warning:
+            warnings.append(f"{Path(path).name}: {warning}")
+        for tool in tools:
+            merged[tool["number"]] = tool
+    return [merged[number] for number in sorted(merged)], warnings
+
+
 def serialize_pallet(pallet: Pallet) -> dict:
     return {
         "id": pallet.id,
@@ -106,7 +185,58 @@ def serialize_pallet(pallet: Pallet) -> dict:
         "location": pallet.location,
         "queue_position": pallet.queue_position,
         "pool_slot_number": pallet.pool_slot_number,
+        **program_metadata(pallet.program_path, pallet.content_status),
     }
+
+
+def _location_position(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0}
+    try:
+        return {axis: float(value.get(axis, 0)) for axis in ("x_mm", "y_mm", "z_mm")}
+    except (TypeError, ValueError):
+        return {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0}
+
+
+def pallet_location_positions(settings: AppSettings) -> dict:
+    try:
+        raw_pool = json.loads(settings.pool_location_positions or "[]")
+    except json.JSONDecodeError:
+        raw_pool = []
+    stored = {
+        item.get("slot"): _location_position(item)
+        for item in raw_pool
+        if isinstance(item, dict) and isinstance(item.get("slot"), int)
+    }
+    pool = [
+        {"slot": slot, **stored.get(slot, _location_position({}))}
+        for slot in range(1, settings.pool_slot_count + 1)
+    ]
+    try:
+        on_deck = _location_position(json.loads(settings.on_deck_location_position))
+    except json.JSONDecodeError:
+        on_deck = _location_position({})
+    try:
+        dripping = _location_position(json.loads(settings.dripping_location_position))
+    except json.JSONDecodeError:
+        dripping = _location_position({})
+    return {"pool_locations": pool, "on_deck_location": on_deck, "dripping_location": dripping}
+
+
+def store_pallet_location_positions(settings: AppSettings, pool_locations: list[dict] | None, on_deck: dict | None, dripping: dict | None) -> None:
+    current = pallet_location_positions(settings)
+    if pool_locations is not None:
+        by_slot = {item["slot"]: item for item in pool_locations}
+        if set(by_slot) != set(range(1, settings.pool_slot_count + 1)):
+            raise problem(422, "Provide exactly one location for every configured pool slot.")
+        current["pool_locations"] = [{"slot": slot, **_location_position(by_slot[slot])} for slot in range(1, settings.pool_slot_count + 1)]
+    if on_deck is not None:
+        current["on_deck_location"] = _location_position(on_deck)
+    if dripping is not None:
+        current["dripping_location"] = _location_position(dripping)
+    settings.pool_location_positions = json.dumps(current["pool_locations"], separators=(",", ":"))
+    settings.on_deck_location_position = json.dumps(current["on_deck_location"], separators=(",", ":"))
+    settings.dripping_location_position = json.dumps(current["dripping_location"], separators=(",", ":"))
 
 
 def board_snapshot(session: Session) -> dict:
@@ -121,6 +251,7 @@ def board_snapshot(session: Session) -> dict:
             "program_extensions": json.loads(settings.program_extensions),
             "weight_unit": settings.weight_unit,
             "pool_slot_count": settings.pool_slot_count,
+            **pallet_location_positions(settings),
             "debug_menu_enabled": settings.debug_menu_enabled,
             "manual_io_control_enabled": settings.manual_io_control_enabled,
             "machine_state": settings.machine_state,
@@ -138,6 +269,22 @@ def board_snapshot(session: Session) -> dict:
             "robot_file_password_configured": bool(settings.robot_file_password),
             "robot_file_directory": settings.robot_file_directory,
             "robot_program_extensions": json.loads(settings.robot_program_extensions),
+            "robot_programs_page_enabled": settings.robot_programs_page_enabled,
+            "robot_programs_filter_enabled": settings.robot_programs_filter_enabled,
+            "robot_editor_command": settings.robot_editor_command,
+            "cnc_telemetry_enabled": settings.cnc_telemetry_enabled,
+            "cnc_host": settings.cnc_host,
+            "cnc_ssh_port": settings.cnc_ssh_port,
+            "cnc_ssh_username": settings.cnc_ssh_username,
+            "cnc_ssh_password": settings.cnc_ssh_password,
+            "cnc_timeout_seconds": settings.cnc_timeout_seconds,
+            "mill_file_directory": settings.mill_file_directory,
+            "mill_program_extensions": json.loads(settings.mill_program_extensions),
+            "mill_programs_page_enabled": settings.mill_programs_page_enabled,
+            "mill_programs_filter_enabled": settings.mill_programs_filter_enabled,
+            "mill_editor_command": settings.mill_editor_command,
+            "fusion_tool_library_path": settings.fusion_tool_library_path,
+            "fusion_tool_libraries": [{"path": path, "name": Path(path).name} for path in fusion_tool_library_paths(settings)],
         },
         "programs": programs,
         "program_warning": warning,
@@ -218,18 +365,261 @@ def robot_program_files(session: Session, include_all: bool = False) -> list[str
         raise problem(502, str(exc)) from exc
 
 
+def robot_programs_page_settings(session: Session) -> AppSettings:
+    settings = get_settings(session)
+    if not settings.robot_programs_page_enabled:
+        raise problem(404, "Robot Programs is disabled in Settings.")
+    return settings
+
+
+def robot_file_manager_settings(session: Session) -> AppSettings:
+    settings = robot_programs_page_settings(session)
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Robot Programs requires a configured physical robot.")
+    if not settings.robot_file_access_enabled:
+        raise problem(409, "Enable SFTP robot file access in Settings first.")
+    return settings
+
+
+def mill_programs_page_settings(session: Session) -> AppSettings:
+    settings = get_settings(session)
+    if not settings.mill_programs_page_enabled:
+        raise problem(404, "Mill Programs is disabled in Settings.")
+    return settings
+
+
+def mill_file_manager_settings(session: Session) -> AppSettings:
+    settings = mill_programs_page_settings(session)
+    if not settings.cnc_host.strip():
+        raise problem(409, "Mill Programs requires PathPilot SSH connection settings.")
+    if not settings.cnc_ssh_username or not settings.cnc_ssh_password:
+        raise problem(409, "Enter the PathPilot SSH username and password in Settings first.")
+    return settings
+
+
 def _board_summary(settings: AppSettings, pallets: list[Pallet]) -> dict:
     machine_pallet = next((item for item in pallets if item.location == "machine"), None)
+    on_deck_pallet = next((item for item in pallets if item.location == "on_deck"), None)
+    dripping_pallet = next((item for item in pallets if item.location == "dripping"), None)
     queue_count = sum(1 for item in pallets if item.queue_position is not None)
     pool_count = sum(1 for item in pallets if item.location == "pool")
     storage_count = sum(1 for item in pallets if item.location == "storage")
     return {
         "machine_pallet": machine_pallet.name if machine_pallet else None,
+        "on_deck_pallet": on_deck_pallet.name if on_deck_pallet else None,
+        "dripping_pallet": dripping_pallet.name if dripping_pallet else None,
         "queue_count": queue_count,
         "pool_count": pool_count,
         "storage_count": storage_count,
         "pool_open_positions": max(settings.pool_slot_count - pool_count, 0),
     }
+
+
+def _configured_cnc_telemetry(settings: AppSettings) -> tuple[dict | None, str]:
+    if not settings.cnc_telemetry_enabled:
+        return None, "Mill telemetry is not connected yet."
+    if not settings.cnc_host.strip():
+        return None, "CNC telemetry is enabled, but no controller host is configured."
+    try:
+        telemetry = read_linuxcnc_snapshot(
+            settings.cnc_host.strip(),
+            settings.cnc_ssh_port,
+            settings.cnc_ssh_username,
+            settings.cnc_ssh_password,
+            settings.cnc_timeout_seconds,
+        )
+    except CncTelemetryError as exc:
+        return None, f"PathPilot ATC telemetry is unavailable: {exc}"
+    return telemetry, "Live PathPilot zbot carousel assignments."
+
+
+def _atc_inventory(telemetry: dict | None, descriptions: dict[int, dict] | None = None) -> list[dict]:
+    descriptions = descriptions or {}
+    slots = telemetry.get("atc", {}).get("slots", []) if telemetry else []
+    inventory = []
+    for slot in slots:
+        tool_number = slot.get("tool_number")
+        library_tool = descriptions.get(tool_number, {}) if tool_number else {}
+        inventory.append(
+            {
+                "position": slot.get("position"),
+                "number": tool_number,
+                "tool": f"T{tool_number}" if tool_number else None,
+                "description": library_tool.get("description") or (f"PathPilot tool {tool_number}" if tool_number else "Empty"),
+                "diameter": slot.get("diameter"),
+                "length_offset": slot.get("length_offset"),
+                "current": bool(slot.get("current")),
+            }
+        )
+    return inventory
+
+
+def _tool_color_states(library: list[dict], telemetry: dict | None, atc_slots: list[dict]) -> dict[str, dict]:
+    if not telemetry:
+        return {}
+    loaded_numbers = {slot["number"] for slot in atc_slots if slot["number"] is not None}
+    lengths = {
+        row.get("tool_number"): row.get("length_offset")
+        for row in telemetry.get("tool_table", [])
+        if row.get("tool_number") is not None
+    }
+    states = {}
+    for tool in library:
+        number = tool["number"]
+        length = lengths.get(number)
+        if number in loaded_numbers:
+            status = "atc"
+        elif isinstance(length, (int, float)) and not math.isclose(length, 0.0, abs_tol=1e-9):
+            status = "measured"
+        else:
+            status = "zero"
+        states[str(number)] = {"status": status, "length_offset": length}
+    return states
+
+
+def dashboard_snapshot(session: Session) -> dict:
+    settings = get_settings(session)
+    pallets = session.scalars(select(Pallet)).all()
+    queue = sorted((item for item in pallets if item.queue_position is not None), key=lambda item: item.queue_position or 0)
+    machine = next((item for item in pallets if item.location == "machine"), None)
+    queue_items = [serialize_pallet(item) for item in queue]
+    queue_cycle_seconds = sum(item["expected_cycle_seconds"] or 0 for item in queue_items)
+    queue_tools = sorted({tool for item in queue_items for tool in item["program_tools"]}, key=lambda tool: int(tool[1:]))
+    machine_item = serialize_pallet(machine) if machine else None
+    telemetry, atc_source = _configured_cnc_telemetry(settings)
+    atc_slots = _atc_inventory(telemetry)
+    return {
+        "revision": settings.revision,
+        "queue": queue_items,
+        "queue_cycle_seconds": queue_cycle_seconds,
+        "queue_tools": queue_tools,
+        "machine_pallet": machine_item,
+        "current_cycle_seconds": machine_item["expected_cycle_seconds"] if machine_item else None,
+        "atc_tools": [slot["tool"] for slot in atc_slots if slot["tool"]],
+        "atc_source": atc_source,
+        "summary": _board_summary(settings, pallets),
+    }
+
+
+def autoschedule_queue_preview(session: Session, expected_revision: int) -> dict:
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    queue = tuple(
+        session.scalars(
+            select(Pallet)
+            .where(Pallet.queue_position.is_not(None))
+            .order_by(Pallet.queue_position)
+        ).all()
+    )
+    serialized = {pallet.id: serialize_pallet(pallet) for pallet in queue}
+    active_jobs = tuple(
+        ScheduleJob(
+            pallet_id=pallet.id,
+            name=pallet.name,
+            program=pallet.program_path or "",
+            tools=frozenset(int(tool[1:]) for tool in serialized[pallet.id]["program_tools"]),
+            original_position=pallet.queue_position or 0,
+        )
+        for pallet in queue
+        if serialized[pallet.id]["program_tools"]
+    )
+
+    telemetry, atc_source = _configured_cnc_telemetry(settings)
+    slots = telemetry.get("atc", {}).get("slots", []) if telemetry else []
+    initial_tools = frozenset(
+        int(slot["tool_number"])
+        for slot in slots
+        if slot.get("tool_number") is not None
+    )
+    largest_job = max((len(job.tools) for job in active_jobs), default=0)
+    capacity = max(len(slots), len(initial_tools), largest_job, 16 if not slots else 0)
+
+    original = simulate_tool_plan(active_jobs, initial_tools, capacity)
+    optimized, method = optimize_tool_schedule(active_jobs, initial_tools, capacity)
+    optimized_by_id = {job.pallet_id: job for job in active_jobs}
+    optimized_jobs = iter(optimized["pallet_ids"])
+    full_order = [
+        next(optimized_jobs) if pallet.id in optimized_by_id else pallet.id
+        for pallet in queue
+    ]
+    optimized["pallet_ids"] = full_order
+    fixed = [
+        {"pallet_id": pallet.id, "name": pallet.name, "position": pallet.queue_position}
+        for pallet in queue
+        if pallet.id not in optimized_by_id
+    ]
+    telemetry_available = bool(slots)
+    warning = None if telemetry_available else (
+        f"{atc_source} Scheduling used an empty 16-position ATC baseline."
+    )
+    return {
+        "revision": settings.revision,
+        "algorithm": method,
+        "atc": {
+            "capacity": capacity,
+            "initial_tools": [f"T{number}" for number in sorted(initial_tools)],
+            "source": atc_source,
+            "telemetry_available": telemetry_available,
+        },
+        "original": original,
+        "optimized": optimized,
+        "savings": {
+            "loads": original["loads"] - optimized["loads"],
+            "unloads": original["unloads"] - optimized["unloads"],
+            "tool_movements": original["tool_movements"] - optimized["tool_movements"],
+        },
+        "fixed_pallets": fixed,
+        "can_apply": full_order != [pallet.id for pallet in queue],
+        "warning": warning,
+        "automation": {
+            "commands_generated": False,
+            "note": "Tool load and unload steps are planning data only; no robot or mill commands are sent.",
+        },
+    }
+
+
+def tools_snapshot(session: Session) -> dict:
+    settings = get_settings(session)
+    paths = fusion_tool_library_paths(settings)
+    library, warnings = fusion_tool_libraries(paths)
+    by_number = {item["number"]: item for item in library}
+    telemetry, atc_source = _configured_cnc_telemetry(settings)
+    atc_slots = _atc_inventory(telemetry, by_number)
+    return {
+        "revision": settings.revision,
+        "atc_slots": atc_slots,
+        "atc_tools": [slot for slot in atc_slots if slot["tool"]],
+        "atc_source": atc_source,
+        "tool_states": _tool_color_states(library, telemetry, atc_slots),
+        "library": library,
+        "warning": " ".join(warnings) or None,
+    }
+
+
+def add_fusion_tool_library(session: Session, path: str) -> list[str]:
+    settings = get_settings(session)
+    paths = fusion_tool_library_paths(settings)
+    if path not in paths:
+        paths.append(path)
+    settings.fusion_tool_library_paths = json.dumps(paths, separators=(",", ":"))
+    bump(settings)
+    commit_or_conflict(session)
+    return paths
+
+
+def remove_fusion_tool_library(session: Session, path: str) -> list[str]:
+    settings = get_settings(session)
+    try:
+        paths = json.loads(settings.fusion_tool_library_paths or "[]")
+    except json.JSONDecodeError:
+        paths = []
+    if path not in paths:
+        raise problem(404, "Uploaded Fusion tool library was not found.")
+    paths.remove(path)
+    settings.fusion_tool_library_paths = json.dumps(paths, separators=(",", ":"))
+    bump(settings)
+    commit_or_conflict(session)
+    return paths
 
 
 def _bit_value(mask: int, index: int) -> bool:
@@ -310,7 +700,8 @@ def _simulated_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
     machine_error = settings.machine_state == "error"
     queue_has_work = summary["queue_count"] > 0
     total_known = max(
-        summary["queue_count"] + summary["pool_count"] + summary["storage_count"],
+        summary["queue_count"] + summary["pool_count"] + summary["storage_count"]
+        + int(summary["on_deck_pallet"] is not None) + int(summary["dripping_pallet"] is not None),
         1,
     )
     snapshot = {
@@ -415,6 +806,123 @@ def _simulated_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
         "notes": "Showing simulated I/O derived from the current board state because debug mode is enabled.",
     }
     return _apply_debug_program_controls(_apply_debug_labels(snapshot, settings), settings)
+
+
+def _cnc_unavailable_snapshot(label: str, notes: str) -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "connected": False,
+        "connection_label": label,
+        "source": "PathPilot / LinuxCNC adapter",
+        "machine_model": "Tormach 1500MX",
+        "controller_state": "Unavailable",
+        "program": "Unavailable",
+        "spindle": "Unavailable",
+        "coolant": "Unavailable",
+        "feed_override": "Unavailable",
+        "notes": notes,
+        "axis_rows": [],
+        "health": {},
+        "motion": {},
+        "coordinates": {},
+        "program_execution": {},
+        "spindle_details": {},
+        "probe": {},
+        "tooling": {},
+        "production": {},
+        "io": {},
+        "atc": {},
+        "tool_table": [],
+    }
+
+
+def cnc_debug_snapshot(session: Session) -> dict:
+    settings = get_settings(session)
+    if not settings.cnc_telemetry_enabled:
+        return _cnc_unavailable_snapshot(
+            "Telemetry disabled",
+            "Enable CNC telemetry in Settings, then provide the PathPilot controller SSH connection details.",
+        )
+    if not settings.cnc_host.strip():
+        return _cnc_unavailable_snapshot("Host not configured", "Enter the PathPilot controller IP address in Settings.")
+
+    try:
+        telemetry = read_linuxcnc_snapshot(
+            settings.cnc_host.strip(),
+            settings.cnc_ssh_port,
+            settings.cnc_ssh_username,
+            settings.cnc_ssh_password,
+            settings.cnc_timeout_seconds,
+        )
+    except CncTelemetryError as exc:
+        return _cnc_unavailable_snapshot("Controller unavailable", f"Read-only PathPilot telemetry failed: {exc}")
+
+    task_states = {1: "Estop", 2: "Estop reset", 3: "Machine off", 4: "Machine on"}
+    task_modes = {1: "Manual", 2: "Auto", 3: "MDI"}
+    interpreter_states = {1: "Idle", 2: "Reading", 3: "Paused", 4: "Waiting"}
+    spindle_speed = telemetry.get("spindle_speed")
+    spindle_text = "Stopped" if not telemetry.get("spindle_enabled") else f"{spindle_speed or 0:g} RPM"
+    coolant = "Flood" if telemetry.get("flood") else ("Mist" if telemetry.get("mist") else "Off")
+    feed_override = telemetry.get("feed_override")
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "connected": True,
+        "connection_label": "Live read-only telemetry",
+        "source": "PathPilot / LinuxCNC over SSH",
+        "machine_model": "Tormach 1500MX",
+        "controller_state": task_states.get(telemetry.get("task_state"), f"State {telemetry.get('task_state')}") + f" / {task_modes.get(telemetry.get('task_mode'), 'Unknown mode')}",
+        "program": telemetry.get("program") or "No program loaded",
+        "spindle": spindle_text,
+        "coolant": coolant,
+        "feed_override": f"{feed_override * 100:.0f}%" if isinstance(feed_override, (int, float)) else "Unavailable",
+        "notes": f"Interpreter: {interpreter_states.get(telemetry.get('interp_state'), 'Unknown')} | Tool: T{telemetry.get('tool_in_spindle') or 0} | Line: {telemetry.get('motion_line') or telemetry.get('current_line') or 'Unavailable'}",
+        "axis_rows": telemetry.get("axis_rows", []),
+        "atc": telemetry.get("atc", {}),
+        "tool_table": telemetry.get("tool_table", []),
+        "health": telemetry.get("health", {}),
+        "motion": telemetry.get("motion", {}),
+        "coordinates": telemetry.get("coordinates", {}),
+        "program_execution": telemetry.get("program_execution", {}),
+        "spindle_details": telemetry.get("spindle_details", {}),
+        "probe": telemetry.get("probe", {}),
+        "tooling": telemetry.get("tooling", {}),
+        "production": telemetry.get("production", {}),
+        "io": telemetry.get("io", {}),
+    }
+
+
+def cnc_io_labels_snapshot(session: Session) -> dict:
+    settings = get_settings(session)
+    empty = {"digital_inputs": {}, "digital_outputs": {}, "analog_inputs": {}, "analog_outputs": {}}
+    if not settings.cnc_telemetry_enabled or not settings.cnc_host.strip():
+        return {"connected": False, "labels": empty}
+    try:
+        labels = read_linuxcnc_io_labels(
+            settings.cnc_host.strip(),
+            settings.cnc_ssh_port,
+            settings.cnc_ssh_username,
+            settings.cnc_ssh_password,
+            settings.cnc_timeout_seconds,
+        )
+    except CncTelemetryError:
+        return {"connected": False, "labels": empty}
+    return {"connected": True, "labels": labels}
+
+
+def test_cnc_telemetry_connection(host: str, port: int, username: str, password: str, timeout: float) -> dict:
+    """Run one read-only status query using unsaved CNC settings."""
+    try:
+        telemetry = read_linuxcnc_snapshot(host, port, username, password, timeout)
+    except CncTelemetryError as exc:
+        raise problem(502, f"CNC telemetry test failed: {exc}") from exc
+    axes = len(telemetry.get("axis_rows", []))
+    return {
+        "connected": True,
+        "message": f"Connected. Read {axes} axis status record{'s' if axes != 1 else ''} from LinuxCNC.",
+        "program": telemetry.get("program") or "No program loaded",
+        "task_state": telemetry.get("task_state"),
+        "axis_count": axes,
+    }
 
 
 def robot_io_snapshot(session: Session) -> dict:
@@ -705,13 +1213,15 @@ def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
     if not pallet:
         raise problem(404, "Pallet not found.")
 
-    if payload.destination == "machine":
+    if payload.destination in {"on_deck", "machine", "dripping"}:
         occupant = session.scalar(
-            select(Pallet).where(Pallet.location == "machine", Pallet.id != pallet_id)
+            select(Pallet).where(Pallet.location == payload.destination, Pallet.id != pallet_id)
         )
         if occupant:
-            raise problem(409, f"Machine is occupied by {occupant.name}.")
-        settings.machine_state = "running"
+            labels = {"on_deck": "On deck station", "machine": "Machine", "dripping": "Dripping station"}
+            raise problem(409, f"{labels[payload.destination]} is occupied by {occupant.name}.")
+        if payload.destination == "machine":
+            settings.machine_state = "running"
     if payload.destination == "pool":
         pool_slot = payload.pool_slot_number or first_open_pool_slot(
             session,
@@ -733,7 +1243,7 @@ def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
         raise problem(422, "Pool position is only valid for a pool destination.")
 
     was_queued = pallet.queue_position is not None
-    if was_queued and payload.destination != "pool":
+    if was_queued and payload.destination not in {"pool", "on_deck"}:
         pallet.queue_position = None
         session.flush()
         compact_queue(session, pallet.id)
@@ -874,6 +1384,12 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     )
     settings.weight_unit = payload.weight_unit
     settings.pool_slot_count = payload.pool_slot_count
+    store_pallet_location_positions(
+        settings,
+        [item.model_dump() for item in payload.pool_locations] if payload.pool_locations is not None else None,
+        payload.on_deck_location.model_dump() if payload.on_deck_location is not None else None,
+        payload.dripping_location.model_dump() if payload.dripping_location is not None else None,
+    )
     settings.debug_menu_enabled = payload.debug_menu_enabled
     if payload.manual_io_control_enabled is not None:
         settings.manual_io_control_enabled = payload.manual_io_control_enabled
@@ -901,6 +1417,39 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
             normalize_extensions(payload.robot_program_extensions),
             separators=(",", ":"),
         )
+    if payload.robot_programs_page_enabled is not None:
+        settings.robot_programs_page_enabled = payload.robot_programs_page_enabled
+    if payload.robot_programs_filter_enabled is not None:
+        settings.robot_programs_filter_enabled = payload.robot_programs_filter_enabled
+    if payload.robot_editor_command is not None:
+        settings.robot_editor_command = payload.robot_editor_command
+    if payload.cnc_telemetry_enabled is not None:
+        settings.cnc_telemetry_enabled = payload.cnc_telemetry_enabled
+    if payload.cnc_host is not None:
+        settings.cnc_host = payload.cnc_host
+    if payload.cnc_ssh_port is not None:
+        settings.cnc_ssh_port = payload.cnc_ssh_port
+    if payload.cnc_ssh_username is not None:
+        settings.cnc_ssh_username = payload.cnc_ssh_username
+    if payload.cnc_ssh_password is not None:
+        settings.cnc_ssh_password = payload.cnc_ssh_password
+    if payload.cnc_timeout_seconds is not None:
+        settings.cnc_timeout_seconds = payload.cnc_timeout_seconds
+    if payload.mill_file_directory is not None:
+        settings.mill_file_directory = payload.mill_file_directory
+    if payload.mill_program_extensions is not None:
+        settings.mill_program_extensions = json.dumps(
+            normalize_extensions(payload.mill_program_extensions),
+            separators=(",", ":"),
+        )
+    if payload.mill_programs_page_enabled is not None:
+        settings.mill_programs_page_enabled = payload.mill_programs_page_enabled
+    if payload.mill_programs_filter_enabled is not None:
+        settings.mill_programs_filter_enabled = payload.mill_programs_filter_enabled
+    if payload.mill_editor_command is not None:
+        settings.mill_editor_command = payload.mill_editor_command
+    if payload.fusion_tool_library_path is not None:
+        settings.fusion_tool_library_path = payload.fusion_tool_library_path
     if not payload.debug_menu_enabled:
         settings.machine_state = "idle"
     cleared = reconcile_programs(session, settings)

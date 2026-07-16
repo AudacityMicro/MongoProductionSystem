@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#17211d">
+    <title>Mill Programs | Mongo Production System</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260715-1">
+    <script src="/static/mill-programs.js?v=20260715-2" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark">M</span><span>Mongo Production System</span></a>
+      <nav aria-label="Main navigation">
+        <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/tools">Tools</a>
+        <a class="nav-link" href="/debugging">Debugging</a>
+        <a class="nav-link hidden" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link active" href="/mill-programs">Mill Programs</a>
+        <a class="nav-link" href="/settings">Settings</a>
+      </nav>
+      <span class="system-state" id="system-state"><span class="state-light" aria-hidden="true"></span> Loading</span>
+    </header>
+    <main class="robot-programs-page">
+      <section class="settings-heading">
+        <p class="eyebrow">PathPilot file management</p>
+        <h1>Mill Programs</h1>
+        <p>Manage files inside the configured PathPilot program directory over SSH.</p>
+      </section>
+      <section class="file-manager">
+        <div class="file-toolbar">
+          <button class="button secondary" id="go-up" type="button">Up</button>
+          <button class="button secondary" id="refresh-files" type="button">Refresh</button>
+          <button class="button secondary" id="new-folder" type="button">New folder</button>
+          <label class="button secondary file-upload-label">Upload<input id="upload-file" type="file" multiple hidden></label>
+          <span class="file-manager-path" id="current-path">Loading...</span>
+        </div>
+        <div class="file-manager-grid">
+          <section class="file-list-pane" aria-label="Mill files">
+            <div class="file-selection-actions">
+              <button class="button ghost" id="copy-file" type="button" disabled>Copy</button>
+              <button class="button ghost" id="cut-file" type="button" disabled>Cut</button>
+              <button class="button ghost" id="paste-file" type="button" disabled>Paste</button>
+              <button class="button ghost" id="rename-file" type="button" disabled>Rename</button>
+              <button class="button ghost" id="download-file" type="button" disabled>Download</button>
+              <button class="button ghost" id="open-file" type="button" disabled>Open</button>
+              <button class="button danger" id="delete-file" type="button" disabled>Delete</button>
+            </div>
+            <div class="file-entry-list" id="file-entry-list"></div>
+          </section>
+          <aside class="file-preview-pane">
+            <p class="eyebrow">Preview</p>
+            <h2 id="preview-title">No file selected</h2>
+            <p class="field-help" id="preview-meta">Select a file to read its contents.</p>
+            <pre id="file-preview">Preview is limited to the first 1 MB of a text file.</pre>
+          </aside>
+        </div>
+      </section>
+    </main>
+    <div class="toast hidden" id="toast" role="status"></div>
+  </body>
+</html>

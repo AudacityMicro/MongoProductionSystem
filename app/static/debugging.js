@@ -29,11 +29,49 @@ const ui = {
   programFilename: document.querySelector("#program-button-filename"),
   programColor: document.querySelector("#program-button-color"),
   programCancel: document.querySelector("#program-button-cancel"),
+  cncConnectionLight: document.querySelector("#cnc-connection-light"),
+  cncConnectionLabel: document.querySelector("#cnc-connection-label"),
+  cncNotes: document.querySelector("#cnc-notes"),
+  cncControllerState: document.querySelector("#cnc-controller-state"),
+  cncProgram: document.querySelector("#cnc-program"),
+  cncSpindle: document.querySelector("#cnc-spindle"),
+  cncCoolant: document.querySelector("#cnc-coolant"),
+  cncFeedOverride: document.querySelector("#cnc-feed-override"),
+  cncTimestamp: document.querySelector("#cnc-timestamp"),
+  cncAxisRows: document.querySelector("#cnc-axis-rows"),
+  cncHealthGrid: document.querySelector("#cnc-health-grid"),
+  cncProgramGrid: document.querySelector("#cnc-program-grid"),
+  cncSpindleGrid: document.querySelector("#cnc-spindle-grid"),
+  cncMotionGrid: document.querySelector("#cnc-motion-grid"),
+  cncProbeProductionGrid: document.querySelector("#cnc-probe-production-grid"),
+  cncAtcGrid: document.querySelector("#cnc-atc-grid"),
+  cncAtcSlots: document.querySelector("#cnc-atc-slots"),
+  cncToolTableRows: document.querySelector("#cnc-tool-table-rows"),
+  cncDigitalInputs: document.querySelector("#cnc-digital-inputs"),
+  cncDigitalOutputs: document.querySelector("#cnc-digital-outputs"),
+  cncAnalogInputs: document.querySelector("#cnc-analog-inputs"),
+  cncAnalogOutputs: document.querySelector("#cnc-analog-outputs"),
 };
 
 let lastError = "";
 let snapshotState = null;
 let editingProgramIndex = null;
+let latestCncSnapshot = null;
+let cncIoLabels = {digital_inputs: {}, digital_outputs: {}, analog_inputs: {}, analog_outputs: {}};
+
+async function loadRobotProgramsNav() {
+  try {
+    const result = await api("/api/settings");
+    document.querySelectorAll("[data-robot-programs-nav]").forEach(link => {
+      link.classList.toggle("hidden", !result.settings.robot_programs_page_enabled);
+    });
+    document.querySelectorAll("[data-mill-programs-nav]").forEach(link => {
+      link.classList.toggle("hidden", !result.settings.mill_programs_page_enabled);
+    });
+  } catch {
+    // Keep the link hidden when settings cannot be read.
+  }
+}
 
 function showToast(message, kind = "success") {
   ui.toast.textContent = message;
@@ -69,6 +107,201 @@ function formatValue(value) {
 
 function tableEmpty(columns, label) {
   return `<tr><td colspan="${columns}" class="debug-table-empty">${escapeHtml(label)}</td></tr>`;
+}
+
+function cncAxisRow(row) {
+  const home = row.homed === null || row.homed === undefined ? "Unavailable" : (row.homed ? "Homed" : "Not homed");
+  const limit = row.limit === null || row.limit === undefined ? "Unavailable" : (Number(row.limit) === 0 ? "Clear" : `Active (${formatValue(row.limit)})`);
+  return `<tr><td>${escapeHtml(row.axis)}</td><td>${escapeHtml(formatValue(row.position))}</td><td>${escapeHtml(formatValue(row.commanded))}</td><td>${escapeHtml(formatValue(row.velocity))}</td><td>${escapeHtml(formatValue(row.distance_to_go))}</td><td>${escapeHtml(formatValue(row.following_error))}</td><td>${escapeHtml(home)}</td><td>${escapeHtml(limit)}</td></tr>`;
+}
+
+function cncDataGrid(values) {
+  return values.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatValue(value))}</strong></article>`).join("");
+}
+
+function boolState(value, on, off) {
+  if (value === null || value === undefined) return "Unavailable";
+  return value ? on : off;
+}
+
+function percentage(value) {
+  return typeof value === "number" ? `${(value * 100).toFixed(0)}%` : "Unavailable";
+}
+
+function axisValues(values) {
+  const axes = ["X", "Y", "Z", "A", "B", "C", "U", "V", "W"];
+  if (!Array.isArray(values) || !values.length) return "Unavailable";
+  return values.map((value, index) => `${axes[index] || index}: ${formatValue(value)}`).join(" | ");
+}
+
+function g5xLabel(index) {
+  if (!Number.isInteger(index)) return "Unavailable";
+  if (index >= 1 && index <= 6) return `G${53 + index}`;
+  if (index >= 7 && index <= 9) return `G59.${index - 6}`;
+  return `G54.1 P${index - 9}`;
+}
+
+function humanizeIoSignal(signal) {
+  if (!signal) return "Unassigned";
+  const aliases = {atc: "ATC", vfd: "VFD", io: "I/O", ngc: "NGC", tsc: "TSC", dbbutton: "Tool change", dig: "Digital", in: "input", out: "output", ref: "reference"};
+  return String(signal)
+    .replace(/^dbbutton-/, "")
+    .replace(/trayref/g, "tray-reference")
+    .replace(/draw-bar/g, "drawbar")
+    .replace(/dig-(in|out)-/g, "digital-$1-")
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map(part => aliases[part.toLowerCase()] || `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function ioLabel(labels, index) {
+  return labels?.[String(index)] || labels?.[index] || "";
+}
+
+function cncDigitalTiles(values, labels, prefix) {
+  if (!Array.isArray(values) || !values.length) return '<p class="debug-table-empty">No channel values reported.</p>';
+  return values.map((value, index) => {
+    const signal = ioLabel(labels, index);
+    return `<article class="cnc-digital-tile ${value ? "active" : "idle"}" title="${escapeHtml(signal || "No named HAL signal")}"><span>${prefix}${String(index).padStart(2, "0")}</span>${ledCell(value)}<strong>${escapeHtml(humanizeIoSignal(signal))}</strong><small>${value ? "ON" : "OFF"}</small></article>`;
+  }).join("");
+}
+
+function cncAnalogRows(values, labels, prefix) {
+  if (!Array.isArray(values) || !values.length) return tableEmpty(3, "No channel values reported.");
+  return values.map((value, index) => `<tr><td>${prefix}${String(index).padStart(2, "0")}</td><td>${escapeHtml(humanizeIoSignal(ioLabel(labels, index)))}</td><td>${escapeHtml(formatValue(value))}</td></tr>`).join("");
+}
+
+function renderCnc(snapshot) {
+  ui.cncConnectionLight.className = `debug-connection-light ${snapshot.connected ? "active" : "unknown"}`;
+  ui.cncConnectionLabel.textContent = snapshot.connection_label;
+  ui.cncNotes.textContent = snapshot.notes;
+  ui.cncControllerState.textContent = snapshot.controller_state;
+  ui.cncProgram.textContent = snapshot.program;
+  ui.cncSpindle.textContent = snapshot.spindle;
+  ui.cncCoolant.textContent = snapshot.coolant;
+  ui.cncFeedOverride.textContent = snapshot.feed_override;
+  ui.cncTimestamp.textContent = new Date(snapshot.timestamp).toLocaleString();
+  const axisRows = snapshot.axis_rows || [];
+  ui.cncAxisRows.innerHTML = axisRows.length
+    ? axisRows.map(cncAxisRow).join("")
+    : tableEmpty(8, "Axis telemetry will appear after the PathPilot/LinuxCNC connection is configured.");
+  const health = snapshot.health || {};
+  const motion = snapshot.motion || {};
+  const coordinates = snapshot.coordinates || {};
+  const execution = snapshot.program_execution || {};
+  const spindle = snapshot.spindle_details || {};
+  const probe = snapshot.probe || {};
+  const tooling = snapshot.tooling || {};
+  const production = snapshot.production || {};
+  const io = snapshot.io || {};
+  ui.cncHealthGrid.innerHTML = cncDataGrid([
+    ["E-stop", boolState(health.estop, "Active", "Reset")],
+    ["Machine enabled", boolState(health.enabled, "Enabled", "Disabled")],
+    ["In position", boolState(health.in_position, "Yes", "No")],
+    ["Homed axes", axisValues(health.homed)],
+    ["Axis limits", axisValues(health.limits)],
+    ["Lubrication", boolState(health.lube_active, "Active", "Inactive")],
+    ["Lube level", boolState(health.lube_level_warning, "Warning", "OK")],
+    ["Interpreter error", health.interpreter_error],
+  ]);
+  ui.cncProgramGrid.innerHTML = cncDataGrid([
+    ["Controller state", execution.state],
+    ["Execution state", execution.exec_state],
+    ["Current line", execution.read_line],
+    ["Read-ahead line", execution.readahead_line],
+    ["Active queue", execution.active_queue],
+    ["Queued motions", execution.queue],
+    ["Queue full", boolState(execution.queue_full, "Yes", "No")],
+    ["Dwell remaining", execution.dwell_remaining],
+    ["Optional stop", boolState(execution.optional_stop, "On", "Off")],
+    ["Block delete", boolState(execution.block_delete, "On", "Off")],
+    ["Adaptive feed", boolState(execution.adaptive_feed, "On", "Off")],
+    ["Feed hold available", boolState(execution.feed_hold_enabled, "Yes", "No")],
+    ["Active G-codes", (execution.g_codes || []).join(" ") || "None"],
+    ["Active M-codes", (execution.m_codes || []).join(" ") || "None"],
+  ]);
+  const direction = {"-1": "Reverse", "0": "Stopped", "1": "Forward"};
+  ui.cncSpindleGrid.innerHTML = cncDataGrid([
+    ["Commanded RPM", spindle.commanded_speed],
+    ["Feedback RPM", spindle.feedback_speed],
+    ["Spindle", boolState(spindle.enabled, "Enabled", "Stopped")],
+    ["Direction", direction[String(spindle.direction)] || spindle.direction],
+    ["Brake", boolState(spindle.brake, "Engaged", "Released")],
+    ["Spindle override", percentage(spindle.spindle_override)],
+    ["Rapid override", percentage(spindle.rapid_override)],
+    ["Feed override", percentage(spindle.feed_override)],
+  ]);
+  ui.cncMotionGrid.innerHTML = cncDataGrid([
+    ["Distance to go", motion.distance_to_go],
+    ["Current velocity", motion.current_velocity],
+    ["Commanded velocity", motion.velocity],
+    ["Acceleration", motion.acceleration],
+    ["Motion mode", motion.motion_mode],
+    ["Work coordinate", g5xLabel(coordinates.g5x_index)],
+    ["G5X offset", axisValues(coordinates.g5x_offset)],
+    ["G92 offset", axisValues(coordinates.g92_offset)],
+    ["XY rotation", coordinates.rotation_xy],
+    ["Program units", {1: "Inch", 2: "Millimeter", 3: "Centimeter"}[coordinates.program_units] || coordinates.program_units],
+    ["Linear units", coordinates.linear_units],
+    ["Angular units", coordinates.angular_units],
+  ]);
+  ui.cncProbeProductionGrid.innerHTML = cncDataGrid([
+    ["Probe", boolState(probe.tripped, "Tripped", "Clear")],
+    ["Probe input", probe.value],
+    ["Last probe position", axisValues(probe.last_position)],
+    ["Spindle tool", tooling.tool_in_spindle ? `T${tooling.tool_in_spindle}` : "No tool"],
+    ["Prepared pocket", tooling.prepared_pocket],
+    ["Tool offset number", tooling.tool_offset_number],
+    ["Tool offset", axisValues(tooling.tool_offset)],
+    ["Cycle time", production.cycle_time],
+    ["M30 counter A", production.m30_a],
+    ["M30 counter B", production.m30_b],
+    ["M99 counter A", production.m99_a],
+    ["M99 counter B", production.m99_b],
+  ]);
+  const atc = snapshot.atc || {};
+  const atcValues = [
+    ["ATC position", atc.current_position ?? "Unavailable"],
+    ["HAL carousel value", atc.carousel_slot ?? "Unavailable"],
+    ["Spindle tool", atc.tool_number ? `T${atc.tool_number}` : "No tool"],
+    ["Prepared tool", atc.prepared_tool ? `T${atc.prepared_tool}` : "None"],
+    ["Tool change", atc.change_in_progress ? "In progress" : "Idle"],
+    ["Tray", atc.tray_in ? "In" : "Out / unknown"],
+    ["ATC device", atc.device_ready ? "Ready" : "Unavailable"],
+    ["Tray reference", atc.tray_referenced ? "Referenced" : "Not referenced"],
+    ["Air pressure", atc.pressure_ok ? "OK" : "Not OK"],
+    ["Drawbar", boolState(atc.drawbar_engaged, "Engaged", "Released")],
+    ["ATC lock", boolState(atc.lock_engaged, "Engaged", "Released")],
+    ["ATC VFD", boolState(atc.vfd_status, "Active", "Idle")],
+    ["ATC busy", boolState(atc.busy, "Busy", "Idle")],
+    ["ATC return code", atc.return_code],
+    ["Tray capacity", atc.tray_capacity],
+  ];
+  ui.cncAtcGrid.innerHTML = atcValues.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
+  const slots = atc.slots || [];
+  ui.cncAtcSlots.innerHTML = slots.length
+    ? slots.map(slot => {
+      const geometry = slot.tool_number
+        ? `Length ${formatValue(slot.length_offset)} / Dia ${formatValue(slot.diameter)}`
+        : "Available";
+      return `<article class="cnc-atc-slot ${slot.current ? "current" : ""} ${slot.tool_number ? "loaded" : "empty"}"><span>Position ${escapeHtml(slot.position)}</span><strong>${slot.tool_number ? `T${escapeHtml(slot.tool_number)}` : "Empty"}</strong><small>${escapeHtml(geometry)}</small>${slot.current ? '<b>Current</b>' : ""}</article>`;
+    }).join("")
+    : '<p class="debug-table-empty">PathPilot carousel assignments are unavailable.</p>';
+  const tools = (snapshot.tool_table || []).filter(tool => tool.length_offset !== null && tool.length_offset !== undefined);
+  const loadedToolNumbers = new Set(slots.filter(slot => slot.tool_number).map(slot => Number(slot.tool_number)));
+  ui.cncToolTableRows.innerHTML = tools.length
+    ? tools.map(tool => {
+      const status = loadedToolNumbers.has(Number(tool.tool_number))
+        ? "atc"
+        : (Math.abs(Number(tool.length_offset)) > 1e-9 ? "measured" : "zero");
+      return `<tr class="tool-status-${status}"><td>T${escapeHtml(tool.tool_number)}</td><td>${escapeHtml(formatValue(tool.diameter))}</td><td>${escapeHtml(formatValue(tool.length_offset))}</td></tr>`;
+    }).join("")
+    : tableEmpty(3, "No PathPilot tool table entries have a length offset.");
+  ui.cncDigitalInputs.innerHTML = cncDigitalTiles(io.digital_inputs, cncIoLabels.digital_inputs, "DI");
+  ui.cncDigitalOutputs.innerHTML = cncDigitalTiles(io.digital_outputs, cncIoLabels.digital_outputs, "DO");
+  ui.cncAnalogInputs.innerHTML = cncAnalogRows(io.analog_inputs, cncIoLabels.analog_inputs, "AI");
+  ui.cncAnalogOutputs.innerHTML = cncAnalogRows(io.analog_outputs, cncIoLabels.analog_outputs, "AO");
 }
 
 function ledCell(value) {
@@ -359,6 +592,27 @@ async function loadDebugging() {
   }
 }
 
+async function loadCncDebugging() {
+  try {
+    latestCncSnapshot = await api("/api/debug/cnc");
+    renderCnc(latestCncSnapshot);
+  } catch (error) {
+    ui.cncConnectionLight.className = "debug-connection-light unknown";
+    ui.cncConnectionLabel.textContent = "Unavailable";
+    ui.cncNotes.textContent = `CNC debug data is unavailable: ${error.message}`;
+  }
+}
+
+async function loadCncIoLabels() {
+  try {
+    const result = await api("/api/debug/cnc/io-labels");
+    cncIoLabels = result.labels || cncIoLabels;
+    if (latestCncSnapshot) renderCnc(latestCncSnapshot);
+  } catch {
+    // The live values remain useful when the static HAL label map is unavailable.
+  }
+}
+
 document.addEventListener("click", async event => {
   const editProgramButton = event.target.closest("[data-edit-debug-program]");
   if (editProgramButton && snapshotState) {
@@ -465,4 +719,8 @@ ui.programForm.addEventListener("submit", async event => {
 });
 
 loadDebugging();
+loadCncDebugging();
+loadCncIoLabels();
+loadRobotProgramsNav();
 window.setInterval(loadDebugging, 2000);
+window.setInterval(loadCncDebugging, 2000);

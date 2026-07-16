@@ -176,6 +176,38 @@ def test_queue_machine_pool_and_storage_invariants(client: TestClient) -> None:
     assert occupied_position.status_code == 409
 
 
+def test_on_deck_and_dripping_are_single_pallet_stations(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    board = create_pallet(client, board["revision"])
+    first, second = sorted(board["pallets"], key=lambda item: item["name"])
+
+    board = client.post(
+        f"/api/pallets/{first['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    board = client.post(
+        f"/api/pallets/{first['id']}/move",
+        json={"expected_revision": board["revision"], "destination": "on_deck"},
+    ).json()
+    staged = next(item for item in board["pallets"] if item["id"] == first["id"])
+    assert staged["location"] == "on_deck"
+    assert staged["queue_position"] == 0
+
+    occupied = client.post(
+        f"/api/pallets/{second['id']}/move",
+        json={"expected_revision": board["revision"], "destination": "on_deck"},
+    )
+    assert occupied.status_code == 409
+
+    board = client.post(
+        f"/api/pallets/{first['id']}/move",
+        json={"expected_revision": board["revision"], "destination": "dripping"},
+    ).json()
+    dripping = next(item for item in board["pallets"] if item["id"] == first["id"])
+    assert dripping["location"] == "dripping"
+    assert dripping["queue_position"] is None
+
+
 def test_queue_reorder_requires_all_queue_members(client: TestClient) -> None:
     board = create_pallet(client, 0)
     pallet = board["pallets"][0]

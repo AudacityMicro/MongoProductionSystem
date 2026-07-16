@@ -1,14 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html class="schedule-document" lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <script src="/static/app.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260715-4">
+    <script src="/static/app.js?v=20260715-4" defer></script>
   </head>
-  <body>
+  <body class="schedule-page">
     <header class="topbar">
       <a class="brand" href="/">
         <span class="brand-mark">M</span>
@@ -16,7 +16,11 @@
       </a>
       <nav aria-label="Main navigation">
         <a class="nav-link active" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/tools">Tools</a>
         <a class="nav-link" href="/debugging">Debugging</a>
+        <a class="nav-link hidden" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link hidden" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
         <a class="nav-link" href="/settings">Settings</a>
       </nav>
       <span class="system-state" id="system-state">
@@ -32,6 +36,7 @@
           <h1>Pallet schedule</h1>
         </div>
         <div class="toolbar">
+          <button class="button secondary" id="autoschedule-queue" type="button">Optimize by tools</button>
           <button class="button primary" id="create-pallet">+ New pallet</button>
         </div>
       </section>
@@ -54,7 +59,7 @@
           <section class="zone queue-zone" data-zone="queue">
             <header class="zone-heading">
               <div>
-                <p class="section-number">02 / Ordered</p>
+                <p class="section-number">03 / Ordered</p>
                 <h2>Production queue</h2>
               </div>
               <span class="zone-count" id="queue-count">0 pallets</span>
@@ -64,10 +69,31 @@
         </div>
 
         <div class="production-workspace">
+          <div class="flow-stations">
+            <section class="zone station-zone" data-zone="on_deck">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">02 / Staged</p>
+                  <h2>On deck</h2>
+                </div>
+              </header>
+              <div class="station-bay drop-target" id="on-deck-slot" data-destination="on_deck"></div>
+            </section>
+            <section class="zone station-zone" data-zone="dripping">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">05 / Return staging</p>
+                  <h2>Dripping</h2>
+                </div>
+              </header>
+              <div class="station-bay drop-target" id="dripping-slot" data-destination="dripping"></div>
+            </section>
+          </div>
+
           <section class="zone pool-zone" data-zone="pool">
             <header class="zone-heading">
               <div>
-                <p class="section-number">03 / Available</p>
+                <p class="section-number">04 / Available</p>
                 <h2>Pallet pool</h2>
               </div>
               <span class="zone-count" id="pool-count">0 pallets</span>
@@ -78,7 +104,7 @@
           <section class="zone storage-zone" data-zone="storage">
             <header class="zone-heading">
               <div>
-                <p class="section-number">04 / Inventory</p>
+                <p class="section-number">06 / Inventory</p>
                 <h2>Storage</h2>
               </div>
               <span class="zone-count" id="storage-count">0 pallets</span>
@@ -169,6 +195,26 @@
         <div class="dialog-actions">
           <button class="button ghost" value="cancel">Cancel</button>
           <button class="button danger" id="confirm-action" value="confirm">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="autoschedule-dialog" class="autoschedule-dialog">
+      <form method="dialog">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">ATC-aware queue planning</p>
+            <h2>Optimized pallet order</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close">&times;</button>
+        </div>
+        <div class="autoschedule-summary" id="autoschedule-summary"></div>
+        <p class="notice hidden" id="autoschedule-warning"></p>
+        <ol class="autoschedule-steps" id="autoschedule-steps"></ol>
+        <p class="field-help" id="autoschedule-note"></p>
+        <div class="dialog-actions">
+          <button class="button ghost" value="cancel">Keep current order</button>
+          <button class="button primary" id="apply-autoschedule" type="button">Apply optimized order</button>
         </div>
       </form>
     </dialog>

@@ -273,6 +273,120 @@ p {
 
 .directory-file-list li:last-child { border-bottom: 0; }
 
+.robot-programs-page { max-width: 1400px; }
+
+.dashboard-page { max-width: 1320px; }
+.tools-page { max-width: 1180px; }
+.atc-zone, .tool-library-zone { margin: 1.5rem 0; border: 1px solid var(--ink); background: var(--surface); }
+.tool-color-legend { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.9rem; }
+.tool-color-legend span { padding: 0.3rem 0.55rem; border: 1px solid var(--ink); font: 0.68rem "DM Mono", Consolas, monospace; text-transform: uppercase; }
+.atc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 0.75rem; min-height: 10rem; padding: 1rem; }
+.tool-card { min-height: 6.5rem; padding: 0.85rem; border: 1px solid var(--ink); border-top: 5px solid #b57912; background: #fff9e8; }
+.tool-card.loaded, .tool-status-atc { border-color: #2f6e43; background: #dcebd7; }
+.tool-card.empty { border-top-color: var(--line); background: #f3f0e7; }
+.tool-card.current { outline: 3px solid var(--signal); outline-offset: -3px; }
+.tool-card strong, .tool-library-row strong { display: block; font: 1rem "DM Mono", Consolas, monospace; }
+.tool-card span, .tool-library-row span { display: block; margin-top: 0.45rem; color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
+.tool-card .tool-position { margin: 0 0 0.45rem; color: var(--signal); font: 0.66rem "DM Mono", Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; }
+.tool-card small, .tool-card b { display: block; margin-top: 0.45rem; font: 0.68rem "DM Mono", Consolas, monospace; }
+.tool-card b { color: var(--signal); text-transform: uppercase; }
+.tool-library-list { display: grid; }
+.tool-library-row { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 1rem; padding: 0.75rem 1rem; border-bottom: 1px solid var(--line); border-left: 7px solid var(--line); }
+.tool-library-row.tool-status-atc { border-left-color: #2f6e43; background: #dcebd7; }
+.tool-library-row.tool-status-measured, .tool-status-measured { border-color: #a8780b; background: #fff0b8; }
+.tool-library-row.tool-status-zero, .tool-status-zero { border-color: #a63b31; background: #f5d3ce; }
+.tool-library-row.tool-status-unknown { background: #f3f0e7; }
+.tool-library-row span { margin: 0; }
+.tool-library-row small { display: block; margin-top: 0.3rem; color: var(--muted); font: 0.67rem "DM Mono", Consolas, monospace; }
+.tool-library-row .tool-status-label { font-weight: 700; text-transform: uppercase; }
+.managed-library-list { display: grid; gap: 0.45rem; color: var(--muted); font-size: 0.82rem; }
+.managed-library-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.45rem 0.65rem; border: 1px solid var(--line); background: #f7f4eb; }
+.managed-library-row span { overflow-wrap: anywhere; }
+.location-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: 0.65rem; }
+.location-fieldset { min-width: 0; margin: 0; padding: 0.6rem; border: 1px solid var(--line); background: #f7f4eb; }
+.location-fieldset legend { padding: 0 0.25rem; color: var(--signal); font: 0.72rem "DM Mono", Consolas, monospace; }
+.location-axis-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; }
+.location-axis-row label { min-width: 0; margin: 0; font-size: 0.68rem; }
+.location-axis-row input { width: 100%; min-width: 0; padding: 0.4rem; font-size: 0.8rem; }
+.location-stations { align-items: stretch; }
+.dashboard-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+.dashboard-summary article { min-height: 10rem; padding: 1rem; border: 1px solid var(--ink); background: var(--surface); box-shadow: var(--shadow); }
+.dashboard-summary strong { display: block; margin: 0.7rem 0 0.35rem; font-size: clamp(1.5rem, 3vw, 2.6rem); line-height: 1; }
+.dashboard-summary span:not(.tool-chip) { color: var(--muted); font-size: 0.82rem; }
+.tool-chip-list { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.75rem; }
+.tool-chip { display: inline-block; padding: 0.2rem 0.42rem; border: 1px solid var(--ink); background: #dcebd7; font: 0.72rem "DM Mono", Consolas, monospace; }
+.dashboard-queue-zone { border: 1px solid var(--ink); background: var(--surface); }
+.dashboard-queue-list { display: grid; }
+.dashboard-queue-item { display: grid; grid-template-columns: 2.5rem minmax(11rem, 1fr) minmax(12rem, 2fr) 5rem; gap: 0.8rem; align-items: center; padding: 0.8rem 1rem; border-bottom: 1px solid var(--line); }
+.dashboard-queue-item small { display: block; margin-top: 0.25rem; color: var(--muted); overflow-wrap: anywhere; }
+.dashboard-queue-item .tool-chip-list { margin: 0; }
+@media (max-width: 900px) { .dashboard-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dashboard-queue-item { grid-template-columns: 2.5rem minmax(0, 1fr); } .dashboard-queue-item > :nth-child(3), .dashboard-queue-item > :nth-child(4) { grid-column: 2; } }
+
+.file-manager {
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.file-toolbar,
+.file-selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+  padding: 0.8rem;
+  border-bottom: 1px solid var(--ink);
+}
+
+.file-manager-path {
+  min-width: 12rem;
+  margin-left: auto;
+  overflow-wrap: anywhere;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.file-upload-label { cursor: pointer; }
+
+.file-manager-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(18rem, 0.75fr);
+  min-height: 32rem;
+}
+
+.file-list-pane { min-width: 0; }
+.file-preview-pane { padding: 1rem; border-left: 1px solid var(--ink); background: #f7f4eb; }
+.file-preview-pane h2 { overflow-wrap: anywhere; }
+.file-preview-pane pre { max-height: 29rem; margin: 0; overflow: auto; padding: 0.8rem; border: 1px solid var(--ink); background: #17211d; color: #d9eed5; font-size: 0.76rem; white-space: pre-wrap; }
+.file-entry-list { display: grid; touch-action: none; }
+.file-entry {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) 5rem 11rem;
+  gap: 0.7rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border: 0;
+  border-bottom: 1px solid #c8c3b5;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+.file-entry:hover, .file-entry.selected { background: #dcebd7; }
+.file-entry-name { min-width: 0; overflow-wrap: anywhere; font-family: "IBM Plex Mono", monospace; font-weight: 700; }
+.file-kind { display: inline-block; min-width: 3.4rem; margin-right: 0.55rem; padding: 0.15rem 0.25rem; color: white; background: var(--signal); font-family: "IBM Plex Mono", monospace; font-size: 0.65rem; text-align: center; }
+.file-entry[data-kind="file"] .file-kind { background: #526c9b; }
+.file-entry time, .file-entry > span:not(.file-entry-name) { font-size: 0.72rem; color: var(--muted); }
+
+@media (max-width: 850px) {
+  .file-manager-grid { grid-template-columns: 1fr; }
+  .file-preview-pane { border-top: 1px solid var(--ink); border-left: 0; }
+  .file-manager-path { width: 100%; margin-left: 0; }
+  .file-entry { grid-template-columns: minmax(0, 1fr) 4rem; }
+  .file-entry time { display: none; }
+}
+
 .dialog-header {
   margin-bottom: 0.9rem;
 }
@@ -418,7 +532,8 @@ p {
 
 .queue-track {
   display: flex;
-  min-height: 8rem;
+  min-height: 0;
+  flex: 0 0 auto;
   gap: 0.45rem;
   flex-direction: column;
   align-items: stretch;
@@ -439,16 +554,18 @@ p {
 }
 
 .operations-rail {
-  position: sticky;
-  top: 5rem;
   display: grid;
   gap: 1rem;
-  grid-template-rows: auto auto;
+  align-content: start;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .queue-zone {
   display: flex;
-  min-height: 10rem;
+  min-height: min-content;
   flex-direction: column;
   overflow: visible;
 }
@@ -458,6 +575,50 @@ p {
   grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
   align-items: start;
+  min-height: 0;
+  padding-right: 0.4rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+@media (min-width: 951px) {
+  html.schedule-document {
+    overflow: hidden;
+  }
+
+  .schedule-page {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .schedule-page .topbar {
+    position: relative;
+  }
+
+  .schedule-page .board-page {
+    display: grid;
+    height: 100%;
+    min-height: 0;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    padding-bottom: clamp(1.25rem, 3vw, 2.5rem);
+    overflow: hidden;
+  }
+
+  .schedule-page .board-layout {
+    min-height: 0;
+    height: 100%;
+    align-items: stretch;
+  }
+}
+
+.flow-stations {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
 }
 
 .pool-zone {
@@ -476,6 +637,19 @@ p {
   padding: 0.8rem;
   place-items: stretch;
 }
+
+.station-zone {
+  background: linear-gradient(135deg, rgba(240, 201, 104, 0.16), rgba(250, 248, 242, 0.68));
+}
+
+.station-bay {
+  display: grid;
+  min-height: 13rem;
+  padding: 0.7rem;
+  place-items: stretch;
+}
+
+.station-bay .pallet-card { border-top-color: #b57912; }
 
 .machine-bay .pallet-card {
   border-width: 2px;
@@ -836,6 +1010,50 @@ a:focus-visible {
   margin-top: 1.75rem;
 }
 
+.autoschedule-dialog {
+  width: min(62rem, calc(100% - 2rem));
+}
+
+.autoschedule-dialog form {
+  max-height: min(48rem, calc(100vh - 3rem));
+  overflow-y: auto;
+}
+
+.autoschedule-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--ink);
+}
+
+.autoschedule-summary article {
+  padding: 0.8rem;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.autoschedule-summary article:last-child { border-right: 0; }
+.autoschedule-summary span,
+.autoschedule-steps span,
+.autoschedule-steps small {
+  display: block;
+  color: var(--muted);
+  font: 0.65rem "DM Mono", Consolas, monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.autoschedule-summary strong { display: block; margin-top: 0.25rem; font-size: 1.4rem; }
+.autoschedule-steps { display: grid; gap: 0; margin: 1rem 0; padding: 0; border: 1px solid var(--line); list-style: none; }
+.autoschedule-steps li { display: grid; grid-template-columns: 2.5rem minmax(8rem, 1.2fr) minmax(10rem, 1fr) minmax(14rem, 1.5fr); gap: 0.75rem; align-items: center; padding: 0.65rem 0.8rem; border-bottom: 1px solid var(--line); background: var(--surface); }
+.autoschedule-steps li:last-child { border-bottom: 0; }
+.autoschedule-steps strong,
+.autoschedule-steps b { display: block; font-size: 0.76rem; overflow-wrap: anywhere; }
+.autoschedule-steps small { margin-top: 0.15rem; text-transform: none; }
+.autoschedule-position { color: var(--signal) !important; font-size: 1rem !important; }
+.autoschedule-steps .tool-load { color: #2f6e43; }
+.autoschedule-steps .tool-unload { color: var(--danger); }
+.autoschedule-empty { display: block !important; color: var(--muted); }
+
 .toast {
   position: fixed;
   z-index: 100;
@@ -927,6 +1145,63 @@ a:focus-visible {
   background: var(--surface);
   box-shadow: var(--shadow);
 }
+
+.cnc-debug-section {
+  margin-top: 1rem;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.cnc-debug-section > .debug-digital-help { padding: 0 1rem; }
+.cnc-connection-row { margin: 0; }
+.cnc-summary-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.cnc-summary-grid article { min-height: 5.75rem; padding: 0.85rem 1rem; border-right: 1px solid var(--line); }
+.cnc-summary-grid article:last-child { border-right: 0; }
+.cnc-summary-grid span { display: block; color: var(--muted); font: 0.66rem "DM Mono", Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; }
+.cnc-summary-grid strong { display: block; margin-top: 0.65rem; overflow-wrap: anywhere; font-size: 0.88rem; }
+.cnc-data-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.cnc-data-grid article { min-height: 5.35rem; padding: 0.7rem 0.85rem; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.cnc-data-grid article:nth-child(4n) { border-right: 0; }
+.cnc-data-grid span { display: block; color: var(--muted); font: 0.62rem "DM Mono", Consolas, monospace; letter-spacing: 0.055em; text-transform: uppercase; }
+.cnc-data-grid strong { display: block; margin-top: 0.4rem; overflow-wrap: anywhere; font-size: 0.78rem; line-height: 1.35; }
+.cnc-axis-table { border-top: 1px solid var(--line); }
+.cnc-atc-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.cnc-atc-grid article { min-height: 4.8rem; padding: 0.8rem 1rem; border-right: 1px solid var(--line); }
+.cnc-atc-grid span { display: block; color: var(--muted); font: 0.66rem "DM Mono", Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; }
+.cnc-atc-grid strong { display: block; margin-top: 0.45rem; font-size: 0.88rem; }
+.cnc-subsection-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; padding: 0.8rem 1rem; border-top: 1px solid var(--ink); background: #ebe7db; }
+.cnc-subsection-heading h3 { margin: 0.15rem 0 0; font-size: 1.05rem; }
+.cnc-subsection-heading > span { color: var(--muted); font: 0.68rem "DM Mono", Consolas, monospace; text-transform: uppercase; }
+.cnc-atc-slot-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); }
+.cnc-atc-slot { position: relative; min-height: 7.2rem; padding: 0.7rem; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #fff9e8; }
+.cnc-atc-slot.empty { background: #f3f0e7; }
+.cnc-atc-slot.current { box-shadow: inset 0 0 0 3px var(--signal); }
+.cnc-atc-slot span, .cnc-atc-slot small, .cnc-atc-slot b { display: block; font: 0.62rem "DM Mono", Consolas, monospace; }
+.cnc-atc-slot span { color: var(--signal); text-transform: uppercase; }
+.cnc-atc-slot strong { display: block; margin: 0.45rem 0; font: 1rem "DM Mono", Consolas, monospace; }
+.cnc-atc-slot small { color: var(--muted); line-height: 1.35; }
+.cnc-atc-slot b { margin-top: 0.45rem; color: var(--signal); text-transform: uppercase; }
+.cnc-tool-color-legend { margin: 0; padding: 0.7rem 1rem; border-top: 1px solid var(--line); }
+.cnc-tool-table tr.tool-status-atc td { background: #dcebd7; }
+.cnc-tool-table tr.tool-status-measured td { background: #fff0b8; }
+.cnc-tool-table tr.tool-status-zero td { background: #f5d3ce; }
+.cnc-tool-table tr.tool-status-atc td:first-child { border-left: 6px solid #2f6e43; }
+.cnc-tool-table tr.tool-status-measured td:first-child { border-left: 6px solid #a8780b; }
+.cnc-tool-table tr.tool-status-zero td:first-child { border-left: 6px solid #a63b31; }
+.cnc-tool-table { max-height: 32rem; overflow: auto; border-top: 1px solid var(--line); }
+.cnc-io-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.cnc-io-sections > section { min-width: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.cnc-io-sections > section:nth-child(2n) { border-right: 0; }
+.cnc-io-sections h4 { margin: 0; padding: 0.7rem 0.85rem; border-bottom: 1px solid var(--line); font: 0.75rem "DM Mono", Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; }
+.cnc-digital-io-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.cnc-digital-tile { display: grid; grid-template-columns: minmax(0, 1fr) 0.7rem; align-items: center; gap: 0.35rem; min-height: 4.7rem; padding: 0.45rem; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #f3f0e7; }
+.cnc-digital-tile.active { background: #dcebd7; }
+.cnc-digital-tile span { color: var(--muted); font: 0.58rem "DM Mono", Consolas, monospace; }
+.cnc-digital-tile strong { grid-column: 1 / -1; overflow-wrap: anywhere; font: 0.65rem "DM Mono", Consolas, monospace; line-height: 1.25; }
+.cnc-digital-tile small { grid-column: 1 / -1; color: var(--muted); font: 0.6rem "DM Mono", Consolas, monospace; }
+.cnc-digital-tile .debug-led { width: 0.65rem; height: 0.65rem; }
+.cnc-analog-table { max-height: 20rem; overflow: auto; }
 
 .debug-overview-card {
   padding: 1rem;
@@ -1290,7 +1565,8 @@ a:focus-visible {
   .board-layout,
   .settings-panel,
   .debug-overview,
-  .debug-grid {
+  .debug-grid,
+  .flow-stations {
     grid-template-columns: 1fr;
   }
 
@@ -1300,8 +1576,18 @@ a:focus-visible {
 
   .operations-rail {
     position: static;
+    height: auto;
     max-height: none;
     grid-template-rows: auto auto;
+    overflow: visible;
+  }
+
+  .production-workspace {
+    position: static;
+    height: auto;
+    max-height: none;
+    padding-right: 0;
+    overflow: visible;
   }
 
   .queue-track {
@@ -1316,6 +1602,14 @@ a:focus-visible {
   .panel-intro p:last-child {
     max-width: none;
   }
+
+  .cnc-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cnc-data-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cnc-atc-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cnc-atc-slot-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .cnc-summary-grid article:nth-child(2n) { border-right: 0; }
+  .cnc-data-grid article:nth-child(2n) { border-right: 0; }
+  .cnc-summary-grid article { border-bottom: 1px solid var(--line); }
 }
 
 @media (max-width: 1100px) {
@@ -1364,9 +1658,21 @@ a:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .autoschedule-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .autoschedule-summary article:nth-child(2) { border-right: 0; }
+  .autoschedule-summary article:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+  .autoschedule-steps li { grid-template-columns: 2rem minmax(0, 1fr); }
+  .autoschedule-steps li > div:nth-child(n+3) { grid-column: 2; }
+
   .debug-table {
     table-layout: auto;
   }
+
+  .cnc-atc-slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cnc-data-grid, .cnc-io-sections { grid-template-columns: 1fr; }
+  .cnc-data-grid article { border-right: 0; }
+  .cnc-io-sections > section { border-right: 0; }
+  .cnc-digital-io-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 
 }
 

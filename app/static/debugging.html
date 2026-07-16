@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Debugging | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260711-5">
-    <script src="/static/debugging.js?v=20260711-5" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260715-11">
+    <script src="/static/debugging.js?v=20260715-8" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -16,7 +16,11 @@
       </a>
       <nav aria-label="Main navigation">
         <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/tools">Tools</a>
         <a class="nav-link active" href="/debugging">Debugging</a>
+        <a class="nav-link hidden" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link hidden" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
         <a class="nav-link" href="/settings">Settings</a>
       </nav>
       <span class="system-state" id="system-state">
@@ -240,6 +244,74 @@
             </table>
           </div>
         </article>
+      </section>
+
+      <section class="cnc-debug-section" aria-labelledby="cnc-debug-title">
+        <header class="zone-heading">
+          <div>
+            <p class="section-number">12 / CNC</p>
+            <h2 id="cnc-debug-title">Tormach 1500MX / PathPilot</h2>
+          </div>
+          <div class="debug-connection-row cnc-connection-row">
+            <span class="debug-connection-light unknown" id="cnc-connection-light" aria-hidden="true"></span>
+            <strong id="cnc-connection-label">Not configured</strong>
+          </div>
+        </header>
+        <p class="debug-digital-help" id="cnc-notes">Loading CNC connection details.</p>
+        <div class="cnc-summary-grid">
+          <article><span>Controller</span><strong id="cnc-controller-state">Unavailable</strong></article>
+          <article><span>Program</span><strong id="cnc-program">Unavailable</strong></article>
+          <article><span>Spindle</span><strong id="cnc-spindle">Unavailable</strong></article>
+          <article><span>Coolant</span><strong id="cnc-coolant">Unavailable</strong></article>
+          <article><span>Feed override</span><strong id="cnc-feed-override">Unavailable</strong></article>
+          <article><span>Updated</span><strong id="cnc-timestamp">Unavailable</strong></article>
+        </div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Machine safety</p><h3>Health and limits</h3></div><span>Live LinuxCNC status</span></div>
+        <div class="cnc-data-grid" id="cnc-health-grid"></div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Program flow</p><h3>Execution and modes</h3></div><span>Read-only</span></div>
+        <div class="cnc-data-grid" id="cnc-program-grid"></div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Cutting state</p><h3>Spindle and overrides</h3></div><span>Command and feedback</span></div>
+        <div class="cnc-data-grid" id="cnc-spindle-grid"></div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Machine coordinates</p><h3>Motion and offsets</h3></div><span>Machine units</span></div>
+        <div class="cnc-data-grid" id="cnc-motion-grid"></div>
+        <div class="debug-table-shell cnc-axis-table">
+          <table class="debug-table">
+            <thead><tr><th>Axis</th><th>Position</th><th>Commanded</th><th>Velocity</th><th>Distance to go</th><th>Following error</th><th>Home</th><th>Limit</th></tr></thead>
+            <tbody id="cnc-axis-rows"></tbody>
+          </table>
+        </div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Probe and production</p><h3>Probe, tooling, and counters</h3></div><span>Latest controller values</span></div>
+        <div class="cnc-data-grid" id="cnc-probe-production-grid"></div>
+        <div class="cnc-atc-grid" id="cnc-atc-grid"></div>
+        <div class="cnc-subsection-heading">
+          <div>
+            <p class="section-number">PathPilot carousel map</p>
+            <h3>ATC positions</h3>
+          </div>
+          <span>Physical positions 1-16</span>
+        </div>
+        <div class="cnc-atc-slot-grid" id="cnc-atc-slots"></div>
+        <div class="cnc-subsection-heading">
+          <div>
+            <p class="section-number">Measured geometry</p>
+            <h3>Tool table</h3>
+          </div>
+          <span>Entries with a length value</span>
+        </div>
+        <div class="tool-color-legend cnc-tool-color-legend" aria-label="Tool status colors"><span class="tool-status-atc">In ATC</span><span class="tool-status-measured">Measured, not in ATC</span><span class="tool-status-zero">Zero length</span></div>
+        <div class="debug-table-shell cnc-tool-table">
+          <table class="debug-table">
+            <thead><tr><th>Tool</th><th>Diameter</th><th>Length offset</th></tr></thead>
+            <tbody id="cnc-tool-table-rows"></tbody>
+          </table>
+        </div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">LinuxCNC channels</p><h3>Machine I/O</h3></div><span>All readable channels</span></div>
+        <div class="cnc-io-sections">
+          <section><h4>Digital inputs</h4><div class="cnc-digital-io-grid" id="cnc-digital-inputs"></div></section>
+          <section><h4>Digital outputs</h4><div class="cnc-digital-io-grid" id="cnc-digital-outputs"></div></section>
+          <section><h4>Analog inputs</h4><div class="debug-table-shell cnc-analog-table"><table class="debug-table"><thead><tr><th>Channel</th><th>Signal</th><th>Value</th></tr></thead><tbody id="cnc-analog-inputs"></tbody></table></div></section>
+          <section><h4>Analog outputs</h4><div class="debug-table-shell cnc-analog-table"><table class="debug-table"><thead><tr><th>Channel</th><th>Signal</th><th>Value</th></tr></thead><tbody id="cnc-analog-outputs"></tbody></table></div></section>
+        </div>
       </section>
     </main>
 

@@ -43,6 +43,25 @@ class AppSettings(Base):
     robot_file_password: Mapped[str] = mapped_column(String, default="easybot")
     robot_file_directory: Mapped[str] = mapped_column(String(500), default="/programs")
     robot_program_extensions: Mapped[str] = mapped_column(String, default='[".urp"]')
+    robot_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    robot_programs_filter_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    robot_editor_command: Mapped[str] = mapped_column(String(500), default="code")
+    fusion_tool_library_path: Mapped[str] = mapped_column(String(1000), default="")
+    fusion_tool_library_paths: Mapped[str] = mapped_column(String, default="[]")
+    cnc_telemetry_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    cnc_host: Mapped[str] = mapped_column(String(255), default="")
+    cnc_ssh_port: Mapped[int] = mapped_column(Integer, default=22)
+    cnc_ssh_username: Mapped[str] = mapped_column(String(255), default="operator")
+    cnc_ssh_password: Mapped[str] = mapped_column(String(500), default="")
+    cnc_timeout_seconds: Mapped[float] = mapped_column(Float, default=2.0)
+    mill_file_directory: Mapped[str] = mapped_column(String(500), default="/home/operator/gcode")
+    mill_program_extensions: Mapped[str] = mapped_column(String, default='[".nc",".tap",".gcode",".cnc"]')
+    mill_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    mill_programs_filter_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mill_editor_command: Mapped[str] = mapped_column(String(500), default="code")
+    pool_location_positions: Mapped[str] = mapped_column(String, default="[]")
+    on_deck_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')
+    dripping_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')
     revision: Mapped[int] = mapped_column(Integer, default=0)
 
     __mapper_args__ = {
@@ -60,7 +79,7 @@ class Pallet(Base):
             name="ck_pallet_content_status",
         ),
         CheckConstraint(
-            "location IN ('pool','machine','storage')",
+            "location IN ('pool','on_deck','machine','dripping','storage')",
             name="ck_pallet_location",
         ),
         Index(
@@ -74,6 +93,18 @@ class Pallet(Base):
             "location",
             unique=True,
             sqlite_where=text("location = 'machine'"),
+        ),
+        Index(
+            "uq_single_on_deck_pallet",
+            "location",
+            unique=True,
+            sqlite_where=text("location = 'on_deck'"),
+        ),
+        Index(
+            "uq_single_dripping_pallet",
+            "location",
+            unique=True,
+            sqlite_where=text("location = 'dripping'"),
         ),
         Index(
             "uq_pallet_pool_slot",
