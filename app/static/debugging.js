@@ -21,14 +21,29 @@ const ui = {
   jointDetailRows: document.querySelector("#joint-detail-rows"),
   actualRows: document.querySelector("#actual-rows"),
   programButtons: document.querySelector("#debug-program-buttons"),
+  millProgramButtons: document.querySelector("#debug-mill-program-buttons"),
   loadedControllerProgram: document.querySelector("#loaded-controller-program"),
   programFileNote: document.querySelector("#program-file-note"),
+  millProgramFileNote: document.querySelector("#mill-program-file-note"),
+  palletMotionSlot: document.querySelector("#debug-pallet-motion-slot"),
+  palletMotionPick: document.querySelector("#debug-pick-pallet"),
+  palletMotionPlace: document.querySelector("#debug-place-pallet"),
+  palletMotionStatus: document.querySelector("#debug-pallet-motion-status"),
+  millMotionLoad: document.querySelector("#debug-load-mill"),
+  millMotionUnload: document.querySelector("#debug-unload-mill"),
+  millMotionStatus: document.querySelector("#debug-mill-motion-status"),
   programDialog: document.querySelector("#program-button-dialog"),
   programForm: document.querySelector("#program-button-form"),
   programName: document.querySelector("#program-button-name"),
   programFilename: document.querySelector("#program-button-filename"),
   programColor: document.querySelector("#program-button-color"),
   programCancel: document.querySelector("#program-button-cancel"),
+  millProgramDialog: document.querySelector("#mill-program-button-dialog"),
+  millProgramForm: document.querySelector("#mill-program-button-form"),
+  millProgramName: document.querySelector("#mill-program-button-name"),
+  millProgramFilename: document.querySelector("#mill-program-button-filename"),
+  millProgramColor: document.querySelector("#mill-program-button-color"),
+  millProgramCancel: document.querySelector("#mill-program-button-cancel"),
   cncConnectionLight: document.querySelector("#cnc-connection-light"),
   cncConnectionLabel: document.querySelector("#cnc-connection-label"),
   cncNotes: document.querySelector("#cnc-notes"),
@@ -56,8 +71,11 @@ const ui = {
 let lastError = "";
 let snapshotState = null;
 let editingProgramIndex = null;
+let editingMillProgramIndex = null;
 let latestCncSnapshot = null;
 let cncIoLabels = {digital_inputs: {}, digital_outputs: {}, analog_inputs: {}, analog_outputs: {}};
+let palletMotionSettings = null;
+let millPalletMotionReady = false;
 
 async function loadRobotProgramsNav() {
   try {
@@ -70,6 +88,43 @@ async function loadRobotProgramsNav() {
     });
   } catch {
     // Keep the link hidden when settings cannot be read.
+  }
+}
+
+async function loadPalletMotionTestSettings() {
+  try {
+    const result = await api("/api/settings");
+    palletMotionSettings = result.settings;
+    const count = Number(result.settings.pool_slot_count || 0);
+    ui.palletMotionSlot.innerHTML = Array.from({length: count}, (_, index) => {
+      const slot = index + 1;
+      return `<option value="${slot}">Pool ${String(slot).padStart(2, "0")}</option>`;
+    }).join("");
+    const ready = result.settings.pallet_motion_enabled;
+    const millPosesReady = Boolean(
+      result.settings.robot_mill_load_unload && result.settings.robot_mill_safe_entry_exit,
+    );
+    millPalletMotionReady = ready && millPosesReady;
+    ui.palletMotionPick.disabled = !ready;
+    ui.palletMotionPlace.disabled = !ready;
+    ui.millMotionLoad.disabled = !millPalletMotionReady;
+    ui.millMotionUnload.disabled = !millPalletMotionReady;
+    ui.palletMotionStatus.textContent = ready
+      ? "Ready for a manual test. This does not update the schedule."
+      : "Enable physical pallet movements in Settings to use this tool.";
+    ui.millMotionStatus.textContent = !ready
+      ? "Enable physical pallet movements in Settings to use this tool."
+      : !millPosesReady
+        ? "Configure and save the robot mill load/unload and safe entry/exit poses in Settings first."
+        : "Ready. Rebuild generated scripts after changing either mill robot pose.";
+  } catch (error) {
+    ui.palletMotionStatus.textContent = `Pallet-motion test unavailable: ${error.message}`;
+    ui.millMotionStatus.textContent = `Mill-transfer test unavailable: ${error.message}`;
+    ui.palletMotionPick.disabled = true;
+    ui.palletMotionPlace.disabled = true;
+    ui.millMotionLoad.disabled = true;
+    ui.millMotionUnload.disabled = true;
+    millPalletMotionReady = false;
   }
 }
 
@@ -86,8 +141,15 @@ async function api(url, options = {}) {
     ...options,
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || `Request failed with status ${response.status}`);
+  if (!response.ok) throw new Error(errorMessage(data.detail, `Request failed with status ${response.status}`));
   return data;
+}
+
+function errorMessage(detail, fallback) {
+  if (typeof detail === "string" && detail) return detail;
+  if (detail && typeof detail.message === "string") return detail.message;
+  if (Array.isArray(detail)) return detail.map(item => item?.msg || item?.message).filter(Boolean).join("; ") || fallback;
+  return fallback;
 }
 
 function escapeHtml(value) {
@@ -182,6 +244,7 @@ function renderCnc(snapshot) {
   ui.cncCoolant.textContent = snapshot.coolant;
   ui.cncFeedOverride.textContent = snapshot.feed_override;
   ui.cncTimestamp.textContent = new Date(snapshot.timestamp).toLocaleString();
+  renderMillProgramControls(snapshot);
   const axisRows = snapshot.axis_rows || [];
   ui.cncAxisRows.innerHTML = axisRows.length
     ? axisRows.map(cncAxisRow).join("")
@@ -302,6 +365,21 @@ function renderCnc(snapshot) {
   ui.cncDigitalOutputs.innerHTML = cncDigitalTiles(io.digital_outputs, cncIoLabels.digital_outputs, "DO");
   ui.cncAnalogInputs.innerHTML = cncAnalogRows(io.analog_inputs, cncIoLabels.analog_inputs, "AI");
   ui.cncAnalogOutputs.innerHTML = cncAnalogRows(io.analog_outputs, cncIoLabels.analog_outputs, "AO");
+}
+
+function renderMillProgramControls(snapshot) {
+  const controls = snapshot.mill_program_controls || {buttons: [], file_list_note: "Mill program controls are unavailable."};
+  ui.millProgramFileNote.textContent = controls.file_list_note;
+  ui.millProgramButtons.innerHTML = controls.buttons.length
+    ? controls.buttons.map(button => `
+      <div class="debug-program-card program-${escapeHtml(button.color)}">
+        <button class="debug-program-run" type="button" data-run-debug-mill-program="${button.index}" ${button.can_run ? "" : "disabled"}>
+          <span class="debug-io-title"><span class="debug-led ${button.can_run ? "active" : "unknown"}"></span><span class="debug-io-name">${escapeHtml(button.display_name)}</span></span>
+          <span class="debug-io-meta">${escapeHtml(button.filename || "No mill file configured")}</span>
+        </button>
+        <button class="debug-io-rename" type="button" data-edit-debug-mill-program="${button.index}">Edit Mill</button>
+      </div>`).join("")
+    : `<p class="debug-table-empty">Enable one or more Mill program buttons in Settings.</p>`;
 }
 
 function ledCell(value) {
@@ -614,6 +692,47 @@ async function loadCncIoLabels() {
 }
 
 document.addEventListener("click", async event => {
+  const editMillProgramButton = event.target.closest("[data-edit-debug-mill-program]");
+  if (editMillProgramButton && latestCncSnapshot) {
+    editingMillProgramIndex = Number(editMillProgramButton.dataset.editDebugMillProgram);
+    const button = latestCncSnapshot.mill_program_controls?.buttons?.[editingMillProgramIndex];
+    if (!button) return;
+    ui.millProgramName.value = button.display_name;
+    ui.millProgramFilename.innerHTML = `<option value="">No Mill program assigned</option>`;
+    ui.millProgramColor.value = button.color;
+    ui.millProgramDialog.showModal();
+    try {
+      const result = await api("/api/debug/mill-programs/files");
+      // The API scans only PathPilot's user G-code folder.
+      const files = [...new Set(result.files || [])];
+      ui.millProgramFilename.innerHTML = ["", ...files]
+        .map(file => `<option value="${escapeHtml(file)}">${escapeHtml(file || "No Mill program assigned")}</option>`)
+        .join("");
+      ui.millProgramFilename.value = button.filename;
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+    return;
+  }
+
+  const runMillProgramButton = event.target.closest("[data-run-debug-mill-program]");
+  if (runMillProgramButton && latestCncSnapshot) {
+    const button = runMillProgramButton;
+    button.disabled = true;
+    try {
+      const updated = await api("/api/debug/mill-programs/run", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: latestCncSnapshot.revision, index: Number(button.dataset.runDebugMillProgram)}),
+      });
+      latestCncSnapshot = updated;
+      renderCnc(updated);
+      showToast("PathPilot accepted the program start command.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+    return;
+  }
+
   const editProgramButton = event.target.closest("[data-edit-debug-program]");
   if (editProgramButton && snapshotState) {
     editingProgramIndex = Number(editProgramButton.dataset.editDebugProgram);
@@ -695,7 +814,59 @@ document.addEventListener("click", async event => {
   }
 });
 
+async function runPalletMotionTest(operation) {
+  if (!snapshotState) return;
+  const button = operation === "pick" ? ui.palletMotionPick : ui.palletMotionPlace;
+  button.disabled = true;
+  ui.palletMotionStatus.textContent = `${operation === "pick" ? "Pick" : "Place"} command is being dispatched...`;
+  try {
+    const result = await api("/api/debug/pallet-motion", {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: snapshotState.revision,
+        operation,
+        pool_slot_number: Number(ui.palletMotionSlot.value),
+      }),
+    });
+    ui.palletMotionStatus.textContent = result.message;
+    showToast(result.message);
+  } catch (error) {
+    ui.palletMotionStatus.textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = !palletMotionSettings?.pallet_motion_enabled;
+  }
+}
+
+ui.palletMotionPick.addEventListener("click", () => runPalletMotionTest("pick"));
+ui.palletMotionPlace.addEventListener("click", () => runPalletMotionTest("put"));
+
+async function runMillPalletMotionTest(operation) {
+  if (!snapshotState) return;
+  const button = operation === "load" ? ui.millMotionLoad : ui.millMotionUnload;
+  button.disabled = true;
+  ui.millMotionStatus.textContent = `${operation === "load" ? "Load" : "Unload"} command is being dispatched...`;
+  try {
+    const result = await api("/api/debug/mill-pallet-motion", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: snapshotState.revision, operation}),
+    });
+    ui.millMotionStatus.textContent = result.message;
+    showToast(result.message);
+  } catch (error) {
+    ui.millMotionStatus.textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    ui.millMotionLoad.disabled = !millPalletMotionReady;
+    ui.millMotionUnload.disabled = !millPalletMotionReady;
+  }
+}
+
+ui.millMotionLoad.addEventListener("click", () => runMillPalletMotionTest("load"));
+ui.millMotionUnload.addEventListener("click", () => runMillPalletMotionTest("unload"));
+
 ui.programCancel.addEventListener("click", () => ui.programDialog.close());
+ui.millProgramCancel.addEventListener("click", () => ui.millProgramDialog.close());
 ui.programForm.addEventListener("submit", async event => {
   event.preventDefault();
   if (editingProgramIndex === null || !snapshotState) return;
@@ -718,9 +889,33 @@ ui.programForm.addEventListener("submit", async event => {
   }
 });
 
+ui.millProgramForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (editingMillProgramIndex === null || !latestCncSnapshot) return;
+  try {
+    const updated = await api("/api/debug/mill-programs/configure", {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: latestCncSnapshot.revision,
+        index: editingMillProgramIndex,
+        display_name: ui.millProgramName.value,
+        filename: ui.millProgramFilename.value,
+        color: ui.millProgramColor.value,
+      }),
+    });
+    ui.millProgramDialog.close();
+    latestCncSnapshot = updated;
+    renderCnc(updated);
+    showToast("Mill program button saved.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+});
+
 loadDebugging();
 loadCncDebugging();
 loadCncIoLabels();
 loadRobotProgramsNav();
+loadPalletMotionTestSettings();
 window.setInterval(loadDebugging, 2000);
 window.setInterval(loadCncDebugging, 2000);

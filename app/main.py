@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import threading
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -24,15 +25,25 @@ from app.schemas import (
     CreatePallet,
     CncTelemetryConnectionTest,
     MovePallet,
+    RecoverPalletMotion,
     ConfigureDebugProgram,
+    ConfigureDebugMillProgram,
+    ConfirmRunModeAction,
     QueuePallet,
     RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
     RobotFileAction,
     SettingsUpdate,
+    SetRunModeSafety,
+    StartRunMode,
+    StartMillPalletTransfer,
+    StartPalletMotion,
     ToggleDebugIo,
     RunDebugProgram,
+    RunDebugMillProgram,
+    RunDebugMillPalletMotion,
+    RunDebugPalletMotion,
     UpdatePallet,
 )
 from app.service import (
@@ -46,14 +57,17 @@ from app.service import (
     tools_snapshot,
     create_pallet,
     configure_debug_program,
+    configure_debug_mill_program,
     dequeue_pallet,
     delete_pallet,
     duplicate_pallet,
     move_pallet,
+    execute_pallet_motion,
     queue_pallet,
     refresh_programs,
     rename_debug_io,
     reorder_queue,
+    current_robot_pose,
     robot_io_snapshot,
     robot_file_manager_settings,
     robot_programs_page_settings,
@@ -62,10 +76,26 @@ from app.service import (
     robot_program_files,
     remove_fusion_tool_library,
     run_debug_program,
+    run_debug_mill_program,
+    mill_program_files,
+    run_debug_mill_pallet_motion,
+    run_debug_pallet_motion,
     simulate_signal,
     toggle_debug_io,
     update_pallet,
     update_settings,
+    start_pallet_motion,
+    start_mill_pallet_transfer,
+    recover_pallet_motion,
+    interrupt_active_pallet_motion,
+    interrupt_run_mode,
+    execute_run_mode,
+    start_run_mode,
+    stop_run_mode,
+    set_run_mode_safety,
+    confirm_run_mode_action,
+    rebuild_pallet_motion_scripts,
+    rebuild_mill_load_position_program,
 )
 from app.robot_files import (
     RobotFileAccessError,
@@ -128,6 +158,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
         engine = create_database_engine(url)
         application.state.engine = engine
         application.state.session_factory = create_session_factory(engine)
+        with application.state.session_factory() as session:
+            interrupt_active_pallet_motion(session)
+            interrupt_run_mode(session)
         yield
         engine.dispose()
 
@@ -193,6 +226,45 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @application.get("/api/board")
     def get_board(session: Session = Depends(get_session)) -> dict:
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/start", status_code=status.HTTP_202_ACCEPTED)
+    def start_production_run_mode(
+        payload: StartRunMode,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        start_run_mode(session, payload)
+        threading.Thread(
+            target=execute_run_mode,
+            args=(request.app.state.session_factory,),
+            daemon=True,
+            name="production-run-mode",
+        ).start()
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/stop")
+    def stop_production_run_mode(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        stop_run_mode(session, payload.expected_revision)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/safety")
+    def update_run_mode_safety(
+        payload: SetRunModeSafety,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        set_run_mode_safety(session, payload)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/confirm")
+    def confirm_production_run_mode_action(
+        payload: ConfirmRunModeAction,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        confirm_run_mode_action(session, payload)
         return board_snapshot(session)
 
     @application.get("/api/dashboard")
@@ -319,6 +391,61 @@ def create_app(database_url: str | None = None) -> FastAPI:
         move_pallet(session, pallet_id, payload)
         return board_snapshot(session)
 
+    @application.post("/api/robot-motions", status_code=status.HTTP_202_ACCEPTED)
+    def start_robot_pallet_motion(
+        payload: StartPalletMotion,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        motion_id = start_pallet_motion(session, payload)
+        if motion_id:
+            threading.Thread(
+                target=execute_pallet_motion,
+                args=(request.app.state.session_factory, motion_id),
+                daemon=True,
+                name=f"pallet-motion-{motion_id[:8]}",
+            ).start()
+        return board_snapshot(session)
+
+    @application.post("/api/robot-motions/mill-transfer", status_code=status.HTTP_202_ACCEPTED)
+    def start_mill_pallet_transfer_motion(
+        payload: StartMillPalletTransfer,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        motion_id = start_mill_pallet_transfer(session, payload)
+        if motion_id:
+            threading.Thread(
+                target=execute_pallet_motion,
+                args=(request.app.state.session_factory, motion_id),
+                daemon=True,
+                name=f"mill-transfer-{motion_id[:8]}",
+            ).start()
+        return board_snapshot(session)
+
+    @application.post("/api/robot-motions/{motion_id}/recover")
+    def recover_robot_pallet_motion(
+        motion_id: str,
+        payload: RecoverPalletMotion,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        recover_pallet_motion(session, motion_id, payload)
+        return board_snapshot(session)
+
+    @application.post("/api/robot-motions/rebuild-scripts")
+    def rebuild_robot_pallet_motion_scripts(
+        session: Session = Depends(get_session),
+    ) -> dict:
+        result = rebuild_pallet_motion_scripts(session)
+        return {"board": board_snapshot(session), **result}
+
+    @application.post("/api/mill-programs/rebuild-load-position")
+    def rebuild_mill_load_position(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return rebuild_mill_load_position_program(session, payload.expected_revision)
+
     @application.post("/api/pallets/{pallet_id}/queue")
     def add_to_queue(
         pallet_id: str,
@@ -383,9 +510,27 @@ def create_app(database_url: str | None = None) -> FastAPI:
         simulate_signal(session, signal, payload.expected_revision)
         return board_snapshot(session)
 
+    @application.post("/api/debug/pallet-motion")
+    def run_debug_pallet_motion_test(
+        payload: RunDebugPalletMotion,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return run_debug_pallet_motion(session, payload)
+
+    @application.post("/api/debug/mill-pallet-motion")
+    def run_debug_mill_pallet_motion_test(
+        payload: RunDebugMillPalletMotion,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return run_debug_mill_pallet_motion(session, payload)
+
     @application.get("/api/debug/robot-io")
     def get_robot_io(session: Session = Depends(get_session)) -> dict:
         return robot_io_snapshot(session)
+
+    @application.get("/api/debug/robot-pose")
+    def get_current_robot_pose(session: Session = Depends(get_session)) -> dict:
+        return current_robot_pose(session)
 
     @application.get("/api/debug/cnc")
     def get_cnc_debug(session: Session = Depends(get_session)) -> dict:
@@ -429,12 +574,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
         configure_debug_program(session, payload)
         return robot_io_snapshot(session)
 
+    @application.post("/api/debug/mill-programs/configure")
+    def configure_debug_mill_program_button(
+        payload: ConfigureDebugMillProgram,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        configure_debug_mill_program(session, payload)
+        return cnc_debug_snapshot(session)
+
     @application.get("/api/debug/programs/files")
     def get_debug_program_files(
         include_all: bool = False,
         session: Session = Depends(get_session),
     ) -> dict:
         return {"files": robot_program_files(session, include_all=include_all)}
+
+    @application.get("/api/debug/mill-programs/files")
+    def get_debug_mill_program_files(session: Session = Depends(get_session)) -> dict:
+        return {"files": mill_program_files(session)}
 
     @application.get("/api/robot-files")
     def get_robot_files(
@@ -639,6 +796,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
     ) -> dict:
         run_debug_program(session, payload)
         return robot_io_snapshot(session)
+
+    @application.post("/api/debug/mill-programs/run")
+    def run_debug_mill_program_button(
+        payload: RunDebugMillProgram,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        run_debug_mill_program(session, payload)
+        return cnc_debug_snapshot(session)
 
     @application.post("/api/system/relaunch", status_code=status.HTTP_202_ACCEPTED)
     def relaunch_system() -> dict[str, str]:

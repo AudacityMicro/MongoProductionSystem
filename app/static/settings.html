@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260712-5">
-    <script src="/static/settings.js?v=20260712-5" defer></script>
+    <script src="/static/settings.js?v=20260716-18" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -32,9 +32,16 @@
     <main class="settings-page">
       <section class="settings-heading">
         <p class="eyebrow">System configuration</p>
-        <h1>Scheduling settings</h1>
-        <p>Program discovery and physical storage layout are configured here. <span id="app-version">Version unknown</span></p>
+        <h1>System settings</h1>
+        <p>Configuration is grouped by the system it controls. <span id="app-version">Version unknown</span></p>
       </section>
+
+      <nav class="settings-category-nav" aria-label="Settings categories">
+        <a href="#settings-general">General</a>
+        <a href="#settings-robot">Robot</a>
+        <a href="#settings-mill">Mill</a>
+        <a href="#settings-system">System</a>
+      </nav>
 
       <form id="settings-form">
         <section class="settings-panel">
@@ -129,12 +136,12 @@
           <div class="panel-intro">
             <p class="section-number">04</p>
             <h2>CNC telemetry</h2>
-            <p>Read-only PathPilot/LinuxCNC status is collected over SSH. No machine commands are enabled in this stage.</p>
+            <p>PathPilot/LinuxCNC status is collected over SSH. The Debugging page can also run only the specifically assigned Mill program buttons.</p>
           </div>
           <div class="panel-fields">
             <label class="checkbox-control">
               <input id="cnc-telemetry-enabled" type="checkbox">
-              <span>Enable CNC telemetry<small>Polls LinuxCNC status only. It never sends a command to the Tormach controller.</small></span>
+              <span>Enable CNC telemetry<small>Enables LinuxCNC status polling and allows explicitly assigned Mill Debug program buttons to send a start command.</small></span>
             </label>
             <div class="form-row">
               <label>PathPilot IP or hostname<input id="cnc-host" placeholder="192.168.86.40" maxlength="255"></label>
@@ -145,11 +152,15 @@
               <label>SSH password<input id="cnc-ssh-password" type="password" maxlength="500" autocomplete="new-password"></label>
             </div>
             <label>Connection timeout (seconds)<input id="cnc-timeout-seconds" type="number" min="0.1" max="15" step="0.1"></label>
+            <label class="checkbox-control">
+              <input id="cnc-require-a-axis-homed" type="checkbox">
+              <span>Require A axis homed before mill program start<small>Leave off for normal X/Y/Z programs. Enable only when a program depends on the rotary A axis.</small></span>
+            </label>
             <div class="inline-actions">
               <button class="button secondary" id="test-cnc-telemetry" type="button">Test CNC telemetry</button>
               <span class="field-help" id="cnc-telemetry-status" role="status" aria-live="polite"></span>
             </div>
-            <p class="field-help">The controller must allow SSH access for this LinuxCNC user. The application runs <code>linuxcnc.stat().poll()</code> remotely and reads its JSON response.</p>
+            <p class="field-help">The controller must allow SSH access for this LinuxCNC user. Telemetry uses <code>linuxcnc.stat().poll()</code>; assigned Mill Debug buttons use <code>linuxcnc.command()</code> to load and start only their configured file.</p>
           </div>
         </section>
 
@@ -171,16 +182,46 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">05</p>
-            <h2>Pallet locations</h2>
-            <p>Robot-reference positions in millimeters. These values are stored for future pallet-handling automation.</p>
+            <h2>Robot pallet locations</h2>
+            <p>All robot positions use millimeters in the robot base frame and radians for tool orientation.</p>
           </div>
           <div class="panel-fields">
             <div class="location-grid" id="pool-location-grid"></div>
+            <div class="form-row">
+              <label class="checkbox-control">
+                <input id="on-deck-enabled" type="checkbox">
+                <span>Enable On deck station<small>Shows the staged pallet position and includes its robot scripts in the workflow.</small></span>
+              </label>
+              <label class="checkbox-control">
+                <input id="dripping-enabled" type="checkbox">
+                <span>Enable Dripping station<small>Shows the return-staging position and includes its robot scripts in the workflow.</small></span>
+              </label>
+            </div>
             <div class="form-row location-stations">
               <fieldset class="location-fieldset" id="on-deck-location-fields"><legend>On deck location</legend></fieldset>
               <fieldset class="location-fieldset" id="dripping-location-fields"><legend>Dripping location</legend></fieldset>
             </div>
-            <p class="field-help">Coordinates are not sent to the robot yet. Save them now to prepare for future robot and mill integration.</p>
+            <fieldset class="location-fieldset" id="robot-mill-load-unload-fields"></fieldset>
+            <fieldset class="location-fieldset" id="robot-mill-safe-entry-exit-fields"></fieldset>
+            <p class="field-help">The robot uses the shared safe entry/exit pose before entering the mill and after retracting. These mill-loading poses are stored for the next robot/mill integration stage.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">Mill geometry</p>
+            <h2>Mill loading position</h2>
+            <p>The mill moves to this machine-coordinate position for robot pallet loading and unloading.</p>
+          </div>
+          <div class="panel-fields">
+            <fieldset class="location-fieldset mill-g53-fieldset" id="mill-load-unload-g53-fields">
+              <legend>Load/unload position · G53 machine coordinates · inches</legend>
+            </fieldset>
+            <div class="inline-actions">
+              <button class="button secondary" id="build-mill-load-position-program" type="button">Build mill loading program</button>
+              <span class="field-help" id="mill-load-position-program-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="field-help">Builds <code>mongo_mill_load_position.nc</code> from these saved coordinates, writes a local copy, and uploads it to PathPilot's <code>/home/operator/gcode/Gcode</code> folder. The program uses G53 G1 moves: Z first, then X/Y.</p>
           </div>
         </section>
 
@@ -241,15 +282,19 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">06</p>
-            <h2>Debug programs</h2>
-            <p>Configure a compact set of controller-program buttons on the Debugging page.</p>
+            <h2>Debug program buttons</h2>
+            <p>Configure independent Robot and Mill program-button counts for the Debugging page.</p>
           </div>
           <div class="panel-fields">
             <label>
-              Number of program buttons
+              Robot program buttons
               <input id="debug-program-button-count" type="number" min="1" max="16" step="1">
             </label>
-            <p class="field-help">Each button has its own display name, controller filename, and color. Reducing the count hides higher-numbered buttons without deleting their saved configuration.</p>
+            <label>
+              Mill program buttons
+              <input id="debug-mill-program-button-count" type="number" min="1" max="16" step="1">
+            </label>
+            <p class="field-help">Each button has its own display name, controller filename, and color. Reducing a count hides higher-numbered buttons without deleting their saved configuration.</p>
           </div>
         </section>
 
@@ -306,6 +351,105 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">09</p>
+            <h2>Robot pallet motion</h2>
+            <p>Configure safe motion geometry and generated programs for Pool positions and manual mill transfers.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="pallet-motion-enabled" type="checkbox">
+              <span>Enable physical pallet movements<small>Off by default. Requires a physical robot, healthy RTDE, idle runtime, and configured program mappings.</small></span>
+            </label>
+            <label>Movement timeout (seconds)<input id="pallet-motion-timeout-seconds" type="number" min="2" max="1800" step="1"></label>
+            <div class="form-row">
+              <label>Y approach clearance (mm)<input id="pallet-motion-approach-y-clearance" type="number" min="-1000" max="1000" step="1"></label>
+              <label>Mill +X withdrawal clearance (mm)<input id="pallet-motion-mill-approach-x-clearance" type="number" min="0" max="1000" step="1"><small>This positive distance is always added to the saved mill X coordinate. Retraction uses straight-line motion.</small></label>
+              <label>Z lift clearance (mm)<input id="pallet-motion-lift-z-clearance" type="number" min="1" max="1000" step="1"></label>
+            </div>
+            <div class="form-row">
+              <label>Max travel speed (rad/s)<input id="pallet-motion-max-travel-speed" type="number" min="0.01" max="3" step="0.01"></label>
+              <label>Pickup/setdown speed (m/s)<input id="pallet-motion-pickup-speed" type="number" min="0.01" max="1" step="0.01"></label>
+              <label>Gripper output (optional)<select id="pallet-motion-grip-output"></select></label>
+              <label class="checkbox-control"><input id="pallet-motion-grip-closed-value" type="checkbox"><span>Closed when output is on<small>Unused for the current passive fork lifter.</small></span></label>
+            </div>
+            <fieldset class="location-fieldset">
+              <legend>Mill door and Erowa commands</legend>
+              <p class="field-help">Assign the robot outputs used for each command. A momentary command returns the output to its opposite state after 0.25 seconds; a maintained command leaves it in the selected state.</p>
+              <div class="form-row">
+                <label>Door open output<select id="mill-door-open-output"></select></label>
+                <label>Door open state<select id="mill-door-open-state"><option value="true">Output ON</option><option value="false">Output OFF</option></select></label>
+                <label class="checkbox-control"><input id="mill-door-open-pulse" type="checkbox"><span>Momentary open command</span></label>
+              </div>
+              <div class="form-row">
+                <label>Door close output<select id="mill-door-close-output"></select></label>
+                <label>Door close state<select id="mill-door-close-state"><option value="true">Output ON</option><option value="false">Output OFF</option></select></label>
+                <label class="checkbox-control"><input id="mill-door-close-pulse" type="checkbox"><span>Momentary close command</span></label>
+              </div>
+              <div class="form-row">
+                <label>Erowa unlock output<select id="erowa-unlock-output"></select></label>
+                <label>Erowa unlock state<select id="erowa-unlock-state"><option value="true">Output ON</option><option value="false">Output OFF</option></select></label>
+                <label class="checkbox-control"><input id="erowa-unlock-pulse" type="checkbox"><span>Momentary unlock command</span></label>
+              </div>
+              <div class="form-row">
+                <label>Erowa lock output<select id="erowa-lock-output"></select></label>
+                <label>Erowa lock state<select id="erowa-lock-state"><option value="true">Output ON</option><option value="false">Output OFF</option></select></label>
+                <label class="checkbox-control"><input id="erowa-lock-pulse" type="checkbox"><span>Momentary lock command</span></label>
+              </div>
+              <label>Wait after each door/Erowa command (seconds)<input id="mill-actuation-wait-seconds" type="number" min="0" max="30" step="0.1"></label>
+            </fieldset>
+            <fieldset class="location-fieldset">
+              <legend>Pallet tool orientation</legend>
+              <div class="location-axis-row">
+                <label>Rx (rad)<input id="pallet-motion-rx" type="number" step="any" data-round-to-decimals="3"></label>
+                <label>Ry (rad)<input id="pallet-motion-ry" type="number" step="any" data-round-to-decimals="3"></label>
+                <label>Rz (rad)<input id="pallet-motion-rz" type="number" step="any" data-round-to-decimals="3"></label>
+              </div>
+            </fieldset>
+            <fieldset class="location-fieldset" id="pallet-motion-safe-pre-fields"></fieldset>
+            <div class="inline-actions">
+              <button class="button secondary" id="rebuild-motion-scripts" type="button">Rebuild generated scripts</button>
+              <span class="field-help" id="motion-program-file-status">Saves these settings, writes local .script files, then synchronizes the same files to the robot.</span>
+            </div>
+            <div class="managed-library-list" id="generated-motion-program-list"></div>
+            <fieldset class="location-fieldset">
+              <legend>Travel waypoints</legend>
+              <div class="waypoint-add-row">
+                <input id="motion-waypoint-name" maxlength="80" placeholder="Name">
+                <input id="motion-waypoint-x" type="number" step="any" data-round-to-decimals="3" placeholder="X mm">
+                <input id="motion-waypoint-y" type="number" step="any" data-round-to-decimals="3" placeholder="Y mm">
+                <input id="motion-waypoint-z" type="number" step="any" data-round-to-decimals="3" placeholder="Z mm">
+                <input id="motion-waypoint-rx" type="number" step="any" data-round-to-decimals="3" placeholder="Rx rad">
+                <input id="motion-waypoint-ry" type="number" step="any" data-round-to-decimals="3" placeholder="Ry rad">
+                <input id="motion-waypoint-rz" type="number" step="any" data-round-to-decimals="3" placeholder="Rz rad">
+                <button class="button secondary" id="add-motion-waypoint" type="button">Add waypoint</button>
+              </div>
+              <div class="managed-library-list" id="motion-waypoint-list"></div>
+            </fieldset>
+            <p class="field-help">Pool pick and place scripts use the Y approach clearance. Mill load and unload scripts use the dedicated X approach clearance. All X/Y/Z values are millimeters in the robot base frame; Rx/Ry/Rz define the pallet tool orientation in radians. The application manages Busy, Success, and Fault state using live TCP-motion telemetry; no robot I/O channels are reserved for those flags.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">10</p>
+            <h2>Workholding library</h2>
+            <p>Manage reusable workholding descriptions for the pallet create and edit forms.</p>
+          </div>
+          <div class="panel-fields">
+            <label>
+              Add workholding
+              <div class="inline-actions">
+                <input id="new-workholding" maxlength="250" placeholder="e.g. 6 in vise">
+                <button class="button secondary" id="add-workholding" type="button">Add</button>
+              </div>
+            </label>
+            <div class="managed-library-list" id="workholding-library-list"></div>
+            <p class="field-help">Saved entries appear as selectable suggestions on pallet forms. You can still enter a one-off workholding description when needed.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">11</p>
             <h2>Fusion 360 tools</h2>
             <p>Load tool numbers and descriptions from a Fusion 360 tool-library JSON file.</p>
           </div>
@@ -335,6 +479,19 @@
           <button class="button ghost" id="unsaved-cancel" type="button">Stay here</button>
           <button class="button secondary" id="unsaved-discard" type="button">Leave without saving</button>
           <button class="button primary" id="unsaved-save" type="button">Save and continue</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-shell hidden" id="script-rebuild-modal" role="dialog" aria-modal="true" aria-labelledby="script-rebuild-title">
+      <div class="dialog-card">
+        <div class="dialog-header">
+          <p class="eyebrow">Robot programs out of date</p>
+          <h2 id="script-rebuild-title">Rebuild generated programs now?</h2>
+        </div>
+        <p>Saved robot-motion settings no longer match the generated pallet-motion scripts. Rebuild to update both the local files and the robot copies.</p>
+        <div class="dialog-actions">
+          <button class="button ghost" id="script-rebuild-later" type="button">Not now</button>
+          <button class="button primary" id="script-rebuild-now" type="button">Rebuild programs</button>
         </div>
       </div>
     </div>

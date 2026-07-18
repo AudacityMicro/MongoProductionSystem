@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Debugging | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260715-11">
-    <script src="/static/debugging.js?v=20260715-8" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260716-12">
+    <script src="/static/debugging.js?v=20260716-13" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -32,13 +32,25 @@
     <main class="debugging-page">
       <section class="settings-heading">
         <p class="eyebrow">Telemetry and diagnostics</p>
-        <h1>Robot readable I/O</h1>
-        <p id="debug-notes">Loading current robot-readable signals.</p>
+        <h1>Debugging</h1>
+        <p id="debug-notes">Loading live robot and mill telemetry.</p>
       </section>
 
-      <section class="debug-overview">
+      <nav class="settings-category-nav debug-category-nav" aria-label="Debugging sections">
+        <a href="#debug-system">System</a>
+        <a href="#debug-robot">Robot</a>
+        <a href="#debug-mill">Mill</a>
+      </nav>
+
+      <section class="debug-category" id="debug-system" aria-labelledby="debug-system-title">
+        <header class="debug-category-heading">
+          <p>System</p>
+          <h2 id="debug-system-title">Cell overview</h2>
+          <span>Connection health, production-state summary, and the latest controller update.</span>
+        </header>
+        <div class="debug-overview">
         <article class="debug-overview-card">
-          <p class="section-number">01</p>
+          <p class="section-number">System 01</p>
           <h2>Connection</h2>
           <div class="debug-connection-row">
             <span class="debug-connection-light" id="debug-connection-light" aria-hidden="true"></span>
@@ -52,7 +64,7 @@
         </article>
 
         <article class="debug-overview-card">
-          <p class="section-number">02</p>
+          <p class="section-number">System 02</p>
           <h2>Board summary</h2>
           <dl class="debug-summary-list">
             <div><dt>Machine pallet</dt><dd id="summary-machine-pallet">None</dd></div>
@@ -62,13 +74,20 @@
             <div><dt>Open pool positions</dt><dd id="summary-pool-open">0</dd></div>
           </dl>
         </article>
+        </div>
       </section>
 
-      <section class="debug-grid">
+      <section class="debug-category" id="debug-robot" aria-labelledby="debug-robot-title">
+        <header class="debug-category-heading">
+          <p>Robot</p>
+          <h2 id="debug-robot-title">Mongo controller</h2>
+          <span>Live I/O, program controls, pallet-motion testing, and RTDE telemetry.</span>
+        </header>
+        <div class="debug-grid">
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">03 / Controller map</p>
+              <p class="section-number">Robot 01 / Controller map</p>
               <h2>Digital I/O faceplate</h2>
             </div>
           </header>
@@ -79,7 +98,7 @@
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">04 / Controller programs</p>
+              <p class="section-number">Robot 02 / Controller programs</p>
               <h2>Program run buttons</h2>
             </div>
           </header>
@@ -88,10 +107,41 @@
           <div class="debug-program-grid" id="debug-program-buttons"></div>
         </article>
 
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">Robot 03 / Pallet motion test</p>
+              <h2>Pick or place a pool pallet</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help">Runs the generated motion for the selected Pool position without changing the schedule, pallet location, or Robot-held state. Use only after confirming the physical cell is ready.</p>
+          <div class="debug-pallet-motion-controls">
+            <label>Pool position<select id="debug-pallet-motion-slot"></select></label>
+            <button class="button primary" id="debug-pick-pallet" type="button">Pick pallet</button>
+            <button class="button primary" id="debug-place-pallet" type="button">Place pallet</button>
+            <span id="debug-pallet-motion-status">Loading pool positions...</span>
+          </div>
+        </article>
+
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">Robot 04 / Mill pallet transfer</p>
+              <h2>Load or unload the mill</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help">Load assumes Mongo is already holding a pallet. Unload picks the pallet from the mill and leaves it held. The mill must already be at its configured G53 load/unload position. This sends only the robot motion and does not change the schedule or Robot-held state.</p>
+          <div class="debug-pallet-motion-controls">
+            <button class="button primary" id="debug-load-mill" type="button">Load mill</button>
+            <button class="button primary" id="debug-unload-mill" type="button">Unload mill</button>
+            <span id="debug-mill-motion-status">Loading mill-transfer settings...</span>
+          </div>
+        </article>
+
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">05 / Analog</p>
+              <p class="section-number">Robot 05 / Analog</p>
               <h2>Analog and I/O values</h2>
             </div>
           </header>
@@ -114,7 +164,7 @@
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">09 / TCP motion</p>
+              <p class="section-number">Robot 06 / TCP motion</p>
               <h2>TCP pose, speed, and force</h2>
             </div>
           </header>
@@ -138,7 +188,7 @@
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">10 / Joints</p>
+              <p class="section-number">Robot 07 / Joints</p>
               <h2>Joint positions, velocities, and current</h2>
             </div>
           </header>
@@ -163,7 +213,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">06 / Analog</p>
+              <p class="section-number">Robot 08 / Analog</p>
               <h2>Analog outputs</h2>
             </div>
           </header>
@@ -186,7 +236,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">07 / State</p>
+              <p class="section-number">Robot 09 / State</p>
               <h2>Robot state</h2>
             </div>
           </header>
@@ -206,7 +256,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">08 / Motion</p>
+              <p class="section-number">Robot 10 / Motion</p>
               <h2>Pose and joints</h2>
             </div>
           </header>
@@ -227,7 +277,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">11 / Actual</p>
+              <p class="section-number">Robot 11 / Actual</p>
               <h2>Additional actual values</h2>
             </div>
           </header>
@@ -244,12 +294,19 @@
             </table>
           </div>
         </article>
+        </div>
       </section>
 
+      <section class="debug-category" id="debug-mill" aria-labelledby="debug-mill-title">
+        <header class="debug-category-heading">
+          <p>Mill</p>
+          <h2 id="debug-mill-title">Tormach 1500MX</h2>
+          <span>Read-only PathPilot and LinuxCNC telemetry, tooling, ATC state, and machine I/O.</span>
+        </header>
       <section class="cnc-debug-section" aria-labelledby="cnc-debug-title">
         <header class="zone-heading">
           <div>
-            <p class="section-number">12 / CNC</p>
+            <p class="section-number">Mill 01 / CNC telemetry</p>
             <h2 id="cnc-debug-title">Tormach 1500MX / PathPilot</h2>
           </div>
           <div class="debug-connection-row cnc-connection-row">
@@ -266,6 +323,9 @@
           <article><span>Feed override</span><strong id="cnc-feed-override">Unavailable</strong></article>
           <article><span>Updated</span><strong id="cnc-timestamp">Unavailable</strong></article>
         </div>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Mill 02 / Programs</p><h3>Program run buttons</h3></div><span>Configured PathPilot programs</span></div>
+        <p class="debug-digital-help" id="mill-program-file-note">Loading mill program-button details.</p>
+        <div class="debug-program-grid mill-program-grid" id="debug-mill-program-buttons"></div>
         <div class="cnc-subsection-heading"><div><p class="section-number">Machine safety</p><h3>Health and limits</h3></div><span>Live LinuxCNC status</span></div>
         <div class="cnc-data-grid" id="cnc-health-grid"></div>
         <div class="cnc-subsection-heading"><div><p class="section-number">Program flow</p><h3>Execution and modes</h3></div><span>Read-only</span></div>
@@ -313,6 +373,7 @@
           <section><h4>Analog outputs</h4><div class="debug-table-shell cnc-analog-table"><table class="debug-table"><thead><tr><th>Channel</th><th>Signal</th><th>Value</th></tr></thead><tbody id="cnc-analog-outputs"></tbody></table></div></section>
         </div>
       </section>
+      </section>
     </main>
 
     <dialog class="debug-program-dialog" id="program-button-dialog" aria-labelledby="program-button-dialog-title">
@@ -345,6 +406,41 @@
         </label>
         <div class="dialog-actions">
           <button class="button ghost" type="button" id="program-button-cancel">Cancel</button>
+          <button class="button primary" type="submit">Save button</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="debug-program-dialog" id="mill-program-button-dialog" aria-labelledby="mill-program-button-dialog-title">
+      <form id="mill-program-button-form">
+        <div class="dialog-header">
+          <p class="eyebrow">PathPilot program</p>
+          <h2 id="mill-program-button-dialog-title">Edit mill program button</h2>
+        </div>
+        <label>
+          Display name
+          <input id="mill-program-button-name" maxlength="80" placeholder="Probe workpiece">
+        </label>
+        <label>
+          Mill filename
+          <select id="mill-program-button-filename"></select>
+        </label>
+        <p class="field-help">Choose a G-code program from <code>/home/operator/gcode/Gcode</code>. The list is filtered by the Mill program extensions in Settings.</p>
+        <label>
+          Button color
+          <select id="mill-program-button-color">
+            <option value="amber">Amber</option>
+            <option value="blue">Blue</option>
+            <option value="cyan">Cyan</option>
+            <option value="green">Green</option>
+            <option value="lime">Lime</option>
+            <option value="orange">Orange</option>
+            <option value="red">Red</option>
+            <option value="violet">Violet</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" type="button" id="mill-program-button-cancel">Cancel</button>
           <button class="button primary" type="submit">Save button</button>
         </div>
       </form>

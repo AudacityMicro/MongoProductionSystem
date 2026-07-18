@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260715-4">
-    <script src="/static/app.js?v=20260715-4" defer></script>
+    <script src="/static/app.js?v=20260716-1" defer></script>
   </head>
   <body class="schedule-page">
     <header class="topbar">
@@ -36,12 +36,21 @@
           <h1>Pallet schedule</h1>
         </div>
         <div class="toolbar">
+          <div class="run-mode-controls">
+            <label>
+              <input id="run-safety-confirm" type="checkbox" checked>
+              <span>Confirm every run step</span>
+            </label>
+            <button class="button run-mode-button" id="run-mode-toggle" type="button">Start run mode</button>
+          </div>
           <button class="button secondary" id="autoschedule-queue" type="button">Optimize by tools</button>
           <button class="button primary" id="create-pallet">+ New pallet</button>
         </div>
       </section>
 
       <div class="notice hidden" id="program-warning" role="status"></div>
+      <section class="run-mode-status" id="run-mode-status" aria-live="polite"></section>
+      <section class="robot-motion-status hidden" id="robot-motion-status" aria-live="polite"></section>
 
       <div class="board-layout">
         <div class="operations-rail">
@@ -70,6 +79,15 @@
 
         <div class="production-workspace">
           <div class="flow-stations">
+            <section class="zone station-zone robot-held-zone" data-zone="robot_held">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">Robot transfer</p>
+                  <h2>Robot-held</h2>
+                </div>
+              </header>
+              <div class="station-bay" id="robot-held-slot"></div>
+            </section>
             <section class="zone station-zone" data-zone="on_deck">
               <header class="zone-heading">
                 <div>
@@ -150,7 +168,8 @@
         <input type="hidden" id="pallet-id">
         <label>
           Workholding
-          <input id="pallet-workholding" required maxlength="250" autocomplete="off">
+          <input id="pallet-workholding" list="workholding-options" required maxlength="250" autocomplete="off">
+          <datalist id="workholding-options"></datalist>
         </label>
         <div class="form-row">
           <label>
@@ -196,6 +215,52 @@
           <button class="button ghost" value="cancel">Cancel</button>
           <button class="button danger" id="confirm-action" value="confirm">Confirm</button>
         </div>
+      </form>
+    </dialog>
+
+    <dialog id="mill-putaway-dialog">
+      <form method="dialog" id="mill-putaway-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Mongo transfer</p>
+            <h2>Put away <span id="mill-putaway-pallet-name"></span></h2>
+          </div>
+        </div>
+        <p>Mongo will unload this pallet from the mill and put it into the selected pool position.</p>
+        <input id="mill-putaway-pallet-id" type="hidden">
+        <label>Destination pool position
+          <select id="mill-putaway-slot"></select>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" value="cancel">Cancel</button>
+          <button class="button" value="confirm">Unload and put away</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="run-confirm-dialog">
+      <form method="dialog" id="run-confirm-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Run mode safety check</p>
+            <h2 id="run-confirm-title">Confirm next action</h2>
+          </div>
+        </div>
+        <p id="run-confirm-message"></p>
+        <p class="field-help">Verify the robot, mill, pallet, door, workholding, and surrounding cell are clear before continuing.</p>
+        <div class="dialog-actions">
+          <button class="button danger" id="run-confirm-stop" type="button">Stop run mode</button>
+          <button class="button primary" id="run-confirm-approve" type="button">Approve action</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="motion-recovery-dialog">
+      <form method="dialog" id="motion-recovery-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Movement fault</p><h2>Reconcile pallet location</h2></div></div>
+        <p id="motion-recovery-message"></p>
+        <label>Observed pallet location<select id="motion-recovery-resolution"></select></label>
+        <div class="dialog-actions"><button class="button ghost" value="cancel">Cancel</button><button class="button danger" type="submit">Save recovery</button></div>
       </form>
     </dialog>
 

@@ -13,6 +13,8 @@ const ui = {
   machine: document.querySelector("#machine-slot"),
   onDeck: document.querySelector("#on-deck-slot"),
   dripping: document.querySelector("#dripping-slot"),
+  onDeckZone: document.querySelector('[data-zone="on_deck"]'),
+  drippingZone: document.querySelector('[data-zone="dripping"]'),
   storage: document.querySelector("#storage-list"),
   warning: document.querySelector("#program-warning"),
   toast: document.querySelector("#toast"),
@@ -26,6 +28,14 @@ const ui = {
   autoscheduleNote: document.querySelector("#autoschedule-note"),
   debugPanel: document.querySelector("#debug-panel"),
   debugState: document.querySelector("#debug-state"),
+  robotHeld: document.querySelector("#robot-held-slot"),
+  robotMotionStatus: document.querySelector("#robot-motion-status"),
+  motionRecoveryDialog: document.querySelector("#motion-recovery-dialog"),
+  motionRecoveryForm: document.querySelector("#motion-recovery-form"),
+  runModeToggle: document.querySelector("#run-mode-toggle"),
+  runSafetyConfirm: document.querySelector("#run-safety-confirm"),
+  runModeStatus: document.querySelector("#run-mode-status"),
+  runConfirmDialog: document.querySelector("#run-confirm-dialog"),
 };
 
 let board = null;
@@ -33,6 +43,7 @@ let draggedPalletId = null;
 let draggedCardContext = null;
 let confirmCallback = null;
 let autoschedulePlan = null;
+let shownRunConfirmationToken = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -81,9 +92,16 @@ async function api(url, options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 409) await loadBoard();
-    throw new Error(data.detail || `Request failed with status ${response.status}`);
+    throw new Error(errorMessage(data.detail, `Request failed with status ${response.status}`));
   }
   return data;
+}
+
+function errorMessage(detail, fallback) {
+  if (typeof detail === "string" && detail) return detail;
+  if (detail && typeof detail.message === "string") return detail.message;
+  if (Array.isArray(detail)) return detail.map(item => item?.msg || item?.message).filter(Boolean).join("; ") || fallback;
+  return fallback;
 }
 
 function showToast(message, kind = "success") {
@@ -99,8 +117,16 @@ function emptyState(label) {
 
 function palletCard(pallet, position = null) {
   const program = pallet.program_path || "No program";
-  const queueAction = pallet.queue_position === null
+  const runLocked = Boolean(board.run_mode?.enabled);
+  const queueAction = !runLocked && pallet.queue_position === null
     ? (pallet.location === "pool" ? `<button class="text-button" data-action="queue">Queue</button>` : "")
+    : "";
+  const motionLocked = Boolean(board.robot_motion?.active) || runLocked;
+  const pickAction = pallet.location === "pool" && !motionLocked
+    ? `<button class="text-button" data-action="pick">Pick</button>`
+    : "";
+  const millPutAwayAction = pallet.location === "machine" && !motionLocked
+    ? `<button class="text-button" data-action="mongo-unload">Put away with Mongo</button>`
     : "";
   const queueBadge = pallet.queue_position !== null && position === null
     ? `<span class="queue-chip">Queued #${pallet.queue_position + 1}</span>`
@@ -111,7 +137,7 @@ function palletCard(pallet, position = null) {
        <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
     : "";
   return `
-    <article class="pallet-card content-${pallet.content_status}" draggable="true"
+    <article class="pallet-card content-${pallet.content_status}" draggable="${runLocked ? "false" : "true"}"
       data-pallet-id="${pallet.id}" data-card-context="${cardContext}" tabindex="0">
       <div class="card-topline">
         ${position === null ? `<span class="drag-handle" aria-hidden="true">⠿</span>` : `<span class="queue-number">${position + 1}</span>`}
@@ -126,9 +152,11 @@ function palletCard(pallet, position = null) {
       </dl>
       <div class="card-actions">
         ${queueAction}
-        <button class="text-button" data-action="edit">Edit</button>
+        ${pickAction}
+        ${millPutAwayAction}
+        ${runLocked ? "" : `<button class="text-button" data-action="edit">Edit</button>
         <button class="text-button" data-action="duplicate">Duplicate</button>
-        <button class="text-button danger-text" data-action="delete">Delete</button>
+        <button class="text-button danger-text" data-action="delete">Delete</button>`}
       </div>
     </article>`;
 }
@@ -143,6 +171,7 @@ function renderBoard() {
   const machine = pallets.find(item => item.location === "machine");
   const onDeck = pallets.find(item => item.location === "on_deck");
   const dripping = pallets.find(item => item.location === "dripping");
+  const robotHeld = pallets.find(item => item.location === "robot_held");
   const stored = pallets.filter(item => item.location === "storage")
     .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -157,7 +186,7 @@ function renderBoard() {
       return `<div class="pool-position drop-target ${occupant ? "occupied" : ""}"
         data-destination="pool" data-pool-slot="${number}">
         <header><span>${String(number).padStart(2, "0")}</span><small>Pool position</small></header>
-        ${occupant ? palletCard(occupant) : emptyState("Available")}
+        ${occupant ? palletCard(occupant) : (robotHeld && !board.robot_motion?.active ? `<button class="button secondary pool-put-action" type="button" data-put-slot="${number}">Put Robot-held pallet here</button>` : emptyState("Available"))}
       </div>`;
     },
   ).join("");
@@ -170,6 +199,11 @@ function renderBoard() {
   ui.dripping.innerHTML = dripping
     ? palletCard(dripping)
     : emptyState("Stage finished pallets here");
+  ui.onDeckZone.classList.toggle("hidden", board.settings.on_deck_enabled === false);
+  ui.drippingZone.classList.toggle("hidden", board.settings.dripping_enabled === false);
+  ui.robotHeld.innerHTML = robotHeld
+    ? palletCard(robotHeld)
+    : emptyState("Picked pallets appear here");
 
   ui.storage.innerHTML = stored.length
     ? stored.map(item => palletCard(item)).join("")
@@ -177,11 +211,17 @@ function renderBoard() {
 
   document.querySelector("#queue-count").textContent = `${queue.length} pallet${queue.length === 1 ? "" : "s"}`;
   document.querySelector("#autoschedule-queue").disabled = queue.filter(item => item.program_tools?.length).length < 2;
+  document.querySelector("#create-pallet").disabled = Boolean(board.run_mode?.enabled);
+  if (board.run_mode?.enabled) document.querySelector("#autoschedule-queue").disabled = true;
   document.querySelector("#pool-count").textContent = `${pool.length} pallet${pool.length === 1 ? "" : "s"}`;
   document.querySelector("#storage-count").textContent = `${stored.length} pallet${stored.length === 1 ? "" : "s"}`;
   document.querySelector("#weight-unit-label").textContent = `(${board.settings.weight_unit})`;
   document.querySelector("#program-options").innerHTML = board.programs
     .map(program => `<option value="${escapeHtml(program)}"></option>`).join("");
+  document.querySelector("#workholding-options").innerHTML = (board.settings.workholding_library || [])
+    .map(workholding => `<option value="${escapeHtml(workholding)}"></option>`).join("");
+  renderRobotMotionStatus();
+  renderRunMode();
 
   ui.warning.classList.toggle("hidden", !board.program_warning);
   ui.warning.textContent = board.program_warning || "";
@@ -194,6 +234,48 @@ function renderBoard() {
   );
   ui.debugState.textContent = board.settings.machine_state;
   ui.debugState.className = `debug-state state-${board.settings.machine_state}`;
+}
+
+function renderRobotMotionStatus() {
+  const motion = board.robot_motion?.active;
+  ui.robotMotionStatus.classList.toggle("hidden", !motion);
+  if (!motion) return;
+  const target = motion.operation === "pick"
+    ? `Pool ${String(motion.source_slot).padStart(2, "0")}`
+    : motion.operation === "put"
+      ? `Pool ${String(motion.destination_slot).padStart(2, "0")}`
+      : motion.operation === "load_mill"
+        ? `Pool ${String(motion.source_slot).padStart(2, "0")} -> Mill`
+        : `Mill -> Pool ${String(motion.destination_slot).padStart(2, "0")}`;
+  const status = motion.status === "faulted" ? "Movement fault" : motion.status === "running" ? "Robot moving" : "Movement requested";
+  const action = motion.status === "faulted"
+    ? `<button class="button danger" type="button" id="recover-robot-motion">Recover</button>`
+    : "";
+  ui.robotMotionStatus.className = `robot-motion-status ${motion.status}`;
+  ui.robotMotionStatus.innerHTML = `<div><strong>${status}: ${escapeHtml(motion.pallet_name || "Pallet")}</strong><span>${escapeHtml(motion.operation)} ${target} | ${escapeHtml(motion.program_path)}${motion.failure_detail ? ` | ${escapeHtml(motion.failure_detail)}` : ""}</span></div>${action}`;
+}
+
+function renderRunMode() {
+  const run = board.run_mode || {};
+  ui.runSafetyConfirm.checked = Boolean(run.safety_confirm);
+  ui.runSafetyConfirm.disabled = Boolean(run.enabled);
+  ui.runModeToggle.textContent = run.enabled ? "Stop run mode" : "Start run mode";
+  ui.runModeToggle.classList.toggle("active", Boolean(run.enabled));
+  ui.runModeStatus.className = `run-mode-status ${escapeHtml(run.state || "idle")}`;
+  const pallet = run.current_pallet_name ? ` · ${escapeHtml(run.current_pallet_name)}` : "";
+  const safety = run.safety_confirm ? "Step confirmation on" : "Step confirmation off";
+  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div><span>${escapeHtml(run.detail || "Ready to process the production queue in order.")} · ${safety}</span>`;
+
+  if (run.confirmation_token && run.pending_action && shownRunConfirmationToken !== run.confirmation_token) {
+    shownRunConfirmationToken = run.confirmation_token;
+    document.querySelector("#run-confirm-title").textContent = `Approve ${run.pending_action.replaceAll("_", " ")}`;
+    document.querySelector("#run-confirm-message").textContent = run.detail;
+    if (!ui.runConfirmDialog.open) ui.runConfirmDialog.showModal();
+  }
+  if (!run.confirmation_token) {
+    shownRunConfirmationToken = null;
+    if (ui.runConfirmDialog.open) ui.runConfirmDialog.close();
+  }
 }
 
 async function loadBoard() {
@@ -343,6 +425,70 @@ async function previewAutoschedule() {
 
 document.querySelector("#create-pallet").addEventListener("click", () => openPalletDialog());
 document.querySelector("#autoschedule-queue").addEventListener("click", previewAutoschedule);
+
+ui.runSafetyConfirm.addEventListener("change", async () => {
+  const enabled = ui.runSafetyConfirm.checked;
+  try {
+    board = await api("/api/run-mode/safety", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, enabled}),
+    });
+    renderBoard();
+    showToast(enabled ? "Run-step confirmations enabled." : "Run-step confirmations disabled.");
+  } catch (error) {
+    ui.runSafetyConfirm.checked = !enabled;
+    showToast(error.message, "error");
+  }
+});
+
+ui.runModeToggle.addEventListener("click", () => {
+  if (board.run_mode?.enabled) {
+    askConfirmation("Stop run mode", "Stop after the current controller command finishes? No next automated step will start.", async () => {
+      await mutate("/api/run-mode/stop", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: board.revision}),
+      }, "Run mode stop requested.");
+    });
+    return;
+  }
+  const queued = board.pallets.filter(item => item.queue_position !== null).length;
+  askConfirmation("Start run mode", `Run all ${queued} queued pallet${queued === 1 ? "" : "s"} in order?`, async () => {
+    try {
+      board = await api("/api/run-mode/start", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: board.revision, safety_confirm: ui.runSafetyConfirm.checked}),
+      });
+      renderBoard();
+      showToast("Run mode started.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+});
+
+async function answerRunConfirmation(approved) {
+  const token = board.run_mode?.confirmation_token;
+  if (!token) return;
+  try {
+    board = await api("/api/run-mode/confirm", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, token, approved}),
+    });
+    ui.runConfirmDialog.close();
+    renderBoard();
+    showToast(approved ? "Run-mode action approved." : "Run mode stopped.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+document.querySelector("#run-confirm-approve").addEventListener("click", () => answerRunConfirmation(true));
+document.querySelector("#run-confirm-stop").addEventListener("click", () => answerRunConfirmation(false));
+ui.runConfirmDialog.addEventListener("cancel", event => {
+  event.preventDefault();
+  answerRunConfirmation(false);
+});
+
 ui.palletForm.addEventListener("submit", savePallet);
 document.querySelectorAll("[data-close-pallet]").forEach(button => {
   button.addEventListener("click", () => ui.palletDialog.close());
@@ -356,6 +502,8 @@ document.addEventListener("click", event => {
   if (!pallet) return;
   if (action === "edit") openPalletDialog(pallet);
   if (action === "queue") queuePallet(pallet.id);
+  if (action === "pick") startRobotMotion("pick", pallet.pool_slot_number, pallet.id);
+  if (action === "mongo-unload") openMillPutAwayDialog(pallet);
   if (action === "duplicate") {
     askConfirmation("Duplicate pallet", `Create a pool copy of ${pallet.name}?`, async () => {
       await mutate(`/api/pallets/${pallet.id}/duplicate`, {
@@ -375,6 +523,89 @@ document.addEventListener("click", event => {
         }, `${pallet.name} deleted.`);
       },
     );
+  }
+});
+
+async function startRobotMotion(operation, poolSlotNumber, palletId = null) {
+  try {
+    board = await api("/api/robot-motions", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, operation, pool_slot_number: poolSlotNumber, pallet_id: palletId}),
+    });
+    renderBoard();
+    showToast(operation === "pick" ? "Pick command sent to Mongo." : "Put-away command sent to Mongo.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function openMillPutAwayDialog(pallet) {
+  const openSlots = Array.from({length: board.settings.pool_slot_count}, (_, index) => index + 1)
+    .filter(slot => !board.pallets.some(item => item.location === "pool" && item.pool_slot_number === slot));
+  if (!openSlots.length) {
+    showToast("No empty pallet-pool positions are available.", "error");
+    return;
+  }
+  document.querySelector("#mill-putaway-pallet-id").value = pallet.id;
+  document.querySelector("#mill-putaway-pallet-name").textContent = pallet.name;
+  document.querySelector("#mill-putaway-slot").innerHTML = openSlots
+    .map(slot => `<option value="${slot}">Pool ${String(slot).padStart(2, "0")}</option>`).join("");
+  document.querySelector("#mill-putaway-dialog").showModal();
+}
+
+async function startMillTransfer(operation, palletId = null, poolSlotNumber = null) {
+  try {
+    board = await api("/api/robot-motions/mill-transfer", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, operation, pallet_id: palletId, pool_slot_number: poolSlotNumber}),
+    });
+    renderBoard();
+    showToast(operation === "load" ? "Mongo is loading the pallet into the mill." : "Mongo is unloading and putting away the pallet.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+document.querySelector("#mill-putaway-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const palletId = document.querySelector("#mill-putaway-pallet-id").value;
+  const slot = Number(document.querySelector("#mill-putaway-slot").value);
+  document.querySelector("#mill-putaway-dialog").close();
+  await startMillTransfer("unload", palletId, slot);
+});
+
+document.addEventListener("click", event => {
+  const put = event.target.closest("[data-put-slot]");
+  if (put) startRobotMotion("put", Number(put.dataset.putSlot));
+  const recover = event.target.closest("#recover-robot-motion");
+  if (!recover) return;
+  const motion = board.robot_motion.active;
+  const options = motion.operation === "pick"
+    ? [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]]
+    : motion.operation === "put"
+      ? [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
+      : motion.operation === "load_mill"
+        ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
+        : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]];
+  document.querySelector("#motion-recovery-message").textContent = `${motion.failure_detail || "Movement fault."} Verify the actual pallet location before saving.`;
+  document.querySelector("#motion-recovery-resolution").innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  ui.motionRecoveryDialog.showModal();
+});
+
+ui.motionRecoveryForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  const motion = board.robot_motion?.active;
+  if (!motion) return;
+  try {
+    board = await api(`/api/robot-motions/${motion.id}/recover`, {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, resolution: document.querySelector("#motion-recovery-resolution").value}),
+    });
+    ui.motionRecoveryDialog.close();
+    renderBoard();
+    showToast("Pallet movement fault reconciled.");
+  } catch (error) {
+    showToast(error.message, "error");
   }
 });
 
@@ -410,6 +641,10 @@ document.querySelector("#apply-autoschedule").addEventListener("click", async ()
 });
 
 document.addEventListener("dragstart", event => {
+  if (board.run_mode?.enabled) {
+    event.preventDefault();
+    return;
+  }
   const card = event.target.closest(".pallet-card");
   if (!card) return;
   draggedPalletId = card.dataset.palletId;
@@ -463,6 +698,16 @@ document.addEventListener("drop", async event => {
     );
     return;
   }
+  if (destination === "machine" && palletById(draggedPalletId)?.location === "pool") {
+    const pallet = palletById(draggedPalletId);
+    const useMongo = window.confirm(`Use Mongo to move ${pallet.name} from Pool ${String(pallet.pool_slot_number).padStart(2, "0")} into the mill?\n\nOK: run the physical pick and mill-load sequence.\nCancel: update the schedule only.`);
+    if (useMongo) {
+      await startMillTransfer("load", pallet.id);
+    } else {
+      await movePallet(draggedPalletId, destination);
+    }
+    return;
+  }
   await movePallet(
     draggedPalletId,
     destination,
@@ -509,3 +754,4 @@ document.querySelectorAll("[data-debug-signal]").forEach(button => {
 });
 
 loadBoard();
+window.setInterval(loadBoard, 1500);

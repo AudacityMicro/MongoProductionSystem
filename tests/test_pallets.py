@@ -53,6 +53,77 @@ def test_create_edit_duplicate_and_delete(client: TestClient) -> None:
     assert len(response.json()["pallets"]) == 1
 
 
+def test_simulated_robot_pick_and_put_away_preserves_queue(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    pallet = board["pallets"][0]
+    board = client.post(
+        f"/api/pallets/{pallet['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+
+    picked = client.post(
+        "/api/robot-motions",
+        json={
+            "expected_revision": board["revision"],
+            "operation": "pick",
+            "pool_slot_number": 1,
+            "pallet_id": pallet["id"],
+        },
+    )
+
+    assert picked.status_code == 202
+    board = picked.json()
+    held = next(item for item in board["pallets"] if item["id"] == pallet["id"])
+    assert held["location"] == "robot_held"
+    assert held["pool_slot_number"] is None
+    assert held["queue_position"] == 0
+    assert board["robot_motion"]["history"][0]["status"] == "succeeded"
+
+    put = client.post(
+        "/api/robot-motions",
+        json={
+            "expected_revision": board["revision"],
+            "operation": "put",
+            "pool_slot_number": 4,
+        },
+    )
+
+    assert put.status_code == 202
+    returned = next(item for item in put.json()["pallets"] if item["id"] == pallet["id"])
+    assert returned["location"] == "pool"
+    assert returned["pool_slot_number"] == 4
+    assert returned["queue_position"] == 0
+
+
+def test_physical_robot_motion_requires_explicit_enable(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    pallet = board["pallets"][0]
+    saved = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+        },
+    )
+    assert saved.status_code == 200
+
+    blocked = client.post(
+        "/api/robot-motions",
+        json={
+            "expected_revision": saved.json()["board"]["revision"],
+            "operation": "pick",
+            "pool_slot_number": 1,
+            "pallet_id": pallet["id"],
+        },
+    )
+    assert blocked.status_code == 403
+
+
 def test_automatic_names_are_unique_and_revision_conflicts(client: TestClient) -> None:
     board = create_pallet(client, 0)
 
@@ -206,6 +277,60 @@ def test_on_deck_and_dripping_are_single_pallet_stations(client: TestClient) -> 
     dripping = next(item for item in board["pallets"] if item["id"] == first["id"])
     assert dripping["location"] == "dripping"
     assert dripping["queue_position"] is None
+
+
+def test_disabled_optional_stations_are_removed_from_workflow(client: TestClient) -> None:
+    settings = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": settings["revision"],
+            "source_folder": settings["settings"]["source_folder"],
+            "program_extensions": settings["settings"]["program_extensions"],
+            "weight_unit": settings["settings"]["weight_unit"],
+            "pool_slot_count": settings["settings"]["pool_slot_count"],
+            "on_deck_enabled": False,
+            "dripping_enabled": False,
+        },
+    )
+    assert response.status_code == 200
+    board = response.json()["board"]
+    assert board["settings"]["on_deck_enabled"] is False
+    assert board["settings"]["dripping_enabled"] is False
+
+    board = create_pallet(client, board["revision"])
+    pallet = board["pallets"][0]
+    for destination, label in (("on_deck", "On deck"), ("dripping", "Dripping")):
+        moved = client.post(
+            f"/api/pallets/{pallet['id']}/move",
+            json={"expected_revision": board["revision"], "destination": destination},
+        )
+        assert moved.status_code == 409
+        assert label in moved.json()["detail"]
+
+
+def test_occupied_optional_station_cannot_be_disabled(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    pallet = board["pallets"][0]
+    board = client.post(
+        f"/api/pallets/{pallet['id']}/move",
+        json={"expected_revision": board["revision"], "destination": "on_deck"},
+    ).json()
+    settings = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": settings["revision"],
+            "source_folder": settings["settings"]["source_folder"],
+            "program_extensions": settings["settings"]["program_extensions"],
+            "weight_unit": settings["settings"]["weight_unit"],
+            "pool_slot_count": settings["settings"]["pool_slot_count"],
+            "on_deck_enabled": False,
+            "dripping_enabled": True,
+        },
+    )
+    assert response.status_code == 409
+    assert "Move the pallet out of On deck" in response.json()["detail"]
 
 
 def test_queue_reorder_requires_all_queue_members(client: TestClient) -> None:

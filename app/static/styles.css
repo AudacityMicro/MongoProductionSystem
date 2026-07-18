@@ -145,6 +145,58 @@ nav {
   margin-bottom: clamp(1.25rem, 3vw, 2.5rem);
 }
 
+.run-mode-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.35rem 0.45rem 0.35rem 0.7rem;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+}
+
+.run-mode-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  font: 0.72rem "DM Mono", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.run-mode-controls input { accent-color: var(--healthy); }
+.run-mode-button.active { color: var(--paper); background: var(--danger); }
+
+.run-mode-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  background: rgba(250, 248, 242, 0.75);
+  font-size: 0.82rem;
+}
+
+.run-mode-status > div { display: flex; align-items: center; gap: 0.6rem; }
+.run-mode-status > span:last-child { color: var(--muted); text-align: right; }
+.run-mode-light { width: 0.65rem; height: 0.65rem; border-radius: 50%; background: var(--muted); }
+.run-mode-status.starting .run-mode-light,
+.run-mode-status.preparing .run-mode-light,
+.run-mode-status.waiting_confirmation .run-mode-light,
+.run-mode-status.loading .run-mode-light,
+.run-mode-status.machining .run-mode-light,
+.run-mode-status.unloading .run-mode-light,
+.run-mode-status.advancing .run-mode-light { background: var(--healthy); box-shadow: 0 0 0 4px rgba(115, 169, 66, 0.14); }
+.run-mode-status.faulted { border-color: var(--danger); background: #ffe6e2; }
+.run-mode-status.faulted .run-mode-light { background: var(--danger); }
+
+@media (max-width: 850px) {
+  .run-mode-controls { width: 100%; justify-content: space-between; }
+  .run-mode-status { align-items: flex-start; flex-direction: column; }
+  .run-mode-status > span:last-child { text-align: left; }
+}
+
 .eyebrow,
 .section-number,
 .zone-count,
@@ -305,10 +357,15 @@ p {
 .location-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: 0.65rem; }
 .location-fieldset { min-width: 0; margin: 0; padding: 0.6rem; border: 1px solid var(--line); background: #f7f4eb; }
 .location-fieldset legend { padding: 0 0.25rem; color: var(--signal); font: 0.72rem "DM Mono", Consolas, monospace; }
+.motion-pose-heading { display: grid; gap: 0.2rem; margin: 0 0 0.65rem; }
+.motion-pose-heading strong { color: var(--signal); font: 0.82rem "DM Mono", Consolas, monospace; letter-spacing: 0.04em; text-transform: uppercase; }
+.motion-pose-heading span { color: var(--muted); font-size: 0.76rem; line-height: 1.35; }
 .location-axis-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; }
 .location-axis-row label { min-width: 0; margin: 0; font-size: 0.68rem; }
 .location-axis-row input { width: 100%; min-width: 0; padding: 0.4rem; font-size: 0.8rem; }
+.capture-robot-pose { margin-top: 0.55rem; width: 100%; padding: 0.45rem 0.65rem; font-size: 0.7rem; }
 .location-stations { align-items: stretch; }
+.mill-g53-fieldset { margin-top: 0.7rem; }
 .dashboard-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin: 1.5rem 0; }
 .dashboard-summary article { min-height: 10rem; padding: 1rem; border: 1px solid var(--ink); background: var(--surface); box-shadow: var(--shadow); }
 .dashboard-summary strong { display: block; margin: 0.7rem 0 0.35rem; font-size: clamp(1.5rem, 3vw, 2.6rem); line-height: 1; }
@@ -617,7 +674,7 @@ p {
 
 .flow-stations {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1rem;
 }
 
@@ -1074,8 +1131,38 @@ a:focus-visible {
   max-width: 1100px;
 }
 
+.settings-category-nav { position: sticky; z-index: 20; top: 0; display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 1.25rem 0 2rem; padding: 0.65rem; border: 1px solid var(--ink); background: rgba(247, 244, 235, 0.96); backdrop-filter: blur(8px); }
+.settings-category-nav a { padding: 0.55rem 0.8rem; color: var(--ink); font: 0.72rem "DM Mono", Consolas, monospace; letter-spacing: 0.06em; text-decoration: none; text-transform: uppercase; }
+.settings-category-nav a:hover { color: white; background: var(--signal); }
+.settings-category, .debug-category { margin: 0 0 3rem; scroll-margin-top: 5rem; border: 1px solid var(--ink); background: rgba(250, 248, 242, 0.5); }
+.settings-category-heading, .debug-category-heading { display: grid; grid-template-columns: 8rem minmax(12rem, 0.8fr) minmax(18rem, 1.2fr); gap: 1rem; align-items: end; padding: 1.1rem 1.25rem; color: white; background: var(--ink); }
+.settings-category-heading p, .debug-category-heading p { margin: 0; color: #f0c968; font: 0.72rem "DM Mono", Consolas, monospace; letter-spacing: 0.08em; text-transform: uppercase; }
+.settings-category-heading h2, .debug-category-heading h2 { margin: 0; font-size: 1.4rem; }
+.settings-category-heading span, .debug-category-heading span { color: #d7ddd9; font-size: 0.82rem; line-height: 1.45; }
+.settings-category .settings-panel { margin: 0 1.25rem; }
+.settings-category .settings-panel:last-child { padding-bottom: 1.4rem; }
+.settings-system-body { padding: 0 1.25rem 1.25rem; }
+
+@media (max-width: 760px) {
+  .settings-category-heading, .debug-category-heading { grid-template-columns: 1fr; gap: 0.35rem; align-items: start; }
+  .settings-category .settings-panel { margin: 0 0.75rem; }
+  .settings-category-nav, .debug-category-nav { position: static; }
+}
+
 .debugging-page {
   max-width: 1320px;
+}
+
+.debug-category .debug-overview,
+.debug-category .debug-grid,
+.debug-category .cnc-debug-section {
+  margin: 1.25rem;
+}
+
+.debug-category .debug-overview-card,
+.debug-category .debug-section,
+.debug-category .cnc-debug-section {
+  box-shadow: none;
 }
 
 .settings-heading {
@@ -1096,6 +1183,53 @@ a:focus-visible {
   border-top: 1px solid var(--ink);
 }
 
+.motion-program-mappings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  max-height: 32rem;
+  overflow: auto;
+  padding-right: 0.35rem;
+}
+
+.motion-program-mapping {
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.motion-program-mapping h3 { margin-bottom: 0.6rem; font: 0.78rem "DM Mono", Consolas, monospace; }
+.motion-program-mapping label { margin-bottom: 0.5rem; font-size: 0.78rem; }
+.motion-program-mapping label:last-child { margin-bottom: 0; }
+
+.waypoint-add-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.45rem;
+  align-items: end;
+}
+
+.waypoint-add-row input { min-width: 0; }
+
+.robot-motion-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--warning);
+  background: #fff3d7;
+}
+
+.robot-motion-status.faulted { border-color: var(--danger); background: #ffe6e2; }
+.robot-motion-status strong { display: block; }
+.robot-held-zone { background: linear-gradient(135deg, rgba(116, 151, 143, 0.2), rgba(250, 248, 242, 0.68)); }
+.debug-pallet-motion-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 0.7rem; padding: 0.85rem; border: 1px solid var(--line); background: #f7f4eb; }
+.debug-pallet-motion-controls label { min-width: 11rem; margin: 0; }
+.debug-pallet-motion-controls #debug-pallet-motion-status,
+.debug-pallet-motion-controls #debug-mill-motion-status { flex: 1 1 18rem; align-self: center; color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
+
 .panel-intro p:last-child {
   max-width: 18rem;
   color: var(--muted);
@@ -1107,6 +1241,7 @@ a:focus-visible {
   justify-content: flex-end;
   padding-top: 2rem;
   border-top: 1px solid var(--ink);
+  scroll-margin-top: 5rem;
 }
 
 .relaunch-status {
@@ -1569,6 +1704,9 @@ a:focus-visible {
   .flow-stations {
     grid-template-columns: 1fr;
   }
+
+  .motion-program-mappings { grid-template-columns: 1fr; }
+  .waypoint-add-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .debug-faceplate-grid {
     min-width: 62rem;

@@ -1,6 +1,19 @@
 from fastapi.testclient import TestClient
+import time
 
 from app.main import create_app
+from app.service import build_mill_load_position_program
+from app import cnc_linuxcnc
+
+
+def wait_for_run_state(client: TestClient, state: str, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        board = client.get("/api/board").json()
+        if board["run_mode"]["state"] == state:
+            return board
+        time.sleep(0.05)
+    raise AssertionError(f"Run mode did not reach {state!r} before timeout.")
 
 
 def test_health_and_pages(client: TestClient) -> None:
@@ -13,11 +26,14 @@ def test_health_and_pages(client: TestClient) -> None:
     assert isinstance(payload["process_id"], int)
     assert payload["started_at"]
     assert "Pallet schedule" in client.get("/").text
-    assert "Robot readable I/O" in client.get("/debugging").text
+    assert "Debugging" in client.get("/debugging").text
+    assert "Mongo controller" in client.get("/debugging").text
     assert "Tormach 1500MX / PathPilot" in client.get("/debugging").text
     settings_page = client.get("/settings").text
-    assert "Scheduling settings" in settings_page
+    assert "System settings" in settings_page
     assert "Close and relaunch" in settings_page
+    assert "Workholding library" in settings_page
+    assert 'id="workholding-options"' in client.get("/").text
 
 
 def test_cnc_debug_baseline(client: TestClient) -> None:
@@ -29,6 +45,38 @@ def test_cnc_debug_baseline(client: TestClient) -> None:
     assert payload["connected"] is False
     assert payload["connection_label"] == "Telemetry disabled"
     assert payload["axis_rows"] == []
+    assert payload["revision"] == 0
+    assert len(payload["mill_program_controls"]["buttons"]) == 4
+
+
+def test_mill_load_position_program_raises_z_before_xy() -> None:
+    program = build_mill_load_position_program({"x_in": 0.01, "y_in": 4.9, "z_in": 0.0})
+
+    assert "G20" in program
+    assert "G90" in program
+    assert "G53 G1 Z0.0000 F100.0" in program
+    assert "G53 G1 X0.0100 Y4.9000 F100.0" in program
+    assert program.index("G53 G1 Z") < program.index("G53 G1 X")
+    assert program.rstrip().endswith("M30")
+
+
+def test_pathpilot_program_run_uses_pathpilot_cycle_start_signature(monkeypatch) -> None:
+    captured = {}
+
+    def fake_remote(host, port, username, password, timeout, remote_script, marker):
+        captured["script"] = remote_script
+        captured["marker"] = marker
+        return {"accepted": True}
+
+    monkeypatch.setattr(cnc_linuxcnc, "_read_remote_payload", fake_remote)
+    result = cnc_linuxcnc.run_linuxcnc_program("mill", 22, "operator", "secret", 10, "/home/operator/gcode/Gcode/job.nc")
+
+    assert result == {"accepted": True}
+    assert captured["script"].index("command.program_close()") < captured["script"].index("command.program_open(filename)")
+    assert 'active_axes = int(getattr(status, "axes", 0) or 0)' in captured["script"]
+    assert 'axis_mask = int(getattr(status, "axis_mask", 0) or 0)' in captured["script"]
+    assert 'command.auto(linuxcnc.AUTO_RUN, 1, linuxcnc.PREP_NONE, True, False)' in captured["script"]
+    assert captured["marker"] == "MONGO_CNC_RUN="
 
 
 def test_cnc_debug_reports_extended_machine_diagnostics(client: TestClient, monkeypatch) -> None:
@@ -150,6 +198,81 @@ def test_initial_board(client: TestClient) -> None:
         ".urp",
     ]
     assert board["settings"]["manual_io_control_enabled"] is False
+    assert board["settings"]["debug_mill_program_button_count"] == 4
+    assert board["settings"]["workholding_library"] == []
+
+
+def test_mill_debug_program_button_is_configured_and_runs(client: TestClient, monkeypatch) -> None:
+    board = client.get("/api/board").json()
+    monkeypatch.setattr("app.main.cnc_debug_snapshot", lambda _: {"status": "updated"})
+    configured = client.post(
+        "/api/debug/mill-programs/configure",
+        json={
+            "expected_revision": board["revision"],
+            "index": 0,
+            "display_name": "Warm up",
+            "filename": "/home/operator/gcode/Gcode/warmup.nc",
+            "color": "green",
+        },
+    )
+    assert configured.status_code == 200
+    updated = client.get("/api/board").json()
+    assert updated["settings"]["debug_mill_program_button_count"] == 4
+
+    monkeypatch.setattr("app.service.run_linuxcnc_program", lambda *args: {"accepted": True})
+    response = client.post(
+        "/api/debug/mill-programs/run",
+        json={"expected_revision": updated["revision"], "index": 0},
+    )
+    assert response.status_code == 409
+
+    enabled = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": updated["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "cnc_telemetry_enabled": True,
+            "cnc_host": "tormach",
+            "cnc_ssh_username": "operator",
+        },
+    )
+    assert enabled.status_code == 200
+    response = client.post(
+        "/api/debug/mill-programs/run",
+        json={"expected_revision": enabled.json()["board"]["revision"], "index": 0},
+    )
+    assert response.status_code == 200
+
+
+def test_workholding_library_is_normalized_and_persisted(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "workholding_library": ["Soft jaws", "  Vise  ", "soft JAWS", "", "Fixture plate"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["board"]["settings"]["workholding_library"] == [
+        "Soft jaws",
+        "Vise",
+        "Fixture plate",
+    ]
+    assert client.get("/api/settings").json()["settings"]["workholding_library"] == [
+        "Soft jaws",
+        "Vise",
+        "Fixture plate",
+    ]
 
 
 def test_settings_update_persists_manual_io_control(client: TestClient) -> None:
@@ -222,6 +345,7 @@ def test_pallet_location_positions_persist(client: TestClient) -> None:
         {"slot": slot, "x_mm": slot * 10, "y_mm": slot * 20, "z_mm": slot * 30}
         for slot in range(1, 17)
     ]
+    locations[4] = {"slot": 5, "x_mm": 50.12349, "y_mm": 100.1235, "z_mm": 150.12351}
     response = client.put(
         "/api/settings",
         json={
@@ -231,16 +355,22 @@ def test_pallet_location_positions_persist(client: TestClient) -> None:
             "weight_unit": "lb",
             "pool_slot_count": 16,
             "pool_locations": locations,
-            "on_deck_location": {"x_mm": 1, "y_mm": 2, "z_mm": 3},
+            "on_deck_location": {"x_mm": 1.98765, "y_mm": 2.12345, "z_mm": 3.55555},
             "dripping_location": {"x_mm": 4, "y_mm": 5, "z_mm": 6},
+            "robot_mill_load_unload": {"name": "Mill load/unload", "x_mm": 10.12349, "y_mm": 20.1235, "z_mm": 30.12351, "rx_rad": 0.12349, "ry_rad": 0.1235, "rz_rad": 0.12351},
+            "robot_mill_safe_entry_exit": {"name": "Mill safe entry/exit", "x_mm": 40, "y_mm": 50, "z_mm": 60, "rx_rad": 0.4, "ry_rad": 0.5, "rz_rad": 0.6},
+            "mill_load_unload_g53": {"x_in": 7, "y_in": 8, "z_in": 9},
         },
     )
 
     assert response.status_code == 200
     settings = client.get("/api/settings").json()["settings"]
-    assert settings["pool_locations"][4] == {"slot": 5, "x_mm": 50.0, "y_mm": 100.0, "z_mm": 150.0}
-    assert settings["on_deck_location"] == {"x_mm": 1.0, "y_mm": 2.0, "z_mm": 3.0}
+    assert settings["pool_locations"][4] == {"slot": 5, "x_mm": 50.123, "y_mm": 100.124, "z_mm": 150.124}
+    assert settings["on_deck_location"] == {"x_mm": 1.988, "y_mm": 2.123, "z_mm": 3.556}
     assert settings["dripping_location"] == {"x_mm": 4.0, "y_mm": 5.0, "z_mm": 6.0}
+    assert settings["robot_mill_load_unload"] == {"name": "Mill load/unload", "x_mm": 10.123, "y_mm": 20.124, "z_mm": 30.124, "rx_rad": 0.123, "ry_rad": 0.124, "rz_rad": 0.124}
+    assert settings["robot_mill_safe_entry_exit"] == {"name": "Mill safe entry/exit", "x_mm": 40.0, "y_mm": 50.0, "z_mm": 60.0, "rx_rad": 0.4, "ry_rad": 0.5, "rz_rad": 0.6}
+    assert settings["mill_load_unload_g53"] == {"x_in": 7.0, "y_in": 8.0, "z_in": 9.0}
 
 
 def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> None:
@@ -253,6 +383,58 @@ def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> No
     assert snapshot["source"] == "simulated"
     assert snapshot["robot"]["mode"] == "simulated"
     assert snapshot["digital_input_groups"][0]["rows"][0]["writable"] is False
+
+
+def test_current_robot_pose_converts_rtde_translation_to_millimeters(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    board = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": board["settings"]["source_folder"],
+            "program_extensions": board["settings"]["program_extensions"],
+            "weight_unit": board["settings"]["weight_unit"],
+            "pool_slot_count": board["settings"]["pool_slot_count"],
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+        },
+    )
+    assert response.status_code == 200
+
+    monkeypatch.setattr(
+        "app.service.robot_io_snapshot",
+        lambda session: {
+            "connected": True,
+            "timestamp": "2026-07-16T12:00:00+00:00",
+            "tcp_detail_rows": [
+                {"actual_pose": value}
+                for value in (0.123456, -0.234567, 0.345678, 0.1, -0.2, 0.3)
+            ],
+        },
+    )
+
+    pose = client.get("/api/debug/robot-pose")
+
+    assert pose.status_code == 200
+    assert pose.json() == {
+        "x_mm": 123.456,
+        "y_mm": -234.567,
+        "z_mm": 345.678,
+        "rx_rad": 0.1,
+        "ry_rad": -0.2,
+        "rz_rad": 0.3,
+        "timestamp": "2026-07-16T12:00:00+00:00",
+    }
+
+
+def test_current_robot_pose_requires_physical_mode(client: TestClient) -> None:
+    response = client.get("/api/debug/robot-pose")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Current robot pose is only available in physical robot mode."
 
 
 def test_debug_robot_io_snapshot_uses_live_robot_reader_when_configured(
@@ -343,6 +525,63 @@ def test_database_persists_across_application_restart(tmp_path) -> None:
         assert board["revision"] == 1
         assert [item["name"] for item in board["pallets"]] == ["ABBA"]
         assert board["pallets"][0]["pool_slot_number"] == 1
+
+
+def test_simulated_run_mode_processes_queue_with_step_confirmations(client: TestClient, tmp_path) -> None:
+    (tmp_path / "job.nc").write_text("G0 X0\nM30\n", encoding="ascii")
+    board = client.get("/api/settings").json()
+    saved = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": str(tmp_path),
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+        },
+    ).json()["board"]
+    created = client.post(
+        "/api/pallets",
+        json={
+            "expected_revision": saved["revision"],
+            "workholding": "Fixture",
+            "weight_kg": 10,
+            "content_status": "raw_stock",
+            "program_path": "job.nc",
+        },
+    ).json()
+    pallet = created["pallets"][0]
+    queued = client.post(
+        f"/api/pallets/{pallet['id']}/queue",
+        json={"expected_revision": created["revision"], "queue_index": 0},
+    ).json()
+
+    started = client.post(
+        "/api/run-mode/start",
+        json={"expected_revision": queued["revision"], "safety_confirm": True},
+    )
+    assert started.status_code == 202
+
+    for expected_action in ("loading", "machining", "unloading"):
+        pending = wait_for_run_state(client, "waiting_confirmation")
+        assert pending["run_mode"]["pending_action"] == expected_action
+        confirmed = client.post(
+            "/api/run-mode/confirm",
+            json={
+                "expected_revision": pending["revision"],
+                "token": pending["run_mode"]["confirmation_token"],
+                "approved": True,
+            },
+        )
+        assert confirmed.status_code == 200
+
+    completed = wait_for_run_state(client, "complete")
+    result = completed["pallets"][0]
+    assert completed["run_mode"]["enabled"] is False
+    assert result["queue_position"] is None
+    assert result["location"] == "pool"
+    assert result["pool_slot_number"] == 1
+    assert result["content_status"] == "complete_parts"
 
 
 def test_relaunch_endpoint_queues_helper(client: TestClient, monkeypatch) -> None:

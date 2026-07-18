@@ -1,4 +1,4 @@
-"""Read-only LinuxCNC telemetry collected from a PathPilot controller over SSH."""
+"""LinuxCNC telemetry and explicitly requested program control over PathPilot SSH."""
 
 from __future__ import annotations
 
@@ -384,3 +384,56 @@ def read_linuxcnc_snapshot(host: str, port: int, username: str, password: str, t
 def read_linuxcnc_io_labels(host: str, port: int, username: str, password: str, timeout: float) -> dict:
     """Read PathPilot's static HAL signal-to-channel labels."""
     return _read_remote_payload(host, port, username, password, timeout, _REMOTE_IO_LABELS_SCRIPT, "MONGO_CNC_LABELS=")
+
+
+def run_linuxcnc_program(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+    filename: str,
+    require_a_axis_homed: bool = False,
+) -> dict:
+    """Load and start one preconfigured absolute G-code file through LinuxCNC."""
+    remote_script = f'''import json
+import linuxcnc
+
+filename = {filename!r}
+require_a_axis_homed = {require_a_axis_homed!r}
+status = linuxcnc.stat()
+status.poll()
+if getattr(status, "estop", False):
+    raise RuntimeError("PathPilot is in E-stop.")
+if not getattr(status, "enabled", False):
+    raise RuntimeError("PathPilot is not enabled.")
+if getattr(status, "interp_state", linuxcnc.INTERP_IDLE) != linuxcnc.INTERP_IDLE:
+    raise RuntimeError("PathPilot is already running or paused. Stop the current program before starting another.")
+homed = list(getattr(status, "homed", []))
+# PathPilot exposes nine display slots in ``homed`` even on a three/four-axis
+# mill. X/Y/Z are always required; A is opt-in because this mill normally runs
+# three-axis programs even when its optional fourth axis is not homed.
+active_axes = int(getattr(status, "axes", 0) or 0)
+if active_axes <= 0:
+    axis_mask = int(getattr(status, "axis_mask", 0) or 0)
+    active_axes = bin(axis_mask).count("1") or len(homed)
+required_axes = 4 if require_a_axis_homed and active_axes >= 4 else 3
+if homed and (len(homed) < required_axes or not all(bool(value) for value in homed[:required_axes])):
+    axis_label = "X, Y, Z, and A" if required_axes == 4 else "X, Y, and Z"
+    raise RuntimeError(axis_label + " must be homed before starting a program.")
+
+command = linuxcnc.command()
+command.mode(linuxcnc.MODE_AUTO)
+command.wait_complete()
+# PathPilot keeps the currently selected file open until explicitly released.
+command.program_close()
+command.wait_complete()
+command.program_open(filename)
+command.wait_complete()
+# Match the active PathPilot UI's cycle-start call exactly. Its LinuxCNC
+# binding requires the PathPilot-specific preparation and single-step values.
+command.auto(linuxcnc.AUTO_RUN, 1, linuxcnc.PREP_NONE, True, False)
+command.wait_complete()
+print("MONGO_CNC_RUN=" + json.dumps({{"accepted": True, "filename": filename}}))
+'''
+    return _read_remote_payload(host, port, username, password, timeout, remote_script, "MONGO_CNC_RUN=")
