@@ -17,6 +17,9 @@ const ui = {
   drippingZone: document.querySelector('[data-zone="dripping"]'),
   storage: document.querySelector("#storage-list"),
   warning: document.querySelector("#program-warning"),
+  warningMessage: document.querySelector("#program-warning-message"),
+  warningDismiss: document.querySelector("#dismiss-program-warning"),
+  palletProgramHelp: document.querySelector("#pallet-program-help"),
   toast: document.querySelector("#toast"),
   palletDialog: document.querySelector("#pallet-dialog"),
   palletForm: document.querySelector("#pallet-form"),
@@ -30,10 +33,12 @@ const ui = {
   debugState: document.querySelector("#debug-state"),
   robotHeld: document.querySelector("#robot-held-slot"),
   robotMotionStatus: document.querySelector("#robot-motion-status"),
+  robotMotionSummary: document.querySelector("#robot-motion-summary"),
+  robotMotionRecover: document.querySelector("#recover-robot-motion"),
+  robotMotionDismiss: document.querySelector("#dismiss-robot-motion"),
   motionRecoveryDialog: document.querySelector("#motion-recovery-dialog"),
   motionRecoveryForm: document.querySelector("#motion-recovery-form"),
   runModeToggle: document.querySelector("#run-mode-toggle"),
-  runSafetyConfirm: document.querySelector("#run-safety-confirm"),
   runModeStatus: document.querySelector("#run-mode-status"),
   runConfirmDialog: document.querySelector("#run-confirm-dialog"),
 };
@@ -44,6 +49,13 @@ let draggedCardContext = null;
 let confirmCallback = null;
 let autoschedulePlan = null;
 let shownRunConfirmationToken = null;
+let palletDialogPrograms = [];
+let palletSaveInProgress = false;
+let renderedMotionKey = null;
+let renderedBoardKey = null;
+let boardLoadPromise = null;
+let dismissedProgramWarning = null;
+let dismissedMotionKey = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -84,6 +96,38 @@ function canonicalWeight(value) {
   return board.settings.weight_unit === "lb" ? value / KG_TO_LB : value;
 }
 
+function renderProgramOptions(selectedProgram = "", programs = board.programs || []) {
+  const select = document.querySelector("#pallet-program");
+  const available = programs;
+  const options = ['<option value="">No program assigned</option>'];
+  if (selectedProgram && !available.includes(selectedProgram)) {
+    options.push(`<option value="${escapeHtml(selectedProgram)}" disabled>Unavailable: ${escapeHtml(selectedProgram)}</option>`);
+  }
+  options.push(...available.map(program => `<option value="${escapeHtml(program)}">${escapeHtml(program)}</option>`));
+  select.innerHTML = options.join("");
+  select.value = selectedProgram || "";
+}
+
+async function loadPalletProgramOptions(selectedProgram = "") {
+  const select = document.querySelector("#pallet-program");
+  select.disabled = true;
+  ui.palletProgramHelp.textContent = "Loading programs from the PathPilot Gcode folder...";
+  try {
+    const result = await api("/api/pallet-programs");
+    palletDialogPrograms = result.files || [];
+    renderProgramOptions(selectedProgram, palletDialogPrograms);
+    ui.palletProgramHelp.textContent = palletDialogPrograms.length
+      ? `${palletDialogPrograms.length} program${palletDialogPrograms.length === 1 ? "" : "s"} available from the PathPilot Gcode folder.`
+      : "No allowed mill programs were found in the PathPilot Gcode folder.";
+  } catch (error) {
+    palletDialogPrograms = [];
+    renderProgramOptions(selectedProgram, []);
+    ui.palletProgramHelp.textContent = `Could not read PathPilot programs: ${error.message}`;
+  } finally {
+    select.disabled = false;
+  }
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, {
     headers: {"Content-Type": "application/json", ...(options.headers || {})},
@@ -105,7 +149,11 @@ function errorMessage(detail, fallback) {
 }
 
 function showToast(message, kind = "success") {
-  ui.toast.textContent = message;
+  const dismiss = document.createElement("button");
+  dismiss.className = "toast-dismiss";
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  ui.toast.replaceChildren(document.createTextNode(message), dismiss);
   ui.toast.className = `toast ${kind}`;
   window.clearTimeout(showToast.timeout);
   showToast.timeout = window.setTimeout(() => ui.toast.classList.add("hidden"), 4200);
@@ -118,8 +166,12 @@ function emptyState(label) {
 function palletCard(pallet, position = null) {
   const program = pallet.program_path || "No program";
   const runLocked = Boolean(board.run_mode?.enabled);
-  const queueAction = !runLocked && pallet.queue_position === null
+  const canManage = !runLocked || pallet.location !== "machine";
+  const queueAction = canManage && pallet.queue_position === null
     ? (pallet.location === "pool" ? `<button class="text-button" data-action="queue">Queue</button>` : "")
+    : "";
+  const dequeueAction = canManage && position !== null && pallet.queue_position !== null
+    ? `<button class="text-button" data-action="dequeue">Remove from queue</button>`
     : "";
   const motionLocked = Boolean(board.robot_motion?.active) || runLocked;
   const pickAction = pallet.location === "pool" && !motionLocked
@@ -137,7 +189,7 @@ function palletCard(pallet, position = null) {
        <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
     : "";
   return `
-    <article class="pallet-card content-${pallet.content_status}" draggable="${runLocked ? "false" : "true"}"
+    <article class="pallet-card content-${pallet.content_status}" draggable="${canManage && pallet.location !== "robot_held" ? "true" : "false"}"
       data-pallet-id="${pallet.id}" data-card-context="${cardContext}" tabindex="0">
       <div class="card-topline">
         ${position === null ? `<span class="drag-handle" aria-hidden="true">⠿</span>` : `<span class="queue-number">${position + 1}</span>`}
@@ -152,16 +204,18 @@ function palletCard(pallet, position = null) {
       </dl>
       <div class="card-actions">
         ${queueAction}
+        ${dequeueAction}
         ${pickAction}
         ${millPutAwayAction}
-        ${runLocked ? "" : `<button class="text-button" data-action="edit">Edit</button>
+        ${canManage ? `<button class="text-button" data-action="edit">Edit</button>
         <button class="text-button" data-action="duplicate">Duplicate</button>
-        <button class="text-button danger-text" data-action="delete">Delete</button>`}
+        <button class="text-button danger-text" data-action="delete">Delete</button>` : ""}
       </div>
     </article>`;
 }
 
 function renderBoard() {
+  renderedBoardKey = JSON.stringify(board);
   syncRobotProgramsNav();
   const pallets = board.pallets;
   const queue = pallets.filter(item => item.queue_position !== null)
@@ -211,20 +265,25 @@ function renderBoard() {
 
   document.querySelector("#queue-count").textContent = `${queue.length} pallet${queue.length === 1 ? "" : "s"}`;
   document.querySelector("#autoschedule-queue").disabled = queue.filter(item => item.program_tools?.length).length < 2;
-  document.querySelector("#create-pallet").disabled = Boolean(board.run_mode?.enabled);
+  document.querySelector("#create-pallet").disabled = false;
   if (board.run_mode?.enabled) document.querySelector("#autoschedule-queue").disabled = true;
   document.querySelector("#pool-count").textContent = `${pool.length} pallet${pool.length === 1 ? "" : "s"}`;
   document.querySelector("#storage-count").textContent = `${stored.length} pallet${stored.length === 1 ? "" : "s"}`;
   document.querySelector("#weight-unit-label").textContent = `(${board.settings.weight_unit})`;
-  document.querySelector("#program-options").innerHTML = board.programs
-    .map(program => `<option value="${escapeHtml(program)}"></option>`).join("");
+  // Program choices are read from PathPilot when the pallet dialog opens.
+  if (!ui.palletDialog.open) {
+    renderProgramOptions();
+    ui.palletProgramHelp.textContent = "Open a pallet to load the current program list from the PathPilot Gcode folder.";
+  }
   document.querySelector("#workholding-options").innerHTML = (board.settings.workholding_library || [])
     .map(workholding => `<option value="${escapeHtml(workholding)}"></option>`).join("");
   renderRobotMotionStatus();
   renderRunMode();
 
-  ui.warning.classList.toggle("hidden", !board.program_warning);
-  ui.warning.textContent = board.program_warning || "";
+  const runAlert = board.run_mode?.alert || "";
+  if (runAlert !== dismissedProgramWarning) dismissedProgramWarning = null;
+  ui.warning.classList.toggle("hidden", !runAlert || dismissedProgramWarning === runAlert);
+  ui.warningMessage.textContent = runAlert;
   ui.state.classList.add("online");
   ui.state.lastChild.textContent = ` Online · rev ${board.revision}`;
   ui.debugPanel.classList.toggle("hidden", !board.settings.debug_menu_enabled);
@@ -238,33 +297,106 @@ function renderBoard() {
 
 function renderRobotMotionStatus() {
   const motion = board.robot_motion?.active;
-  ui.robotMotionStatus.classList.toggle("hidden", !motion);
-  if (!motion) return;
+  if (!motion) {
+    renderedMotionKey = null;
+    dismissedMotionKey = null;
+    ui.robotMotionStatus.classList.add("hidden");
+    ui.robotMotionSummary.innerHTML = "";
+    ui.robotMotionRecover.classList.add("hidden");
+    return;
+  }
+  const palletIsHeld = motion.operation === "pick"
+    && board.pallets.some(pallet => pallet.id === motion.pallet_id && pallet.location === "robot_held");
+  const motionKey = JSON.stringify([
+    motion.id,
+    motion.status,
+    motion.operation,
+    motion.source_slot,
+    motion.destination_slot,
+    motion.failure_detail,
+    palletIsHeld,
+  ]);
+  if (motionKey !== dismissedMotionKey) dismissedMotionKey = null;
+  if (motionKey === renderedMotionKey) {
+    ui.robotMotionStatus.classList.toggle("hidden", dismissedMotionKey === motionKey);
+    return;
+  }
+  renderedMotionKey = motionKey;
   const target = motion.operation === "pick"
     ? `Pool ${String(motion.source_slot).padStart(2, "0")}`
     : motion.operation === "put"
       ? `Pool ${String(motion.destination_slot).padStart(2, "0")}`
       : motion.operation === "load_mill"
-        ? `Pool ${String(motion.source_slot).padStart(2, "0")} -> Mill`
+        ? `${motion.source_slot ? `Pool ${String(motion.source_slot).padStart(2, "0")}` : "Robot-held"} -> Mill`
         : `Mill -> Pool ${String(motion.destination_slot).padStart(2, "0")}`;
-  const status = motion.status === "faulted" ? "Movement fault" : motion.status === "running" ? "Robot moving" : "Movement requested";
-  const action = motion.status === "faulted"
-    ? `<button class="button danger" type="button" id="recover-robot-motion">Recover</button>`
-    : "";
+  const status = motion.status === "faulted"
+    ? "Movement fault"
+    : palletIsHeld
+      ? "Pallet secured, robot retreating"
+      : motion.status === "running"
+        ? "Robot moving"
+        : "Movement requested";
   ui.robotMotionStatus.className = `robot-motion-status ${motion.status}`;
-  ui.robotMotionStatus.innerHTML = `<div><strong>${status}: ${escapeHtml(motion.pallet_name || "Pallet")}</strong><span>${escapeHtml(motion.operation)} ${target} | ${escapeHtml(motion.program_path)}${motion.failure_detail ? ` | ${escapeHtml(motion.failure_detail)}` : ""}</span></div>${action}`;
+  ui.robotMotionStatus.classList.toggle("hidden", dismissedMotionKey === motionKey);
+  ui.robotMotionSummary.innerHTML = `<strong>${status}: ${escapeHtml(motion.pallet_name || "Pallet")}</strong><span>${escapeHtml(motion.operation)} ${target} | ${escapeHtml(motion.program_path)}${motion.failure_detail ? ` | ${escapeHtml(motion.failure_detail)}` : ""}</span>`;
+  ui.robotMotionRecover.classList.toggle("hidden", motion.status !== "faulted");
+  if (motion.status === "faulted") {
+    const options = motion.operation === "pick"
+      ? [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]]
+      : motion.operation === "put"
+        ? [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
+      : motion.operation === "load_mill"
+          ? (motion.source_slot
+            ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
+            : [["robot_held", "Robot-held"], ["machine", "Mill"]])
+          : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]];
+    document.querySelector("#motion-recovery-message").textContent = `${motion.failure_detail || "Movement fault."} Verify the actual pallet location before saving.`;
+    document.querySelector("#motion-recovery-resolution").innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+    if (!ui.motionRecoveryDialog.open) ui.motionRecoveryDialog.showModal();
+  }
 }
+
+ui.toast.addEventListener("click", event => {
+  if (event.target.closest(".toast-dismiss")) ui.toast.classList.add("hidden");
+});
+
+ui.warningDismiss.addEventListener("click", async () => {
+  dismissedProgramWarning = board?.run_mode?.alert || null;
+  ui.warning.classList.add("hidden");
+  try {
+    board = await api("/api/run-mode/alert/dismiss", {method: "POST", body: "{}"});
+    renderBoard();
+  } catch (error) {
+    showToast(`Could not dismiss alert: ${error.message}`, "error");
+  }
+});
+
+ui.robotMotionDismiss.addEventListener("click", () => {
+  const motion = board?.robot_motion?.active;
+  dismissedMotionKey = motion ? JSON.stringify([
+    motion.id,
+    motion.status,
+    motion.operation,
+    motion.source_slot,
+    motion.destination_slot,
+    motion.failure_detail,
+    motion.operation === "pick" && board.pallets.some(pallet => pallet.id === motion.pallet_id && pallet.location === "robot_held"),
+  ]) : null;
+  ui.robotMotionStatus.classList.add("hidden");
+});
 
 function renderRunMode() {
   const run = board.run_mode || {};
-  ui.runSafetyConfirm.checked = Boolean(run.safety_confirm);
-  ui.runSafetyConfirm.disabled = Boolean(run.enabled);
   ui.runModeToggle.textContent = run.enabled ? "Stop run mode" : "Start run mode";
   ui.runModeToggle.classList.toggle("active", Boolean(run.enabled));
   ui.runModeStatus.className = `run-mode-status ${escapeHtml(run.state || "idle")}`;
   const pallet = run.current_pallet_name ? ` · ${escapeHtml(run.current_pallet_name)}` : "";
-  const safety = run.safety_confirm ? "Step confirmation on" : "Step confirmation off";
-  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div><span>${escapeHtml(run.detail || "Ready to process the production queue in order.")} · ${safety}</span>`;
+  const showDetail = !run.enabled && ["faulted", "interrupted"].includes(run.state);
+  const detail = showDetail ? `<span>${escapeHtml(run.detail || "Run Mode needs operator attention.")}</span>` : "";
+  const clearStatus = !run.enabled && ["faulted", "interrupted"].includes(run.state)
+    ? '<button class="notice-dismiss run-mode-clear" type="button" data-clear-run-mode-status>Clear warning</button>'
+    : "";
+  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div>${detail}${clearStatus}`;
 
   if (run.confirmation_token && run.pending_action && shownRunConfirmationToken !== run.confirmation_token) {
     shownRunConfirmationToken = run.confirmation_token;
@@ -278,16 +410,53 @@ function renderRunMode() {
   }
 }
 
-async function loadBoard() {
+ui.runModeStatus.addEventListener("click", async event => {
+  const button = event.target.closest("[data-clear-run-mode-status]");
+  if (!button || !board) return;
+  button.disabled = true;
+  button.textContent = "Clearing...";
   try {
-    board = await api("/api/board");
+    board = await api("/api/run-mode/status/clear", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision}),
+    });
     renderBoard();
+    showToast("Stale Run Mode warning cleared.");
   } catch (error) {
-    ui.state.classList.remove("online");
-    ui.state.lastChild.textContent = " Unavailable";
-    showToast(error.message, "error");
+    showToast(`Could not clear warning: ${error.message}`, "error");
+    await loadBoard();
+  }
+});
+
+async function loadBoard() {
+  if (boardLoadPromise) return boardLoadPromise;
+  boardLoadPromise = (async () => {
+    try {
+      const nextBoard = await api("/api/board");
+      const nextBoardKey = JSON.stringify(nextBoard);
+      board = nextBoard;
+      if (nextBoardKey !== renderedBoardKey) renderBoard();
+    } catch (error) {
+      ui.state.classList.remove("online");
+      ui.state.lastChild.textContent = " Unavailable";
+      showToast(error.message, "error");
+    }
+  })();
+  try {
+    return await boardLoadPromise;
+  } finally {
+    boardLoadPromise = null;
   }
 }
+
+async function pollBoard() {
+  if (!document.hidden) await loadBoard();
+  window.setTimeout(pollBoard, board?.robot_motion?.active ? 500 : 1500);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) loadBoard();
+});
 
 function palletById(id) {
   return board.pallets.find(item => item.id === id);
@@ -300,18 +469,22 @@ function openPalletDialog(pallet = null, focusProgram = false) {
   document.querySelector("#pallet-workholding").value = pallet?.workholding || "";
   document.querySelector("#pallet-weight").value = pallet ? inputWeight(pallet.weight_kg).toFixed(3) : "";
   document.querySelector("#pallet-contents").value = pallet?.content_status || "empty";
-  document.querySelector("#pallet-program").value = pallet?.program_path || "";
+  // Load once per dialog from the same PathPilot SFTP source as Mill Programs.
+  palletDialogPrograms = [];
+  renderProgramOptions(pallet?.program_path || "", []);
   ui.palletDialog.showModal();
+  void loadPalletProgramOptions(pallet?.program_path || "");
   (focusProgram ? document.querySelector("#pallet-program") : document.querySelector("#pallet-workholding")).focus();
 }
 
 async function savePallet(event) {
   event.preventDefault();
+  if (palletSaveInProgress) return;
   if (!ui.palletForm.reportValidity()) return;
   const id = document.querySelector("#pallet-id").value;
   const program = document.querySelector("#pallet-program").value.trim();
-  if (program && !board.programs.includes(program)) {
-    showToast("Choose a program from the configured source folder.", "error");
+  if (program && !palletDialogPrograms.includes(program)) {
+    showToast("Choose a program from the PathPilot Gcode folder.", "error");
     return;
   }
   const payload = {
@@ -321,6 +494,10 @@ async function savePallet(event) {
     content_status: document.querySelector("#pallet-contents").value,
     program_path: program || null,
   };
+  const saveButton = document.querySelector("#save-pallet");
+  palletSaveInProgress = true;
+  saveButton.disabled = true;
+  saveButton.textContent = "Saving...";
   try {
     board = await api(id ? `/api/pallets/${id}` : "/api/pallets", {
       method: id ? "PUT" : "POST",
@@ -331,6 +508,10 @@ async function savePallet(event) {
     showToast(id ? "Pallet updated." : "Pallet created.");
   } catch (error) {
     showToast(error.message, "error");
+  } finally {
+    palletSaveInProgress = false;
+    saveButton.disabled = false;
+    saveButton.textContent = "Save pallet";
   }
 }
 
@@ -426,21 +607,6 @@ async function previewAutoschedule() {
 document.querySelector("#create-pallet").addEventListener("click", () => openPalletDialog());
 document.querySelector("#autoschedule-queue").addEventListener("click", previewAutoschedule);
 
-ui.runSafetyConfirm.addEventListener("change", async () => {
-  const enabled = ui.runSafetyConfirm.checked;
-  try {
-    board = await api("/api/run-mode/safety", {
-      method: "POST",
-      body: JSON.stringify({expected_revision: board.revision, enabled}),
-    });
-    renderBoard();
-    showToast(enabled ? "Run-step confirmations enabled." : "Run-step confirmations disabled.");
-  } catch (error) {
-    ui.runSafetyConfirm.checked = !enabled;
-    showToast(error.message, "error");
-  }
-});
-
 ui.runModeToggle.addEventListener("click", () => {
   if (board.run_mode?.enabled) {
     askConfirmation("Stop run mode", "Stop after the current controller command finishes? No next automated step will start.", async () => {
@@ -456,7 +622,7 @@ ui.runModeToggle.addEventListener("click", () => {
     try {
       board = await api("/api/run-mode/start", {
         method: "POST",
-        body: JSON.stringify({expected_revision: board.revision, safety_confirm: ui.runSafetyConfirm.checked}),
+        body: JSON.stringify({expected_revision: board.revision}),
       });
       renderBoard();
       showToast("Run mode started.");
@@ -494,7 +660,7 @@ document.querySelectorAll("[data-close-pallet]").forEach(button => {
   button.addEventListener("click", () => ui.palletDialog.close());
 });
 
-document.addEventListener("click", event => {
+document.addEventListener("click", async event => {
   const action = event.target.closest("[data-action]")?.dataset.action;
   if (!action) return;
   const card = event.target.closest(".pallet-card");
@@ -502,6 +668,13 @@ document.addEventListener("click", event => {
   if (!pallet) return;
   if (action === "edit") openPalletDialog(pallet);
   if (action === "queue") queuePallet(pallet.id);
+  if (action === "dequeue") {
+    await mutate(
+      `/api/pallets/${pallet.id}/queue?expected_revision=${board.revision}`,
+      {method: "DELETE"},
+      `${pallet.name} removed from the queue.`,
+    );
+  }
   if (action === "pick") startRobotMotion("pick", pallet.pool_slot_number, pallet.id);
   if (action === "mongo-unload") openMillPutAwayDialog(pallet);
   if (action === "duplicate") {
@@ -573,29 +746,29 @@ document.querySelector("#mill-putaway-form").addEventListener("submit", async ev
   document.querySelector("#mill-putaway-dialog").close();
   await startMillTransfer("unload", palletId, slot);
 });
+document.querySelector("#cancel-mill-putaway").addEventListener("click", () => {
+  document.querySelector("#mill-putaway-dialog").close();
+});
 
 document.addEventListener("click", event => {
   const put = event.target.closest("[data-put-slot]");
   if (put) startRobotMotion("put", Number(put.dataset.putSlot));
-  const recover = event.target.closest("#recover-robot-motion");
-  if (!recover) return;
-  const motion = board.robot_motion.active;
-  const options = motion.operation === "pick"
-    ? [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]]
-    : motion.operation === "put"
-      ? [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
-      : motion.operation === "load_mill"
-        ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
-        : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]];
-  document.querySelector("#motion-recovery-message").textContent = `${motion.failure_detail || "Movement fault."} Verify the actual pallet location before saving.`;
-  document.querySelector("#motion-recovery-resolution").innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
-  ui.motionRecoveryDialog.showModal();
+});
+
+ui.robotMotionRecover.addEventListener("click", () => {
+  if (!ui.motionRecoveryDialog.open) ui.motionRecoveryDialog.showModal();
+});
+document.querySelector("#cancel-motion-recovery").addEventListener("click", () => {
+  ui.motionRecoveryDialog.close();
 });
 
 ui.motionRecoveryForm.addEventListener("submit", async event => {
   event.preventDefault();
   const motion = board.robot_motion?.active;
   if (!motion) return;
+  const saveButton = document.querySelector("#save-motion-recovery");
+  saveButton.disabled = true;
+  saveButton.textContent = "Saving...";
   try {
     board = await api(`/api/robot-motions/${motion.id}/recover`, {
       method: "POST",
@@ -606,6 +779,9 @@ ui.motionRecoveryForm.addEventListener("submit", async event => {
     showToast("Pallet movement fault reconciled.");
   } catch (error) {
     showToast(error.message, "error");
+  } finally {
+    saveButton.disabled = false;
+    saveButton.textContent = "Save recovery";
   }
 });
 
@@ -641,12 +817,13 @@ document.querySelector("#apply-autoschedule").addEventListener("click", async ()
 });
 
 document.addEventListener("dragstart", event => {
-  if (board.run_mode?.enabled) {
+  const card = event.target.closest(".pallet-card");
+  if (!card) return;
+  const pallet = palletById(card.dataset.palletId);
+  if (pallet?.location === "machine" || pallet?.location === "robot_held") {
     event.preventDefault();
     return;
   }
-  const card = event.target.closest(".pallet-card");
-  if (!card) return;
   draggedPalletId = card.dataset.palletId;
   draggedCardContext = card.dataset.cardContext;
   event.dataTransfer.effectAllowed = "move";
@@ -708,6 +885,14 @@ document.addEventListener("drop", async event => {
     }
     return;
   }
+  if (destination === "machine" && palletById(draggedPalletId)?.location === "robot_held") {
+    const pallet = palletById(draggedPalletId);
+    const useMongo = window.confirm(
+      `Load the Robot-held pallet ${pallet.name} into the mill?\n\nMongo will first run the mill loading-position program, then load the held pallet.`,
+    );
+    if (useMongo) await startMillTransfer("load", pallet.id);
+    return;
+  }
   await movePallet(
     draggedPalletId,
     destination,
@@ -723,6 +908,14 @@ document.querySelector("#refresh-programs").addEventListener("click", async () =
     });
     board = result.board;
     renderBoard();
+    if (ui.palletDialog.open) {
+      palletDialogPrograms = [...(board.programs || [])];
+      renderProgramOptions(document.querySelector("#pallet-program").value, palletDialogPrograms);
+    }
+    if (board.program_warning) {
+      showToast(`Programs could not be refreshed: ${board.program_warning}`, "error");
+      return;
+    }
     const suffix = result.cleared_assignments.length
       ? ` Cleared assignments from: ${result.cleared_assignments.join(", ")}.`
       : "";
@@ -753,5 +946,4 @@ document.querySelectorAll("[data-debug-signal]").forEach(button => {
   });
 });
 
-loadBoard();
-window.setInterval(loadBoard, 1500);
+pollBoard();

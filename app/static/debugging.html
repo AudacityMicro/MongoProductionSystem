@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Debugging | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260716-12">
-    <script src="/static/debugging.js?v=20260716-13" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260720-12">
+    <script src="/static/debugging.js?v=20260720-22" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -61,6 +61,8 @@
             <div><dt>Machine state</dt><dd id="debug-machine-state">Unknown</dd></div>
             <div><dt>Updated</dt><dd id="debug-timestamp">Unknown</dd></div>
           </dl>
+          <button class="secondary-action" id="retry-mongo-connection" type="button">Retry Mongo connection</button>
+          <button class="secondary-action" id="clear-mongo-fault" type="button">Clear robot fault/error</button>
         </article>
 
         <article class="debug-overview-card">
@@ -74,6 +76,23 @@
             <div><dt>Open pool positions</dt><dd id="summary-pool-open">0</dd></div>
           </dl>
         </article>
+
+        <article class="debug-overview-card">
+          <p class="section-number">System 03</p>
+          <h2>Network diagnostic</h2>
+          <p class="debug-digital-help">Runs 20 pings from this application computer to <code>8.8.8.8</code>. Use it to capture loss and latency during a connection problem.</p>
+          <button class="secondary-action" id="run-network-test" type="button">Run 20-packet test</button>
+          <div class="network-test-result" id="network-test-result" role="status">No test run yet.</div>
+        </article>
+
+        <article class="debug-overview-card debug-overview-card-wide">
+          <div class="zone-heading compact-heading">
+            <div><p class="section-number">System 04</p><h2>Diagnostic timeline</h2></div>
+            <a class="secondary-action" href="/api/debug/diagnostics/export" download>Download support bundle</a>
+          </div>
+          <p class="debug-digital-help">Recent controller, network, application, failed-request, and slow-request events. Passwords and credentials are excluded from exports.</p>
+          <div class="diagnostic-event-list" id="diagnostic-event-list" aria-live="polite">Loading diagnostic events...</div>
+        </article>
         </div>
       </section>
 
@@ -81,9 +100,31 @@
         <header class="debug-category-heading">
           <p>Robot</p>
           <h2 id="debug-robot-title">Mongo controller</h2>
-          <span>Live I/O, program controls, pallet-motion testing, and RTDE telemetry.</span>
+          <span>Live I/O, program controls, pallet-motion testing, and supervisor telemetry.</span>
         </header>
         <div class="debug-grid">
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">Robot 00 / Supervisor transport</p>
+              <h2>Persistent robot-originated connection</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help">Mongo owns this TCP connection and reports sequenced atomic command events. An uncertain or latched command must be reconciled; it is never repeated through the legacy transport.</p>
+          <div class="supervisor-status-grid" id="robot-supervisor-status-grid"></div>
+          <div class="inline-actions">
+            <button class="button secondary" id="debug-supervisor-bootstrap" type="button">No-motion bootstrap</button>
+            <button class="button secondary" id="debug-supervisor-maintenance" type="button">Enter Maintenance Mode</button>
+            <button class="button secondary" id="debug-supervisor-clear-latch" type="button">Clear reconciled latch</button>
+          </div>
+          <div class="network-test-result" id="robot-supervisor-detail" role="status">Loading supervisor status...</div>
+          <div class="debug-table-shell">
+            <table class="debug-table">
+              <thead><tr><th>Seq</th><th>Operation</th><th>Transport</th><th>Status</th><th>Result</th></tr></thead>
+              <tbody id="robot-supervisor-command-rows"></tbody>
+            </table>
+          </div>
+        </article>
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
@@ -138,10 +179,27 @@
           </div>
         </article>
 
+        <article class="debug-section debug-section-wide">
+          <header class="zone-heading">
+            <div>
+              <p class="section-number">Robot 05 / Reliability</p>
+              <h2>Queue reliability test</h2>
+            </div>
+          </header>
+          <p class="debug-digital-help">Captures the current queue order. For each pallet, Mongo picks it from its current Pool position, moves only to the outer Mill pre-entry/staging waypoint, and returns it to the same Pool position.</p>
+          <p class="reliability-exclusion"><strong>Explicitly excluded:</strong> mill entry, mill load/unload poses, door outputs, Erowa outputs, and PathPilot commands.</p>
+          <div class="inline-actions">
+            <button class="button primary" id="start-reliability-test" type="button">Start queue reliability test</button>
+            <button class="button danger" id="cancel-reliability-test" type="button" disabled>Stop after current pallet</button>
+          </div>
+          <div class="network-test-result" id="reliability-test-status" role="status">Loading reliability-test status...</div>
+          <div class="reliability-queue" id="reliability-test-queue"></div>
+        </article>
+
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">Robot 05 / Analog</p>
+              <p class="section-number">Robot 06 / Analog</p>
               <h2>Analog and I/O values</h2>
             </div>
           </header>
@@ -164,7 +222,7 @@
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">Robot 06 / TCP motion</p>
+              <p class="section-number">Robot 07 / TCP motion</p>
               <h2>TCP pose, speed, and force</h2>
             </div>
           </header>
@@ -188,7 +246,7 @@
         <article class="debug-section debug-section-wide">
           <header class="zone-heading">
             <div>
-              <p class="section-number">Robot 07 / Joints</p>
+              <p class="section-number">Robot 08 / Joints</p>
               <h2>Joint positions, velocities, and current</h2>
             </div>
           </header>
@@ -213,7 +271,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">Robot 08 / Analog</p>
+              <p class="section-number">Robot 09 / Analog</p>
               <h2>Analog outputs</h2>
             </div>
           </header>
@@ -236,7 +294,7 @@
         <article class="debug-section">
           <header class="zone-heading">
             <div>
-              <p class="section-number">Robot 09 / State</p>
+              <p class="section-number">Robot 10 / State</p>
               <h2>Robot state</h2>
             </div>
           </header>

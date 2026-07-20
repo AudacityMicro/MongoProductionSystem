@@ -26,9 +26,20 @@ class AppSettings(Base):
     machine_state: Mapped[str] = mapped_column(String(20), default="idle")
     robot_connection_mode: Mapped[str] = mapped_column(String(20), default="simulated")
     robot_host: Mapped[str] = mapped_column(String(255), default="")
-    robot_port: Mapped[int] = mapped_column(Integer, default=30004)
+    robot_port: Mapped[int] = mapped_column(Integer, default=30003)
     robot_poll_hz: Mapped[int] = mapped_column(Integer, default=10)
     robot_timeout_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    robot_supervisor_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    robot_supervisor_activation_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    robot_supervisor_hostname: Mapped[str] = mapped_column(String(255), default="DESKTOP-KF5I73N.lan")
+    robot_supervisor_listen_host: Mapped[str] = mapped_column(String(255), default="0.0.0.0")
+    robot_supervisor_port: Mapped[int] = mapped_column(Integer, default=50010)
+    robot_supervisor_heartbeat_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    robot_supervisor_telemetry_hz: Mapped[float] = mapped_column(Float, default=2.0)
+    robot_supervisor_reconnect_limit_seconds: Mapped[float] = mapped_column(Float, default=10.0)
+    robot_supervisor_pre_dispatch_fallback: Mapped[bool] = mapped_column(Boolean, default=True)
+    robot_supervisor_maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    robot_supervisor_last_sequence: Mapped[int] = mapped_column(Integer, default=0)
     debug_standard_input_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_configurable_input_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_tool_input_mask: Mapped[int] = mapped_column(Integer, default=0)
@@ -69,16 +80,24 @@ class AppSettings(Base):
     run_mode_safety_confirm: Mapped[bool] = mapped_column(Boolean, default=True)
     run_mode_state: Mapped[str] = mapped_column(String(30), default="idle")
     run_mode_detail: Mapped[str] = mapped_column(String(1000), default="")
+    run_mode_alert: Mapped[str] = mapped_column(String(1000), default="")
     run_mode_current_pallet_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     run_mode_return_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     run_mode_pending_action: Mapped[str] = mapped_column(String(30), default="")
     run_mode_confirmation_token: Mapped[str] = mapped_column(String(36), default="")
     run_mode_confirmation_granted: Mapped[bool] = mapped_column(Boolean, default=False)
-    mill_file_directory: Mapped[str] = mapped_column(String(500), default="/home/operator/gcode")
+    mill_file_directory: Mapped[str] = mapped_column(String(500), default="/home/operator/gcode/Gcode")
     mill_program_extensions: Mapped[str] = mapped_column(String, default='[".nc",".tap",".gcode",".cnc"]')
     mill_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     mill_programs_filter_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     mill_editor_command: Mapped[str] = mapped_column(String(500), default="code")
+    mill_results_archiving_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    mill_results_source_path: Mapped[str] = mapped_column(
+        String(500), default="/home/operator/gcode/RESULTS.TXT"
+    )
+    mill_results_archive_directory: Mapped[str] = mapped_column(
+        String(500), default="/home/operator/gcode/results"
+    )
     pool_location_positions: Mapped[str] = mapped_column(String, default="[]")
     on_deck_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')
     dripping_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')
@@ -175,6 +194,64 @@ class RobotMotion(Base):
     status: Mapped[str] = mapped_column(String(20), default="requested")
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     observed_busy: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class RobotSupervisorCommand(Base):
+    __tablename__ = "robot_supervisor_commands"
+    __table_args__ = (
+        Index("uq_robot_supervisor_sequence", "sequence", unique=True),
+        Index("ix_robot_supervisor_motion_id", "robot_motion_id"),
+        Index("ix_robot_supervisor_status", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    robot_session: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    app_session: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    robot_motion_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    operation: Mapped[str] = mapped_column(String(40), nullable=False)
+    opcode: Mapped[int] = mapped_column(Integer, nullable=False)
+    argument: Mapped[int] = mapped_column(Integer, default=0)
+    value: Mapped[int] = mapped_column(Integer, default=0)
+    payload_g: Mapped[int] = mapped_column(Integer, default=0)
+    transport: Mapped[str] = mapped_column(String(20), default="supervisor")
+    status: Mapped[str] = mapped_column(String(20), default="created")
+    attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    sent_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    accepted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    result_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fault_detail: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class RobotReliabilityRun(Base):
+    __tablename__ = "robot_reliability_runs"
+    __table_args__ = (
+        Index(
+            "uq_active_robot_reliability_run",
+            "status",
+            unique=True,
+            sqlite_where=text("status IN ('requested','running')"),
+        ),
+        Index("ix_robot_reliability_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="requested")
+    queue_snapshot: Mapped[str] = mapped_column(String, default="[]")
+    total_pallets: Mapped[int] = mapped_column(Integer, default=0)
+    completed_pallets: Mapped[int] = mapped_column(Integer, default=0)
+    current_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_pallet_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    current_pallet_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    current_pool_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False)
     started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)

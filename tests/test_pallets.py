@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from app import service
+from app.models import Pallet
 from app.pallet_names import PALLET_NAMES
 
 
@@ -22,7 +24,7 @@ def create_pallet(client: TestClient, revision: int) -> dict:
 def test_create_edit_duplicate_and_delete(client: TestClient) -> None:
     board = create_pallet(client, 0)
     pallet = board["pallets"][0]
-    assert pallet["name"] == "ABBA"
+    assert pallet["name"] in PALLET_NAMES
     assert pallet["location"] == "pool"
     assert pallet["pool_slot_number"] == 1
 
@@ -31,7 +33,7 @@ def test_create_edit_duplicate_and_delete(client: TestClient) -> None:
     response = client.put(f"/api/pallets/{pallet['id']}", json=edited)
     assert response.status_code == 200
     board = response.json()
-    assert board["pallets"][0]["name"] == "ABBA"
+    assert board["pallets"][0]["name"] == pallet["name"]
 
     response = client.post(
         f"/api/pallets/{pallet['id']}/duplicate",
@@ -40,7 +42,8 @@ def test_create_edit_duplicate_and_delete(client: TestClient) -> None:
     assert response.status_code == 200
     board = response.json()
     duplicate = next(item for item in board["pallets"] if item["id"] != pallet["id"])
-    assert duplicate["name"] == "Adele"
+    assert duplicate["name"] in PALLET_NAMES
+    assert duplicate["name"] != pallet["name"]
     assert duplicate["content_status"] == "complete_parts"
     assert duplicate["location"] == "pool"
     assert duplicate["pool_slot_number"] == 2
@@ -95,6 +98,32 @@ def test_simulated_robot_pick_and_put_away_preserves_queue(client: TestClient) -
     assert returned["queue_position"] == 0
 
 
+def test_removing_a_pallet_from_queue_keeps_its_pool_location(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    board = create_pallet(client, board["revision"])
+    first, second = sorted(board["pallets"], key=lambda item: item["pool_slot_number"])
+    board = client.post(
+        f"/api/pallets/{first['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    board = client.post(
+        f"/api/pallets/{second['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+
+    response = client.delete(
+        f"/api/pallets/{first['id']}/queue",
+        params={"expected_revision": board["revision"]},
+    )
+
+    assert response.status_code == 200
+    pallets = {item["id"]: item for item in response.json()["pallets"]}
+    assert pallets[first["id"]]["location"] == "pool"
+    assert pallets[first["id"]]["pool_slot_number"] == 1
+    assert pallets[first["id"]]["queue_position"] is None
+    assert pallets[second["id"]]["queue_position"] == 0
+
+
 def test_physical_robot_motion_requires_explicit_enable(client: TestClient) -> None:
     board = create_pallet(client, 0)
     pallet = board["pallets"][0]
@@ -124,12 +153,23 @@ def test_physical_robot_motion_requires_explicit_enable(client: TestClient) -> N
     assert blocked.status_code == 403
 
 
-def test_automatic_names_are_unique_and_revision_conflicts(client: TestClient) -> None:
+def test_automatic_names_are_random_unique_and_revision_conflicts(client: TestClient, monkeypatch) -> None:
+    selections: list[tuple[str, ...]] = []
+
+    def choose_last(names: list[str]) -> str:
+        selections.append(tuple(names))
+        return names[-1]
+
+    monkeypatch.setattr(service.random, "choice", choose_last)
     board = create_pallet(client, 0)
 
     second = client.post("/api/pallets", json=pallet_payload(board["revision"]))
     assert second.status_code == 201
-    assert {item["name"] for item in second.json()["pallets"]} == {"ABBA", "Adele"}
+    names = [item["name"] for item in second.json()["pallets"]]
+    assert len(names) == len(set(names)) == 2
+    assert names[0] == PALLET_NAMES[-1]
+    assert names[1] == PALLET_NAMES[-2]
+    assert len(selections) == 2
 
     stale = client.post("/api/pallets", json=pallet_payload(0))
     assert stale.status_code == 409
@@ -185,7 +225,7 @@ def test_queue_machine_pool_and_storage_invariants(client: TestClient) -> None:
         (item for item in board["pallets"] if item["queue_position"] is not None),
         key=lambda item: item["queue_position"],
     )
-    assert [item["name"] for item in queue] == ["Adele", "ABBA"]
+    assert [item["id"] for item in queue] == [second["id"], first["id"]]
     assert all(item["location"] == "pool" for item in queue)
     assert {item["pool_slot_number"] for item in queue} == {1, 2}
 
@@ -351,10 +391,10 @@ def test_queue_reorder_requires_all_queue_members(client: TestClient) -> None:
 def test_queue_can_be_reordered(client: TestClient) -> None:
     board = create_pallet(client, 0)
     board = create_pallet(client, board["revision"])
-    by_name = {item["name"]: item for item in board["pallets"]}
-    for name in ("ABBA", "Adele"):
+    first, second = board["pallets"]
+    for pallet in (first, second):
         board = client.post(
-            f"/api/pallets/{by_name[name]['id']}/queue",
+            f"/api/pallets/{pallet['id']}/queue",
             json={
                 "expected_revision": board["revision"],
             },
@@ -365,8 +405,8 @@ def test_queue_can_be_reordered(client: TestClient) -> None:
         json={
             "expected_revision": board["revision"],
             "pallet_ids": [
-                by_name["Adele"]["id"],
-                by_name["ABBA"]["id"],
+                second["id"],
+                first["id"],
             ],
         },
     )
@@ -380,7 +420,7 @@ def test_queue_can_be_reordered(client: TestClient) -> None:
         ),
         key=lambda item: item["queue_position"],
     )
-    assert [item["name"] for item in queue] == ["Adele", "ABBA"]
+    assert [item["id"] for item in queue] == [second["id"], first["id"]]
 
 
 def test_only_pool_pallets_can_be_queued_and_dequeue_compacts(
@@ -388,38 +428,38 @@ def test_only_pool_pallets_can_be_queued_and_dequeue_compacts(
 ) -> None:
     board = create_pallet(client, 0)
     board = create_pallet(client, board["revision"])
-    by_name = {item["name"]: item for item in board["pallets"]}
+    first, second = board["pallets"]
 
     board = client.post(
-        f"/api/pallets/{by_name['ABBA']['id']}/queue",
+        f"/api/pallets/{first['id']}/queue",
         json={"expected_revision": board["revision"]},
     ).json()
     board = client.post(
-        f"/api/pallets/{by_name['Adele']['id']}/queue",
+        f"/api/pallets/{second['id']}/queue",
         json={"expected_revision": board["revision"]},
     ).json()
 
     response = client.delete(
-        f"/api/pallets/{by_name['ABBA']['id']}/queue",
+        f"/api/pallets/{first['id']}/queue",
         params={"expected_revision": board["revision"]},
     )
     assert response.status_code == 200
     board = response.json()
     remaining = next(
-        item for item in board["pallets"] if item["name"] == "Adele"
+        item for item in board["pallets"] if item["id"] == second["id"]
     )
     assert remaining["queue_position"] == 0
     assert remaining["location"] == "pool"
 
     board = client.post(
-        f"/api/pallets/{by_name['ABBA']['id']}/move",
+        f"/api/pallets/{first['id']}/move",
         json={
             "expected_revision": board["revision"],
             "destination": "storage",
         },
     ).json()
     response = client.post(
-        f"/api/pallets/{by_name['ABBA']['id']}/queue",
+        f"/api/pallets/{first['id']}/queue",
         json={"expected_revision": board["revision"]},
     )
     assert response.status_code == 409
@@ -448,3 +488,98 @@ def test_machine_pallet_can_return_to_pool_and_queue(
     assert returned["location"] == "pool"
     assert returned["pool_slot_number"] == 1
     assert returned["queue_position"] == 0
+
+
+def test_run_mode_allows_managing_non_machine_pallets_only(
+    client: TestClient,
+) -> None:
+    board = create_pallet(client, 0)
+    board = create_pallet(client, board["revision"])
+    pool_pallet, machine_pallet = board["pallets"]
+
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        stored_machine_pallet = session.get(Pallet, machine_pallet["id"])
+        assert stored_machine_pallet is not None
+        stored_machine_pallet.location = "machine"
+        stored_machine_pallet.pool_slot_number = None
+        settings.run_mode_enabled = True
+        session.commit()
+
+    pool_update = pallet_payload(board["revision"])
+    pool_update["workholding"] = "Updated vise"
+    response = client.put(f"/api/pallets/{pool_pallet['id']}", json=pool_update)
+    assert response.status_code == 200
+    updated_board = response.json()
+    updated_pool_pallet = next(
+        item for item in updated_board["pallets"] if item["id"] == pool_pallet["id"]
+    )
+    assert updated_pool_pallet["workholding"] == "Updated vise"
+
+    board = create_pallet(client, updated_board["revision"])
+    added_pallet = next(
+        item
+        for item in board["pallets"]
+        if item["id"] not in {pool_pallet["id"], machine_pallet["id"]}
+    )
+    board = client.post(
+        f"/api/pallets/{pool_pallet['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    board = client.post(
+        f"/api/pallets/{added_pallet['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    board = client.put(
+        "/api/queue",
+        json={
+            "expected_revision": board["revision"],
+            "pallet_ids": [added_pallet["id"], pool_pallet["id"]],
+        },
+    ).json()
+    board = client.delete(
+        f"/api/pallets/{pool_pallet['id']}/queue",
+        params={"expected_revision": board["revision"]},
+    ).json()
+    board = client.post(
+        f"/api/pallets/{pool_pallet['id']}/move",
+        json={
+            "expected_revision": board["revision"],
+            "destination": "storage",
+        },
+    ).json()
+    board = client.post(
+        f"/api/pallets/{added_pallet['id']}/duplicate",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    duplicate = next(
+        item
+        for item in board["pallets"]
+        if item["id"] not in {pool_pallet["id"], machine_pallet["id"], added_pallet["id"]}
+    )
+    board = client.delete(
+        f"/api/pallets/{duplicate['id']}",
+        params={"expected_revision": board["revision"]},
+    ).json()
+    assert next(
+        item for item in board["pallets"] if item["id"] == pool_pallet["id"]
+    )["location"] == "storage"
+    assert next(
+        item for item in board["pallets"] if item["id"] == added_pallet["id"]
+    )["queue_position"] == 0
+
+    response = client.put(
+        f"/api/pallets/{machine_pallet['id']}",
+        json=pallet_payload(board["revision"]),
+    )
+    assert response.status_code == 409
+    assert "mill" in response.json()["detail"].lower()
+
+    response = client.post(
+        f"/api/pallets/{machine_pallet['id']}/move",
+        json={
+            "expected_revision": board["revision"],
+            "destination": "pool",
+        },
+    )
+    assert response.status_code == 409

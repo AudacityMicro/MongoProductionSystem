@@ -297,7 +297,6 @@ def test_debug_program_run_uses_dashboard(client: TestClient, monkeypatch) -> No
         lambda *args: called.update(args=args),
     )
     monkeypatch.setattr("app.service.read_robot_snapshot", lambda *args: {"robot": {}})
-    monkeypatch.setattr("app.service.loaded_robot_program", lambda *args: None)
 
     response = client.post(
         "/api/debug/programs/run",

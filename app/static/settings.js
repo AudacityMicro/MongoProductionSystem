@@ -8,9 +8,11 @@ const ui = {
   poolLocationGrid: document.querySelector("#pool-location-grid"),
   onDeckEnabled: document.querySelector("#on-deck-enabled"),
   drippingEnabled: document.querySelector("#dripping-enabled"),
+  runModeSafetyConfirm: document.querySelector("#run-mode-safety-confirm"),
   onDeckLocationFields: document.querySelector("#on-deck-location-fields"),
   drippingLocationFields: document.querySelector("#dripping-location-fields"),
   robotMillLoadUnloadFields: document.querySelector("#robot-mill-load-unload-fields"),
+  robotMillPreEntryFields: document.querySelector("#robot-mill-pre-entry-fields"),
   robotMillSafeEntryExitFields: document.querySelector("#robot-mill-safe-entry-exit-fields"),
   millLoadUnloadG53Fields: document.querySelector("#mill-load-unload-g53-fields"),
   buildMillLoadPositionProgram: document.querySelector("#build-mill-load-position-program"),
@@ -22,6 +24,17 @@ const ui = {
   robotPort: document.querySelector("#robot-port"),
   robotPollHz: document.querySelector("#robot-poll-hz"),
   robotTimeoutSeconds: document.querySelector("#robot-timeout-seconds"),
+  robotSupervisorEnabled: document.querySelector("#robot-supervisor-enabled"),
+  robotSupervisorHostname: document.querySelector("#robot-supervisor-hostname"),
+  robotSupervisorListenHost: document.querySelector("#robot-supervisor-listen-host"),
+  robotSupervisorPort: document.querySelector("#robot-supervisor-port"),
+  robotSupervisorHeartbeatSeconds: document.querySelector("#robot-supervisor-heartbeat-seconds"),
+  robotSupervisorTelemetryHz: document.querySelector("#robot-supervisor-telemetry-hz"),
+  robotSupervisorReconnectLimitSeconds: document.querySelector("#robot-supervisor-reconnect-limit-seconds"),
+  robotSupervisorFallback: document.querySelector("#robot-supervisor-fallback"),
+  bootstrapRobotSupervisor: document.querySelector("#bootstrap-robot-supervisor"),
+  installSupervisorFirewall: document.querySelector("#install-supervisor-firewall"),
+  robotSupervisorStatus: document.querySelector("#robot-supervisor-status"),
   cncTelemetryEnabled: document.querySelector("#cnc-telemetry-enabled"),
   cncHost: document.querySelector("#cnc-host"),
   cncSshPort: document.querySelector("#cnc-ssh-port"),
@@ -48,11 +61,15 @@ const ui = {
   millProgramsFilterEnabled: document.querySelector("#mill-programs-filter-enabled"),
   millProgramsPageEnabled: document.querySelector("#mill-programs-page-enabled"),
   millEditorCommand: document.querySelector("#mill-editor-command"),
+  millResultsArchivingEnabled: document.querySelector("#mill-results-archiving-enabled"),
+  millResultsSourcePath: document.querySelector("#mill-results-source-path"),
+  millResultsArchiveDirectory: document.querySelector("#mill-results-archive-directory"),
   palletMotionEnabled: document.querySelector("#pallet-motion-enabled"),
   palletMotionTimeoutSeconds: document.querySelector("#pallet-motion-timeout-seconds"),
   palletMotionApproachYClearance: document.querySelector("#pallet-motion-approach-y-clearance"),
   palletMotionMillApproachXClearance: document.querySelector("#pallet-motion-mill-approach-x-clearance"),
   palletMotionLiftZClearance: document.querySelector("#pallet-motion-lift-z-clearance"),
+  palletMotionMillLiftZClearance: document.querySelector("#pallet-motion-mill-lift-z-clearance"),
   palletMotionMaxTravelSpeed: document.querySelector("#pallet-motion-max-travel-speed"),
   palletMotionPickupSpeed: document.querySelector("#pallet-motion-pickup-speed"),
   palletMotionGripOutput: document.querySelector("#pallet-motion-grip-output"),
@@ -74,17 +91,13 @@ const ui = {
   palletMotionRy: document.querySelector("#pallet-motion-ry"),
   palletMotionRz: document.querySelector("#pallet-motion-rz"),
   palletMotionSafePreFields: document.querySelector("#pallet-motion-safe-pre-fields"),
+  intermediateSafePoseName: document.querySelector("#intermediate-safe-pose-name"),
+  intermediateSafePoseJoints: Array.from({length: 6}, (_, index) => document.querySelector(`#intermediate-safe-pose-j${index}`)),
+  intermediateSafePoseSlots: document.querySelector("#intermediate-safe-pose-slots"),
+  addIntermediateSafePose: document.querySelector("#add-intermediate-safe-pose"),
+  intermediateSafePoseList: document.querySelector("#intermediate-safe-pose-list"),
   rebuildMotionScripts: document.querySelector("#rebuild-motion-scripts"),
   generatedMotionProgramList: document.querySelector("#generated-motion-program-list"),
-  motionWaypointName: document.querySelector("#motion-waypoint-name"),
-  motionWaypointX: document.querySelector("#motion-waypoint-x"),
-  motionWaypointY: document.querySelector("#motion-waypoint-y"),
-  motionWaypointZ: document.querySelector("#motion-waypoint-z"),
-  motionWaypointRx: document.querySelector("#motion-waypoint-rx"),
-  motionWaypointRy: document.querySelector("#motion-waypoint-ry"),
-  motionWaypointRz: document.querySelector("#motion-waypoint-rz"),
-  addMotionWaypoint: document.querySelector("#add-motion-waypoint"),
-  motionWaypointList: document.querySelector("#motion-waypoint-list"),
   motionProgramFileStatus: document.querySelector("#motion-program-file-status"),
   newWorkholding: document.querySelector("#new-workholding"),
   addWorkholding: document.querySelector("#add-workholding"),
@@ -102,6 +115,10 @@ const ui = {
   appVersion: document.querySelector("#app-version"),
   relaunchSystem: document.querySelector("#relaunch-system"),
   relaunchStatus: document.querySelector("#relaunch-status"),
+  poseCaptureModal: document.querySelector("#pose-capture-modal"),
+  poseCaptureMessage: document.querySelector("#pose-capture-message"),
+  poseCaptureCancel: document.querySelector("#pose-capture-cancel"),
+  poseCaptureConfirm: document.querySelector("#pose-capture-confirm"),
   unsavedModal: document.querySelector("#unsaved-modal"),
   unsavedCancel: document.querySelector("#unsaved-cancel"),
   unsavedDiscard: document.querySelector("#unsaved-discard"),
@@ -117,6 +134,8 @@ let healthVersion = "unknown";
 let healthProcessId = null;
 let healthStartedAt = "";
 let savedSettingsSignature = "";
+let savedSettingsDraft = null;
+let intermediateSafePoses = [];
 let isDirty = false;
 let isLoadingSettings = false;
 let allowNavigation = false;
@@ -124,7 +143,7 @@ let pendingNavigation = null;
 let afterScriptRebuildPrompt = null;
 let suppressNextPopstatePrompt = false;
 let workholdingLibrary = [];
-let motionWaypoints = [];
+let pendingPoseCaptureButton = null;
 
 function organizeSettingsPage() {
   const groups = [
@@ -133,14 +152,18 @@ function organizeSettingsPage() {
       eyebrow: "General",
       title: "Production and display",
       description: "Shared scheduling, pallet, workholding, and operator display settings.",
-      panels: ["Display", "Pallet pool", "Workholding library"],
+      panels: ["Display", "Pallet pool", "Workflow stations", "Workholding library"],
+      openPanels: ["Display"],
+      widePanels: ["Workholding library"],
     },
     {
       id: "settings-robot",
       eyebrow: "Robot",
       title: "Mongo robot",
-      description: "Connection, controller files, debug controls, physical locations, and generated pallet motion.",
-      panels: ["Robot connection", "Robot file access", "Robot Programs page", "Debug program buttons", "Robot pallet locations", "Robot pallet motion"],
+      description: "Connection, controller files, physical locations, and generated pallet motion.",
+      panels: ["Robot connection", "Robot file access", "Robot Programs page", "Robot pallet locations", "Robot pallet motion"],
+      openPanels: ["Robot connection"],
+      widePanels: ["Robot pallet locations", "Robot pallet motion"],
     },
     {
       id: "settings-mill",
@@ -148,10 +171,36 @@ function organizeSettingsPage() {
       title: "Tormach and PathPilot",
       description: "CNC telemetry, programs, machine loading coordinates, and tooling sources.",
       panels: ["CNC telemetry", "Mill programs", "Mill Programs page", "Mill loading position", "Fusion 360 tools"],
+      openPanels: ["CNC telemetry"],
+      widePanels: ["CNC telemetry", "Mill Programs page"],
+    },
+    {
+      id: "settings-system",
+      eyebrow: "System",
+      title: "Application and diagnostics",
+      description: "Diagnostic access, test controls, saving, and backend lifecycle actions.",
+      panels: ["Debugging controls"],
+      openPanels: ["Debugging controls"],
+      widePanels: ["Debugging controls"],
     },
   ];
   const actions = ui.form.querySelector(".settings-actions");
   const panels = new Map([...ui.form.querySelectorAll(":scope > .settings-panel")].map(panel => [panel.querySelector("h2")?.textContent.trim(), panel]));
+  const debugFields = panels.get("Debugging controls")?.querySelector(".panel-fields");
+  [ui.debugMenuEnabled, ui.manualIoControlEnabled].forEach(input => {
+    const control = input?.closest(".checkbox-control");
+    if (control && debugFields) debugFields.prepend(control);
+  });
+
+  function setPanelExpanded(panel, expanded) {
+    const fields = panel.querySelector(".panel-fields");
+    const toggle = panel.querySelector(".settings-panel-toggle");
+    panel.classList.toggle("is-collapsed", !expanded);
+    fields.hidden = !expanded;
+    toggle.setAttribute("aria-expanded", String(expanded));
+    toggle.textContent = expanded ? "Hide" : "Show";
+  }
+
   for (const group of groups) {
     const section = document.createElement("section");
     section.className = "settings-category";
@@ -162,17 +211,27 @@ function organizeSettingsPage() {
       const panel = panels.get(title);
       if (!panel) return;
       panel.querySelector(".section-number").textContent = `${group.eyebrow} ${String(index + 1).padStart(2, "0")}`;
+      panel.classList.toggle("settings-panel-wide", group.widePanels.includes(title));
+      const fields = panel.querySelector(".panel-fields");
+      fields.id = `${group.id}-panel-${index + 1}`;
+      const toggle = document.createElement("button");
+      toggle.className = "settings-panel-toggle";
+      toggle.type = "button";
+      toggle.setAttribute("aria-controls", fields.id);
+      panel.querySelector(".panel-intro").append(toggle);
+      toggle.addEventListener("click", () => setPanelExpanded(panel, toggle.getAttribute("aria-expanded") !== "true"));
+      setPanelExpanded(panel, group.openPanels.includes(title));
       container.append(panel);
     });
-    ui.form.insertBefore(section, actions);
+    if (group.id === "settings-system") {
+      const systemBody = document.createElement("div");
+      systemBody.className = "settings-system-body";
+      systemBody.append(actions, ui.form.querySelector("#relaunch-status"));
+      section.append(systemBody);
+    }
+    if (group.id === "settings-system") ui.form.append(section);
+    else ui.form.insertBefore(section, actions);
   }
-  const systemSection = document.createElement("section");
-  systemSection.className = "settings-category settings-system-category";
-  systemSection.id = "settings-system";
-  systemSection.innerHTML = '<header class="settings-category-heading"><p>System</p><h2>Application controls</h2><span>Save pending changes or restart the backend and reload the current application version.</span></header><div class="settings-system-body"></div>';
-  const systemBody = systemSection.querySelector(".settings-system-body");
-  systemBody.append(actions, ui.form.querySelector("#relaunch-status"));
-  ui.form.append(systemSection);
 }
 
 organizeSettingsPage();
@@ -204,11 +263,19 @@ function errorMessage(detail, fallback) {
 }
 
 function showToast(message, kind = "success") {
-  ui.toast.textContent = message;
+  const dismiss = document.createElement("button");
+  dismiss.className = "toast-dismiss";
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  ui.toast.replaceChildren(document.createTextNode(message), dismiss);
   ui.toast.className = `toast ${kind}`;
   clearTimeout(showToast.timeout);
   showToast.timeout = setTimeout(() => ui.toast.classList.add("hidden"), 4500);
 }
+
+ui.toast.addEventListener("click", event => {
+  if (event.target.closest(".toast-dismiss")) ui.toast.classList.add("hidden");
+});
 
 function setDirtyState(nextDirty) {
   isDirty = Boolean(nextDirty);
@@ -313,17 +380,40 @@ function renderGeneratedMotionPrograms() {
     : "No generated scripts have been rebuilt yet.";
 }
 
-function renderMotionWaypoints() {
-  ui.motionWaypointList.replaceChildren();
-  if (!motionWaypoints.length) {
-    ui.motionWaypointList.textContent = "No travel waypoints. Scripts will approach pallets directly.";
+function poolSlotCountForAssignments() {
+  return Math.max(1, Math.min(256, fieldNumber(ui.poolSlotCount, board?.settings.pool_slot_count || 16)));
+}
+
+function poolAssignmentCheckboxes(selectedSlots = [], index = null) {
+  const selected = new Set(selectedSlots.map(Number));
+  return Array.from({length: poolSlotCountForAssignments()}, (_, offset) => {
+    const slot = offset + 1;
+    const attribute = index === null ? "data-intermediate-new-slot" : `data-intermediate-pose-index="${index}"`;
+    return `<label><input type="checkbox" value="${slot}" ${attribute} ${selected.has(slot) ? "checked" : ""}>Pool ${String(slot).padStart(2, "0")}</label>`;
+  }).join("");
+}
+
+function selectedNewIntermediateSlots() {
+  return Array.from(ui.intermediateSafePoseSlots.querySelectorAll("input:checked"), input => Number(input.value));
+}
+
+function renderIntermediateSafePoseSlots() {
+  const selected = selectedNewIntermediateSlots();
+  ui.intermediateSafePoseSlots.innerHTML = `<span class="field-help">Assign the new pose to Pool positions</span><div class="intermediate-safe-pose-assignment">${poolAssignmentCheckboxes(selected)}</div>`;
+}
+
+function renderIntermediateSafePoses() {
+  ui.intermediateSafePoseList.replaceChildren();
+  if (!intermediateSafePoses.length) {
+    ui.intermediateSafePoseList.textContent = "No intermediate safe poses. Scripts will move directly from the shared safe pose to the pallet approach.";
     return;
   }
-  motionWaypoints.forEach((waypoint, index) => {
-    const row = document.createElement("div");
-    row.className = "managed-library-row";
-    row.innerHTML = `<span>${escapeHtml(waypoint.name)} | X ${waypoint.x_mm} Y ${waypoint.y_mm} Z ${waypoint.z_mm} | Rx ${waypoint.rx_rad} Ry ${waypoint.ry_rad} Rz ${waypoint.rz_rad}</span><button class="button ghost" type="button" data-motion-waypoint-index="${index}">Remove</button>`;
-    ui.motionWaypointList.append(row);
+  intermediateSafePoses.forEach((pose, index) => {
+    const row = document.createElement("section");
+    row.className = "intermediate-safe-pose-row";
+    const joints = Array.isArray(pose.joints_rad) ? pose.joints_rad.map((value, joint) => `J${joint} ${Number(value).toFixed(3)}`).join(" | ") : "Invalid joint positions";
+    row.innerHTML = `<header><strong>${index + 1}. ${escapeHtml(pose.name)}</strong><button class="button ghost" type="button" data-intermediate-safe-pose-index="${index}">Remove</button></header><small>${escapeHtml(joints)}</small><div class="intermediate-safe-pose-assignment">${poolAssignmentCheckboxes(pose.pool_slots || [], index)}</div>`;
+    ui.intermediateSafePoseList.append(row);
   });
 }
 
@@ -346,6 +436,21 @@ function motionPoseDraft(scope, name) {
   }
   if (Object.values(values).every(value => value === "")) return null;
   return {name, ...Object.fromEntries(Object.entries(values).map(([axis, value]) => [axis, Number(value)]))};
+}
+
+function renderJointWaypointFields(container, scope, waypoint, title = "Shared Safe Joint Pose", description = "A physically verified J0-J5 configuration used before and after every pallet movement. The robot will use this exact joint posture rather than calculating inverse kinematics from a Cartesian point.") {
+  const joints = Array.isArray(waypoint?.joints_rad) ? waypoint.joints_rad : [];
+  const legacyNotice = waypoint && !Array.isArray(waypoint.joints_rad) ? " Legacy Cartesian safety data was found. Capture the current verified joint posture before saving and rebuilding scripts." : "";
+  const inputs = Array.from({length: 6}, (_, index) => `<label>J${index} (rad)<input type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="${scope}" data-joint-index="${index}" value="${joints[index] ?? ""}"></label>`).join("");
+  container.innerHTML = `<div class="motion-pose-heading"><strong>${title}</strong><span>${description}${legacyNotice}</span></div><div class="location-axis-row joint-waypoint-row">${inputs}</div><button class="button ghost capture-robot-pose" type="button" data-capture-joint-waypoint="${scope}">Capture current joint positions</button>`;
+  bindPrecisionRounding(container);
+  for (const input of container.querySelectorAll("input")) input.addEventListener("input", () => { if (!isLoadingSettings) refreshDirtyState(); });
+}
+
+function jointWaypointDraft(scope, name) {
+  const joints = Array.from({length: 6}, (_, index) => ui.form.querySelector(`[data-joint-waypoint="${scope}"][data-joint-index="${index}"]`)?.value.trim() || "");
+  if (joints.every(value => value === "")) return null;
+  return {name, joints_rad: joints.map(Number)};
 }
 
 function g53Input(axis, value) {
@@ -421,11 +526,13 @@ function renderLocationFields() {
   const onDeck = ui.onDeckLocationFields.querySelector("input") ? readLocation("on_deck") : board?.settings.on_deck_location || {};
   const dripping = ui.drippingLocationFields.querySelector("input") ? readLocation("dripping") : board?.settings.dripping_location || {};
   const robotMillLoadUnload = ui.robotMillLoadUnloadFields.querySelector("input") ? motionPoseDraft("robot-mill-load-unload", "Mill load/unload") : board?.settings.robot_mill_load_unload;
+  const robotMillPreEntry = ui.robotMillPreEntryFields.querySelector("input") ? motionPoseDraft("robot-mill-pre-entry", "Mill pre-entry") : board?.settings.pallet_motion_generation?.mill_pre_entry_waypoint;
   const robotMillSafeEntryExit = ui.robotMillSafeEntryExitFields.querySelector("input") ? motionPoseDraft("robot-mill-safe-entry-exit", "Mill safe entry/exit") : board?.settings.robot_mill_safe_entry_exit;
   const millLoadUnloadG53 = ui.millLoadUnloadG53Fields.querySelector("input") ? readMillG53() : board?.settings.mill_load_unload_g53 || {};
-  ui.onDeckLocationFields.innerHTML = `<div class="location-axis-row">${locationInput("x_mm", onDeck.x_mm, "on_deck")}${locationInput("y_mm", onDeck.y_mm, "on_deck")}${locationInput("z_mm", onDeck.z_mm, "on_deck")}</div>${captureLocationButton("on_deck")}`;
-  ui.drippingLocationFields.innerHTML = `<div class="location-axis-row">${locationInput("x_mm", dripping.x_mm, "dripping")}${locationInput("y_mm", dripping.y_mm, "dripping")}${locationInput("z_mm", dripping.z_mm, "dripping")}</div>${captureLocationButton("dripping")}`;
+  ui.onDeckLocationFields.innerHTML = `<legend>On Deck Staging Pose</legend><p class="field-help">Robot position for the optional pallet staged before loading.</p><div class="location-axis-row">${locationInput("x_mm", onDeck.x_mm, "on_deck")}${locationInput("y_mm", onDeck.y_mm, "on_deck")}${locationInput("z_mm", onDeck.z_mm, "on_deck")}</div>${captureLocationButton("on_deck")}`;
+  ui.drippingLocationFields.innerHTML = `<legend>Dripping Return Pose</legend><p class="field-help">Robot position for the optional completed pallet awaiting return to the pool.</p><div class="location-axis-row">${locationInput("x_mm", dripping.x_mm, "dripping")}${locationInput("y_mm", dripping.y_mm, "dripping")}${locationInput("z_mm", dripping.z_mm, "dripping")}</div>${captureLocationButton("dripping")}`;
   renderMotionPoseFields(ui.robotMillLoadUnloadFields, "robot-mill-load-unload", robotMillLoadUnload, "Robot Mill Load/Unload Pose", "The fork pose used while physically loading or unloading the mill pallet.");
+  renderMotionPoseFields(ui.robotMillPreEntryFields, "robot-mill-pre-entry", robotMillPreEntry, "Robot Mill Pre-entry Waypoint", "The first Cartesian waypoint before the existing mill entry/exit pose. Scripts return through this waypoint after leaving the mill.");
   renderMotionPoseFields(ui.robotMillSafeEntryExitFields, "robot-mill-safe-entry-exit", robotMillSafeEntryExit, "Robot Mill Safe Entry/Exit", "The shared clearance pose used before entering the mill and after retracting from it.");
   renderMillG53(millLoadUnloadG53);
   bindLocationInputs(ui.poolLocationGrid);
@@ -447,6 +554,7 @@ function settingsDraft() {
     pool_slot_count: fieldNumber(ui.poolSlotCount, board.settings.pool_slot_count),
     on_deck_enabled: ui.onDeckEnabled.checked,
     dripping_enabled: ui.drippingEnabled.checked,
+    run_mode_safety_confirm: ui.runModeSafetyConfirm.checked,
     pool_locations: poolLocationsDraft(),
     on_deck_location: readLocation("on_deck"),
     dripping_location: readLocation("dripping"),
@@ -457,9 +565,17 @@ function settingsDraft() {
     manual_io_control_enabled: ui.manualIoControlEnabled.checked,
     robot_connection_mode: ui.robotConnectionMode.value,
     robot_host: ui.robotHost.value.trim(),
-    robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30004),
+    robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30003),
     robot_poll_hz: fieldNumber(ui.robotPollHz, board.settings.robot_poll_hz || 10),
     robot_timeout_seconds: fieldNumber(ui.robotTimeoutSeconds, board.settings.robot_timeout_seconds || 1.0),
+    robot_supervisor_enabled: ui.robotSupervisorEnabled.checked,
+    robot_supervisor_hostname: ui.robotSupervisorHostname.value.trim() || "DESKTOP-KF5I73N.lan",
+    robot_supervisor_listen_host: ui.robotSupervisorListenHost.value.trim() || "0.0.0.0",
+    robot_supervisor_port: fieldNumber(ui.robotSupervisorPort, 50010),
+    robot_supervisor_heartbeat_seconds: fieldNumber(ui.robotSupervisorHeartbeatSeconds, 1),
+    robot_supervisor_telemetry_hz: fieldNumber(ui.robotSupervisorTelemetryHz, 2),
+    robot_supervisor_reconnect_limit_seconds: fieldNumber(ui.robotSupervisorReconnectLimitSeconds, 10),
+    robot_supervisor_pre_dispatch_fallback: ui.robotSupervisorFallback.checked,
     cnc_telemetry_enabled: ui.cncTelemetryEnabled.checked,
     cnc_host: ui.cncHost.value.trim(),
     cnc_ssh_port: fieldNumber(ui.cncSshPort, board.settings.cnc_ssh_port || 22),
@@ -479,17 +595,21 @@ function settingsDraft() {
     robot_programs_filter_enabled: ui.robotProgramsFilterEnabled.checked,
     robot_programs_page_enabled: ui.robotProgramsPageEnabled.checked,
     robot_editor_command: ui.robotEditorCommand.value.trim() || "code",
-    mill_file_directory: ui.millFileDirectory.value.trim() || "/home/operator/gcode",
+    mill_file_directory: ui.millFileDirectory.value.trim() || "/home/operator/gcode/Gcode",
     mill_program_extensions: millProgramExtensions(),
     mill_programs_filter_enabled: ui.millProgramsFilterEnabled.checked,
     mill_programs_page_enabled: ui.millProgramsPageEnabled.checked,
     mill_editor_command: ui.millEditorCommand.value.trim() || "code",
+    mill_results_archiving_enabled: ui.millResultsArchivingEnabled.checked,
+    mill_results_source_path: ui.millResultsSourcePath.value.trim() || "/home/operator/gcode/RESULTS.TXT",
+    mill_results_archive_directory: ui.millResultsArchiveDirectory.value.trim() || "/home/operator/gcode/results",
     pallet_motion_enabled: ui.palletMotionEnabled.checked,
     pallet_motion_timeout_seconds: fieldNumber(ui.palletMotionTimeoutSeconds, 120),
     pallet_motion_generation: {
       approach_y_clearance_mm: fieldNumber(ui.palletMotionApproachYClearance, 100),
       mill_approach_x_clearance_mm: fieldNumber(ui.palletMotionMillApproachXClearance, 100),
       lift_z_clearance_mm: fieldNumber(ui.palletMotionLiftZClearance, 100),
+      mill_lift_z_clearance_mm: fieldNumber(ui.palletMotionMillLiftZClearance, 100),
       max_travel_speed_rad_s: fieldNumber(ui.palletMotionMaxTravelSpeed, 0.6),
       pickup_setdown_speed_m_s: fieldNumber(ui.palletMotionPickupSpeed, 0.08),
       rx_rad: fieldNumber(ui.palletMotionRx, 0),
@@ -502,12 +622,33 @@ function settingsDraft() {
       erowa_unlock_action: outputActionDraft(ui.erowaUnlockOutput, ui.erowaUnlockState, ui.erowaUnlockPulse),
       erowa_lock_action: outputActionDraft(ui.erowaLockOutput, ui.erowaLockState, ui.erowaLockPulse),
       mill_actuation_wait_seconds: fieldNumber(ui.millActuationWaitSeconds, 2),
-      safe_pre_waypoint: motionPoseDraft("safe-pre", "Shared Safe Waypoint"),
-      safe_post_waypoint: motionPoseDraft("safe-pre", "Shared Safe Waypoint"),
-      travel_waypoints: motionWaypoints,
+      mill_pre_entry_waypoint: motionPoseDraft("robot-mill-pre-entry", "Mill pre-entry"),
+      safe_pre_waypoint: jointWaypointDraft("safe-pre", "Shared Safe Joint Pose"),
+      safe_post_waypoint: jointWaypointDraft("safe-pre", "Shared Safe Joint Pose"),
+      travel_waypoints: [],
+      intermediate_safe_poses: intermediateSafePoses,
     },
     workholding_library: workholdingLibrary,
   };
+}
+
+function cloneSettingsDraft(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function changedSettings(base, current) {
+  return Object.fromEntries(Object.keys(current).filter(key => JSON.stringify(current[key]) !== JSON.stringify(base?.[key])).map(key => [key, current[key]]));
+}
+
+function rebaseSettingsChanges(base, current, latestSettings) {
+  const changes = changedSettings(base, current);
+  for (const [key, value] of Object.entries(changes)) {
+    if (!Array.isArray(value) && value && typeof value === "object" && latestSettings[key] && typeof latestSettings[key] === "object") {
+      const nestedChanges = changedSettings(base?.[key] || {}, value);
+      changes[key] = {...latestSettings[key], ...nestedChanges};
+    }
+  }
+  return changes;
 }
 
 function normalizeSettingsPrecision() {
@@ -545,6 +686,17 @@ async function loadSettings() {
     ui.robotPort.value = board.settings.robot_port;
     ui.robotPollHz.value = board.settings.robot_poll_hz;
     ui.robotTimeoutSeconds.value = board.settings.robot_timeout_seconds;
+    ui.robotSupervisorEnabled.checked = board.settings.robot_supervisor_enabled;
+    ui.robotSupervisorHostname.value = board.settings.robot_supervisor_hostname || "DESKTOP-KF5I73N.lan";
+    ui.robotSupervisorListenHost.value = board.settings.robot_supervisor_listen_host || "0.0.0.0";
+    ui.robotSupervisorPort.value = board.settings.robot_supervisor_port || 50010;
+    ui.robotSupervisorHeartbeatSeconds.value = board.settings.robot_supervisor_heartbeat_seconds ?? 1;
+    ui.robotSupervisorTelemetryHz.value = board.settings.robot_supervisor_telemetry_hz ?? 2;
+    ui.robotSupervisorReconnectLimitSeconds.value = board.settings.robot_supervisor_reconnect_limit_seconds ?? 10;
+    ui.robotSupervisorFallback.checked = board.settings.robot_supervisor_pre_dispatch_fallback !== false;
+    ui.robotSupervisorStatus.textContent = board.settings.robot_supervisor_activation_verified
+      ? "No-motion handshake verified. Enable and save when ready."
+      : "Not verified. Save and rebuild scripts before testing.";
     ui.cncTelemetryEnabled.checked = board.settings.cnc_telemetry_enabled;
     ui.cncHost.value = board.settings.cnc_host || "";
     ui.cncSshPort.value = board.settings.cnc_ssh_port || 22;
@@ -552,6 +704,8 @@ async function loadSettings() {
     ui.cncSshPassword.value = board.settings.cnc_ssh_password || "";
     ui.cncTimeoutSeconds.value = board.settings.cnc_timeout_seconds || 2;
     ui.cncRequireAAxisHomed.checked = Boolean(board.settings.cnc_require_a_axis_homed);
+    ui.runModeSafetyConfirm.checked = board.settings.run_mode_safety_confirm !== false;
+    ui.runModeSafetyConfirm.disabled = Boolean(board.run_mode?.enabled);
     ui.debugProgramButtonCount.value = board.settings.debug_program_button_count || 4;
     ui.debugMillProgramButtonCount.value = board.settings.debug_mill_program_button_count || 4;
     ui.robotFileAccessEnabled.checked = board.settings.robot_file_access_enabled;
@@ -564,11 +718,14 @@ async function loadSettings() {
     ui.robotProgramsFilterEnabled.checked = board.settings.robot_programs_filter_enabled;
     ui.robotProgramsPageEnabled.checked = board.settings.robot_programs_page_enabled;
     ui.robotEditorCommand.value = board.settings.robot_editor_command || "code";
-    ui.millFileDirectory.value = board.settings.mill_file_directory || "/home/operator/gcode";
+    ui.millFileDirectory.value = board.settings.mill_file_directory || "/home/operator/gcode/Gcode";
     ui.millProgramExtensions.value = board.settings.mill_program_extensions.join(", ");
     ui.millProgramsFilterEnabled.checked = board.settings.mill_programs_filter_enabled;
     ui.millProgramsPageEnabled.checked = board.settings.mill_programs_page_enabled;
     ui.millEditorCommand.value = board.settings.mill_editor_command || "code";
+    ui.millResultsArchivingEnabled.checked = board.settings.mill_results_archiving_enabled !== false;
+    ui.millResultsSourcePath.value = board.settings.mill_results_source_path || "/home/operator/gcode/RESULTS.TXT";
+    ui.millResultsArchiveDirectory.value = board.settings.mill_results_archive_directory || "/home/operator/gcode/results";
     renderMotionChannelOptions();
     ui.palletMotionEnabled.checked = board.settings.pallet_motion_enabled;
     ui.palletMotionTimeoutSeconds.value = board.settings.pallet_motion_timeout_seconds || 120;
@@ -576,6 +733,7 @@ async function loadSettings() {
     ui.palletMotionApproachYClearance.value = generation.approach_y_clearance_mm ?? 100;
     ui.palletMotionMillApproachXClearance.value = generation.mill_approach_x_clearance_mm ?? 100;
     ui.palletMotionLiftZClearance.value = generation.lift_z_clearance_mm ?? 100;
+    ui.palletMotionMillLiftZClearance.value = generation.mill_lift_z_clearance_mm ?? 100;
     ui.palletMotionMaxTravelSpeed.value = generation.max_travel_speed_rad_s ?? 0.6;
     ui.palletMotionPickupSpeed.value = generation.pickup_setdown_speed_m_s ?? 0.08;
     ui.palletMotionGripOutput.value = channelValue(generation.grip_output);
@@ -588,16 +746,18 @@ async function loadSettings() {
     ui.palletMotionRx.value = generation.rx_rad ?? 0;
     ui.palletMotionRy.value = generation.ry_rad ?? 0;
     ui.palletMotionRz.value = generation.rz_rad ?? 0;
-    renderMotionPoseFields(ui.palletMotionSafePreFields, "safe-pre", generation.safe_pre_waypoint);
-    motionWaypoints = [...(generation.travel_waypoints || [])];
-    renderMotionWaypoints();
+    renderJointWaypointFields(ui.palletMotionSafePreFields, "safe-pre", generation.safe_pre_waypoint);
+    intermediateSafePoses = [...(generation.intermediate_safe_poses || [])];
+    renderIntermediateSafePoseSlots();
+    renderIntermediateSafePoses();
     renderGeneratedMotionPrograms();
     workholdingLibrary = [...(board.settings.workholding_library || [])];
     renderWorkholdingLibrary();
     renderFusionToolLibraries(board.settings.fusion_tool_libraries || []);
     document.querySelectorAll("[data-robot-programs-nav]").forEach(link => link.classList.toggle("hidden", !board.settings.robot_programs_page_enabled));
     document.querySelectorAll("[data-mill-programs-nav]").forEach(link => link.classList.toggle("hidden", !board.settings.mill_programs_page_enabled));
-    savedSettingsSignature = JSON.stringify(settingsDraft());
+    savedSettingsDraft = cloneSettingsDraft(settingsDraft());
+    savedSettingsSignature = JSON.stringify(savedSettingsDraft);
     setDirtyState(false);
     syncRobotModeUi();
     setSystemState();
@@ -623,20 +783,35 @@ function closeScriptRebuildPrompt() {
 }
 
 async function saveSettings({promptForScriptRebuild = true} = {}) {
+  normalizeSettingsPrecision();
+  const draft = settingsDraft();
+  const baseDraft = savedSettingsDraft || cloneSettingsDraft(draft);
+  let settingsChanges = changedSettings(baseDraft, draft);
   try {
-    normalizeSettingsPrecision();
-    const result = await api("/api/settings", {
+    const submit = revision => api("/api/settings", {
       method: "PUT",
-      body: JSON.stringify({
-        expected_revision: board.revision,
-        ...settingsDraft(),
-      }),
+      body: JSON.stringify({expected_revision: revision, ...settingsChanges}),
     });
+    let result;
+    try {
+      result = await submit(board.revision);
+    } catch (error) {
+      if (!error.message.includes("another session")) throw error;
+      const latestBoard = await api("/api/board");
+      settingsChanges = rebaseSettingsChanges(baseDraft, draft, latestBoard.settings);
+      board = latestBoard;
+      result = await submit(board.revision);
+    }
     board = result.board;
     ui.manualIoControlEnabled.checked = board.settings.manual_io_control_enabled;
+    ui.robotSupervisorEnabled.checked = board.settings.robot_supervisor_enabled;
+    if (!board.settings.robot_supervisor_activation_verified) {
+      ui.robotSupervisorStatus.textContent = "Supervisor configuration changed. Rebuild scripts and repeat the no-motion bootstrap.";
+    }
     workholdingLibrary = [...(board.settings.workholding_library || [])];
     renderWorkholdingLibrary();
-    savedSettingsSignature = JSON.stringify(settingsDraft());
+    savedSettingsDraft = cloneSettingsDraft(settingsDraft());
+    savedSettingsSignature = JSON.stringify(savedSettingsDraft);
     setDirtyState(false);
     setSystemState();
     syncRobotModeUi();
@@ -647,7 +822,6 @@ async function saveSettings({promptForScriptRebuild = true} = {}) {
     if (promptForScriptRebuild && board.settings.motion_scripts_need_rebuild) showScriptRebuildPrompt();
     return true;
   } catch (error) {
-    if (error.message.includes("another session")) await loadSettings();
     showToast(error.message, "error");
     return false;
   }
@@ -688,6 +862,75 @@ ui.testCncTelemetry.addEventListener("click", async () => {
   }
 });
 
+function renderSupervisorStatus(status) {
+  if (!status.listening) {
+    ui.robotSupervisorStatus.textContent = status.last_disconnect_detail || "Backend listener is unavailable.";
+    return;
+  }
+  if (!status.connected) {
+    ui.robotSupervisorStatus.textContent = `Listening on ${status.listen_host}:${status.listen_port}; Mongo is not connected.`;
+    return;
+  }
+  const match = status.robot_last_sequence === status.expected_sequence ? "sequence matched" : "reconciliation required";
+  ui.robotSupervisorStatus.textContent = `Connected · robot session ${status.robot_session} · heartbeat ${status.heartbeat_age_seconds ?? "?"}s · ${match}${status.latched ? " · LATCHED" : ""}.`;
+}
+
+async function loadSupervisorStatus() {
+  try {
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor", {cache: "no-store"}));
+  } catch (error) {
+    ui.robotSupervisorStatus.textContent = error.message;
+  }
+}
+
+ui.bootstrapRobotSupervisor.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save settings and rebuild generated scripts before the no-motion bootstrap.", "error");
+    return;
+  }
+  if (board.settings.motion_scripts_need_rebuild) {
+    showToast("Rebuild generated scripts before the no-motion bootstrap.", "error");
+    return;
+  }
+  const button = ui.bootstrapRobotSupervisor;
+  button.disabled = true;
+  button.textContent = "Waiting for Mongo...";
+  ui.robotSupervisorStatus.textContent = "Starting the supervisor without dispatching a movement...";
+  try {
+    const status = await api("/api/debug/robot-supervisor/bootstrap", {method: "POST", body: "{}"});
+    renderSupervisorStatus(status);
+    board = await api("/api/board", {cache: "no-store"});
+    ui.robotSupervisorEnabled.checked = board.settings.robot_supervisor_enabled;
+    savedSettingsDraft = cloneSettingsDraft(settingsDraft());
+    savedSettingsSignature = JSON.stringify(savedSettingsDraft);
+    showToast("No-motion supervisor handshake verified. Enable it and Save settings when ready.");
+  } catch (error) {
+    ui.robotSupervisorStatus.textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Run no-motion bootstrap";
+  }
+});
+
+ui.installSupervisorFirewall.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save the supervisor port before installing its firewall rule.", "error");
+    return;
+  }
+  const button = ui.installSupervisorFirewall;
+  button.disabled = true;
+  try {
+    const result = await api("/api/system/supervisor-firewall", {method: "POST", body: "{}"});
+    ui.robotSupervisorStatus.textContent = `${result.message} Approve the Windows prompt, then run the no-motion bootstrap.`;
+    showToast(`Firewall setup opened for TCP port ${result.port}.`);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
 ui.buildMillLoadPositionProgram.addEventListener("click", async () => {
   if (isDirty) {
     ui.millLoadPositionProgramStatus.textContent = "Save the changed loading coordinates before building the program.";
@@ -715,20 +958,58 @@ ui.buildMillLoadPositionProgram.addEventListener("click", async () => {
 });
 ui.poolSlotCount.addEventListener("change", () => {
   if (!board) return;
+  const poolSlotCount = fieldNumber(ui.poolSlotCount, board.settings.pool_slot_count || 16);
+  intermediateSafePoses = intermediateSafePoses.map(pose => ({...pose, pool_slots: (pose.pool_slots || []).filter(slot => Number(slot) <= poolSlotCount)}));
   renderLocationFields();
+  renderIntermediateSafePoseSlots();
+  renderIntermediateSafePoses();
   refreshDirtyState();
 });
 
-ui.form.addEventListener("click", async event => {
-  const button = event.target.closest(".capture-robot-pose");
-  if (!button) return;
+function poseCaptureName(button) {
+  if (button.hasAttribute("data-capture-joint-waypoint")) {
+    return button.dataset.captureJointWaypoint === "safe-pre" ? "the shared safe joint pose" : "the intermediate joint pose";
+  }
+  if (button.hasAttribute("data-capture-motion-pose")) {
+    if (button.dataset.captureMotionPose === "robot-mill-load-unload") return "the robot mill load/unload pose";
+    if (button.dataset.captureMotionPose === "robot-mill-pre-entry") return "the robot mill pre-entry waypoint";
+    return "the robot mill entry/exit pose";
+  }
+  if (button.dataset.captureLocation === "pool") return `Pool ${String(button.dataset.captureSlot).padStart(2, "0")} robot position`;
+  if (button.dataset.captureLocation === "on_deck") return "the On deck robot position";
+  if (button.dataset.captureLocation === "dripping") return "the Dripping robot position";
+  return "the selected robot pose";
+}
+
+function openPoseCaptureModal(button) {
+  pendingPoseCaptureButton = button;
+  const label = poseCaptureName(button);
+  ui.poseCaptureMessage.textContent = `Capture the live robot position and replace ${label}? This changes only the displayed settings until Save settings is pressed.`;
+  ui.poseCaptureModal.classList.remove("hidden");
+  ui.poseCaptureConfirm.focus();
+}
+
+function closePoseCaptureModal() {
+  pendingPoseCaptureButton = null;
+  ui.poseCaptureModal.classList.add("hidden");
+}
+
+async function captureRobotPose(button) {
 
   const originalLabel = button.textContent;
   button.disabled = true;
   button.textContent = "Reading robot...";
   try {
     const pose = await api("/api/debug/robot-pose");
-    if (button.hasAttribute("data-capture-motion-pose")) {
+    if (button.hasAttribute("data-capture-joint-waypoint")) {
+      if (!Array.isArray(pose.joints_rad) || pose.joints_rad.length !== 6) throw new Error("Live robot joint positions are unavailable. Confirm physical RTDE telemetry is connected before capturing a joint waypoint.");
+      const scope = button.dataset.captureJointWaypoint;
+      pose.joints_rad.forEach((value, index) => {
+        const input = ui.form.querySelector(`[data-joint-waypoint="${scope}"][data-joint-index="${index}"]`);
+        if (input) input.value = value;
+      });
+      showToast("Current J0-J5 joint positions captured. Press Save changes to store them.");
+    } else if (button.hasAttribute("data-capture-motion-pose")) {
       const scope = button.dataset.captureMotionPose;
       for (const axis of ["x_mm", "y_mm", "z_mm", "rx_rad", "ry_rad", "rz_rad"]) {
         const input = ui.form.querySelector(`[data-motion-pose="${scope}"][data-motion-axis="${axis}"]`);
@@ -743,34 +1024,57 @@ ui.form.addEventListener("click", async event => {
       }
     }
     refreshDirtyState();
-    showToast(`Robot pose captured: X ${pose.x_mm} mm, Y ${pose.y_mm} mm, Z ${pose.z_mm} mm. Press Save changes to store it.`);
+    if (!button.hasAttribute("data-capture-joint-waypoint")) showToast(`Robot pose captured: X ${pose.x_mm} mm, Y ${pose.y_mm} mm, Z ${pose.z_mm} mm. Press Save changes to store it.`);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     button.disabled = false;
     button.textContent = originalLabel;
   }
+}
+
+ui.form.addEventListener("click", event => {
+  const button = event.target.closest(".capture-robot-pose");
+  if (button) openPoseCaptureModal(button);
 });
 
-ui.addMotionWaypoint.addEventListener("click", () => {
-  const name = ui.motionWaypointName.value.trim();
-  if (!name) return showToast("Enter a waypoint name.", "error");
-  if (motionWaypoints.some(item => item.name.localeCompare(name, undefined, {sensitivity: "accent"}) === 0)) return showToast("Waypoint names must be unique.", "error");
-  motionWaypoints.push({
-    name,
-    x_mm: fieldNumber(ui.motionWaypointX, 0), y_mm: fieldNumber(ui.motionWaypointY, 0), z_mm: fieldNumber(ui.motionWaypointZ, 0),
-    rx_rad: fieldNumber(ui.motionWaypointRx, 0), ry_rad: fieldNumber(ui.motionWaypointRy, 0), rz_rad: fieldNumber(ui.motionWaypointRz, 0),
-  });
-  [ui.motionWaypointName, ui.motionWaypointX, ui.motionWaypointY, ui.motionWaypointZ, ui.motionWaypointRx, ui.motionWaypointRy, ui.motionWaypointRz].forEach(input => { input.value = ""; });
-  renderMotionWaypoints();
+ui.poseCaptureCancel.addEventListener("click", closePoseCaptureModal);
+ui.poseCaptureConfirm.addEventListener("click", async () => {
+  const button = pendingPoseCaptureButton;
+  closePoseCaptureModal();
+  if (button) await captureRobotPose(button);
+});
+
+ui.addIntermediateSafePose.addEventListener("click", () => {
+  const name = ui.intermediateSafePoseName.value.trim();
+  const joints = ui.intermediateSafePoseJoints.map(input => input.value.trim());
+  const poolSlots = selectedNewIntermediateSlots();
+  if (!name) return showToast("Enter an intermediate safe-pose name.", "error");
+  if (intermediateSafePoses.some(pose => pose.name.localeCompare(name, undefined, {sensitivity: "accent"}) === 0)) return showToast("Intermediate safe-pose names must be unique.", "error");
+  if (joints.some(value => value === "" || !Number.isFinite(Number(value)))) return showToast("Enter all six finite joint positions for the intermediate safe pose.", "error");
+  if (!poolSlots.length) return showToast("Assign the intermediate safe pose to at least one Pool position.", "error");
+  intermediateSafePoses.push({name, joints_rad: joints.map(Number), pool_slots: poolSlots});
+  ui.intermediateSafePoseName.value = "";
+  ui.intermediateSafePoseJoints.forEach(input => { input.value = ""; });
+  renderIntermediateSafePoseSlots();
+  renderIntermediateSafePoses();
   refreshDirtyState();
 });
 
-ui.motionWaypointList.addEventListener("click", event => {
-  const button = event.target.closest("[data-motion-waypoint-index]");
+ui.intermediateSafePoseList.addEventListener("change", event => {
+  const input = event.target.closest("[data-intermediate-pose-index]");
+  if (!input) return;
+  const index = Number(input.dataset.intermediatePoseIndex);
+  const row = input.closest(".intermediate-safe-pose-row");
+  intermediateSafePoses[index].pool_slots = Array.from(row.querySelectorAll("input:checked"), checkbox => Number(checkbox.value));
+  refreshDirtyState();
+});
+
+ui.intermediateSafePoseList.addEventListener("click", event => {
+  const button = event.target.closest("[data-intermediate-safe-pose-index]");
   if (!button) return;
-  motionWaypoints.splice(Number(button.dataset.motionWaypointIndex), 1);
-  renderMotionWaypoints();
+  intermediateSafePoses.splice(Number(button.dataset.intermediateSafePoseIndex), 1);
+  renderIntermediateSafePoses();
   refreshDirtyState();
 });
 
@@ -782,7 +1086,8 @@ async function rebuildMotionScripts() {
     board = result.board;
     renderGeneratedMotionPrograms();
     ui.motionProgramFileStatus.textContent = `${result.files.length} scripts synchronized locally and to the robot.`;
-    savedSettingsSignature = JSON.stringify(settingsDraft());
+    savedSettingsDraft = cloneSettingsDraft(settingsDraft());
+    savedSettingsSignature = JSON.stringify(savedSettingsDraft);
     setDirtyState(false);
     showToast("Generated robot scripts rebuilt and synchronized.");
     return true;
@@ -1098,4 +1403,4 @@ ui.robotDirectoryModal.addEventListener("click", event => {
   if (event.target === ui.robotDirectoryModal) closeRobotDirectory();
 });
 
-loadSettings();
+loadSettings().then(loadSupervisorStatus);

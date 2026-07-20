@@ -1,9 +1,85 @@
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
+import pytest
 import time
 
 from app.main import create_app
+from app.models import Pallet, RobotMotion
 from app.service import build_mill_load_position_program
-from app import cnc_linuxcnc
+from app import cnc_linuxcnc, service
+
+
+def test_network_diagnostic_reports_packet_loss_and_transit_times(monkeypatch) -> None:
+    class PingResult:
+        stdout = """Reply from 8.8.8.8: bytes=32 time=12ms TTL=117
+Reply from 8.8.8.8: bytes=32 time<1ms TTL=117
+Packets: Sent = 20, Received = 2, Lost = 18 (90% loss),
+"""
+        stderr = ""
+
+    monkeypatch.setattr(service.subprocess, "run", lambda *args, **kwargs: PingResult())
+    monkeypatch.setattr(service, "_NETWORK_TEST_LAST_MANUAL_START", 0.0)
+
+    result = service.network_diagnostic()
+
+    assert result["target"] == "8.8.8.8"
+    assert result["sent"] == 20
+    assert result["received"] == 2
+    assert result["packet_loss_percent"] == 90.0
+    assert result["minimum_ms"] == 1.0
+    assert result["maximum_ms"] == 12.0
+    assert result["transit_times_ms"] == [12.0, 1.0]
+
+
+def test_network_diagnostic_returns_full_loss_result(monkeypatch) -> None:
+    class PingResult:
+        stdout = "Packets: Sent = 20, Received = 0, Lost = 20 (100% loss),"
+        stderr = ""
+
+    monkeypatch.setattr(service.subprocess, "run", lambda *args, **kwargs: PingResult())
+    monkeypatch.setattr(service, "_NETWORK_TEST_LAST_MANUAL_START", 0.0)
+
+    result = service.network_diagnostic()
+
+    assert result["received"] == 0
+    assert result["packet_loss_percent"] == 100.0
+    assert result["average_ms"] is None
+
+
+def test_network_diagnostic_manual_rate_limit(monkeypatch) -> None:
+    monkeypatch.setattr(service, "_NETWORK_TEST_LAST_MANUAL_START", 100.0)
+    monkeypatch.setattr(service.time, "monotonic", lambda: 105.0)
+
+    with pytest.raises(HTTPException) as error:
+        service.network_diagnostic()
+
+    assert error.value.status_code == 429
+
+
+def test_robot_connection_loss_starts_network_test_at_most_every_180_seconds(monkeypatch) -> None:
+    starts: list[str] = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, **kwargs) -> None:
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            starts.append(self.args[0])
+            self.target(*self.args)
+
+    monkeypatch.setattr(service, "Thread", ImmediateThread)
+    monkeypatch.setattr(service, "_run_network_diagnostic", lambda: {"sent": 20, "received": 20})
+    monkeypatch.setattr(service, "_NETWORK_TEST_ACTIVE", False)
+    monkeypatch.setattr(service, "_NETWORK_TEST_LAST_AUTOMATIC_START", 0.0)
+    clock = iter((200.0, 250.0, 380.0))
+    monkeypatch.setattr(service.time, "monotonic", lambda: next(clock))
+
+    service.trigger_network_diagnostic_on_robot_loss()
+    service.trigger_network_diagnostic_on_robot_loss()
+    service.trigger_network_diagnostic_on_robot_loss()
+
+    assert starts == ["automatic_robot_disconnect", "automatic_robot_disconnect"]
 
 
 def wait_for_run_state(client: TestClient, state: str, timeout: float = 5.0) -> dict:
@@ -25,15 +101,21 @@ def test_health_and_pages(client: TestClient) -> None:
     assert payload["version"] == "0.3.0"
     assert isinstance(payload["process_id"], int)
     assert payload["started_at"]
-    assert "Pallet schedule" in client.get("/").text
-    assert "Debugging" in client.get("/debugging").text
-    assert "Mongo controller" in client.get("/debugging").text
-    assert "Tormach 1500MX / PathPilot" in client.get("/debugging").text
+    schedule_page = client.get("/").text
+    assert "Pallet schedule" in schedule_page
+    assert 'id="cancel-mill-putaway" type="button"' in schedule_page
+    assert 'id="cancel-motion-recovery" type="button"' in schedule_page
+    debugging_page = client.get("/debugging").text
+    assert "Debugging" in debugging_page
+    assert "Mongo controller" in debugging_page
+    assert "Tormach 1500MX / PathPilot" in debugging_page
+    assert 'id="retry-mongo-connection"' in debugging_page
+    assert 'id="clear-mongo-fault"' in debugging_page
     settings_page = client.get("/settings").text
     assert "System settings" in settings_page
     assert "Close and relaunch" in settings_page
     assert "Workholding library" in settings_page
-    assert 'id="workholding-options"' in client.get("/").text
+    assert 'id="workholding-options"' in schedule_page
 
 
 def test_cnc_debug_baseline(client: TestClient) -> None:
@@ -373,6 +455,28 @@ def test_pallet_location_positions_persist(client: TestClient) -> None:
     assert settings["mill_load_unload_g53"] == {"x_in": 7.0, "y_in": 8.0, "z_in": 9.0}
 
 
+def test_robot_telemetry_refresh_retains_last_good_snapshot_on_brief_failure(monkeypatch) -> None:
+    key = ("192.0.2.80", 30003, 10, 1.0)
+    healthy = {"connected": True, "connection_label": "Live realtime fallback"}
+    service._ROBOT_TELEMETRY_CACHE[key] = (100.0, healthy, None, 100.0)
+    monkeypatch.setattr(service.time, "monotonic", lambda: 105.0)
+    monkeypatch.setattr(
+        service,
+        "read_robot_snapshot",
+        lambda *args: (_ for _ in ()).throw(service.RobotTelemetryError("brief packet gap")),
+    )
+
+    completed = service.Event()
+    service._refresh_robot_telemetry(key, key, completed)
+
+    cached = service._ROBOT_TELEMETRY_CACHE[key]
+    assert cached[1] == healthy
+    assert cached[2] == "brief packet gap"
+    assert cached[3] == 100.0
+    assert completed.is_set()
+    service._ROBOT_TELEMETRY_CACHE.pop(key, None)
+
+
 def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> None:
     snapshot = client.get("/api/debug/robot-io").json()
 
@@ -383,6 +487,51 @@ def test_debug_robot_io_snapshot_defaults_to_simulated(client: TestClient) -> No
     assert snapshot["source"] == "simulated"
     assert snapshot["robot"]["mode"] == "simulated"
     assert snapshot["digital_input_groups"][0]["rows"][0]["writable"] is False
+
+
+def test_operator_can_reset_robot_connection_when_idle(client: TestClient, monkeypatch) -> None:
+    resets = []
+    monkeypatch.setattr(service, "reset_robot_connections", lambda: resets.append(True))
+
+    response = client.post("/api/debug/robot-io/retry", json={})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "retrying"
+    assert resets == [True]
+
+
+def test_operator_can_clear_recoverable_robot_fault_when_idle(client: TestClient, monkeypatch) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.0.10"
+        session.commit()
+        revision = settings.revision
+    recoveries = []
+    monkeypatch.setattr(
+        service,
+        "clear_robot_fault",
+        lambda *args: recoveries.append(args) or {
+            "action": "protective_stop_unlocked",
+            "message": "Protective stop release was accepted.",
+        },
+    )
+
+    rejected = client.post(
+        "/api/debug/robot-fault/clear",
+        json={"expected_revision": revision, "confirmed": False},
+    )
+    assert rejected.status_code == 422
+    assert recoveries == []
+
+    response = client.post(
+        "/api/debug/robot-fault/clear",
+        json={"expected_revision": revision, "confirmed": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "protective_stop_unlocked"
+    assert recoveries == [("192.168.0.10", 1.0)]
 
 
 def test_current_robot_pose_converts_rtde_translation_to_millimeters(
@@ -413,6 +562,10 @@ def test_current_robot_pose_converts_rtde_translation_to_millimeters(
                 {"actual_pose": value}
                 for value in (0.123456, -0.234567, 0.345678, 0.1, -0.2, 0.3)
             ],
+            "joint_detail_rows": [
+                {"actual_position": value}
+                for value in (0.1, -1.2, 1.4, -1.6, -1.5, 0.2)
+            ],
         },
     )
 
@@ -426,6 +579,7 @@ def test_current_robot_pose_converts_rtde_translation_to_millimeters(
         "rx_rad": 0.1,
         "ry_rad": -0.2,
         "rz_rad": 0.3,
+        "joints_rad": [0.1, -1.2, 1.4, -1.6, -1.5, 0.2],
         "timestamp": "2026-07-16T12:00:00+00:00",
     }
 
@@ -523,12 +677,34 @@ def test_database_persists_across_application_restart(tmp_path) -> None:
     with TestClient(create_app(database_url)) as second_client:
         board = second_client.get("/api/board").json()
         assert board["revision"] == 1
-        assert [item["name"] for item in board["pallets"]] == ["ABBA"]
+        assert len(board["pallets"]) == 1
+        assert board["pallets"][0]["name"] in service.PALLET_NAMES
         assert board["pallets"][0]["pool_slot_number"] == 1
 
 
-def test_simulated_run_mode_processes_queue_with_step_confirmations(client: TestClient, tmp_path) -> None:
-    (tmp_path / "job.nc").write_text("G0 X0\nM30\n", encoding="ascii")
+def test_simulated_run_mode_processes_queue_with_step_confirmations(client: TestClient, tmp_path, monkeypatch) -> None:
+    command_order = []
+    start_transfer = service.start_mill_pallet_transfer
+
+    def track_transfer(session, payload, automated=False):
+        command_order.append(f"robot_{payload.operation}")
+        return start_transfer(session, payload, automated)
+
+    monkeypatch.setattr(service, "start_mill_pallet_transfer", track_transfer)
+    monkeypatch.setattr(
+        service,
+        "_run_mode_load_position_cycle",
+        lambda session_factory: command_order.append("mill_load_position") or True,
+    )
+    monkeypatch.setattr(
+        service,
+        "_run_mode_machine_cycle",
+        lambda session_factory, pallet_id: command_order.append("mill_assigned_program") or True,
+    )
+    monkeypatch.setattr(service, "pallet_program_files", lambda session: ["job.nc"])
+    gcode_dir = tmp_path / "Gcode"
+    gcode_dir.mkdir()
+    (gcode_dir / "job.nc").write_text("G0 X0\nM30\n", encoding="ascii")
     board = client.get("/api/settings").json()
     saved = client.put(
         "/api/settings",
@@ -582,6 +758,279 @@ def test_simulated_run_mode_processes_queue_with_step_confirmations(client: Test
     assert result["location"] == "pool"
     assert result["pool_slot_number"] == 1
     assert result["content_status"] == "complete_parts"
+    assert command_order == [
+        "mill_load_position",
+        "robot_load",
+        "mill_assigned_program",
+        "mill_load_position",
+        "robot_unload",
+    ]
+
+
+def test_run_mode_cnc_cycle_starts_program_and_waits_for_idle(client: TestClient, monkeypatch) -> None:
+    calls = []
+    telemetry = iter(({"interp_state": 2}, {"interp_state": 1}))
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.robot_connection_mode = "physical"
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_username = "operator"
+        settings.cnc_ssh_password = "secret"
+        session.commit()
+
+    monkeypatch.setattr(service, "run_linuxcnc_program", lambda *args: calls.append(args))
+    monkeypatch.setattr(service, "read_linuxcnc_cycle_state", lambda *args: next(telemetry))
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: None)
+
+    completed = service._run_mode_cnc_cycle(
+        client.app.state.session_factory,
+        "/home/operator/gcode/Gcode/mongo_mill_load_position.nc",
+        cycle_label="Loading position",
+        timeout_seconds=10,
+    )
+
+    assert completed is True
+    assert len(calls) == 1
+    assert calls[0][0] == "tormach"
+    assert calls[0][5] == "/home/operator/gcode/Gcode/mongo_mill_load_position.nc"
+
+
+def test_physical_run_mode_requires_live_cnc_before_enabling(client: TestClient, monkeypatch) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.pallet_motion_enabled = True
+        settings.robot_host = "mongo"
+        settings.cnc_telemetry_enabled = True
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_username = "operator"
+        settings.cnc_ssh_password = "secret"
+        pallet = Pallet(
+            id="batch-preflight-pallet",
+            name="Batch Preflight",
+            workholding="Fixture",
+            weight_kg=1.0,
+            content_status="raw_stock",
+            program_path="job.nc",
+            location="pool",
+            pool_slot_number=1,
+            queue_position=1,
+        )
+        session.add(pallet)
+        session.commit()
+        revision = settings.revision
+
+    monkeypatch.setattr(service, "_assert_motion_ready", lambda *args: None)
+
+    def unavailable(*args):
+        raise service.CncTelemetryError("SSH timed out")
+
+    monkeypatch.setattr(service, "read_linuxcnc_cycle_state", unavailable)
+    response = client.post(
+        "/api/run-mode/start",
+        json={"expected_revision": revision, "safety_confirm": True},
+    )
+
+    assert response.status_code == 409
+    assert "Live CNC telemetry is unavailable" in response.json()["detail"]
+    assert client.get("/api/board").json()["run_mode"]["enabled"] is False
+
+
+def test_mill_results_archive_uses_program_name_and_utc_timestamp(client: TestClient, monkeypatch) -> None:
+    copied = {}
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_password = "secret"
+        settings.mill_file_directory = "/home/operator/gcode"
+        settings.mill_results_source_path = "/home/operator/gcode/RESULTS.TXT"
+        settings.mill_results_archive_directory = "/home/operator/gcode/Results"
+        session.commit()
+
+    monkeypatch.setattr(
+        service,
+        "remote_file_signature",
+        lambda **kwargs: {"size": 20, "mtime": 2, "sha256": "new"},
+    )
+
+    def fake_copy(**kwargs):
+        copied.update(kwargs)
+        return f"{kwargs['destination_directory']}/{kwargs['destination_name']}"
+
+    monkeypatch.setattr(service, "copy_remote_file_as", fake_copy)
+    archived = service._archive_mill_results(
+        settings,
+        "customer/jobs/Op 1 - Top.nc",
+        {"size": 10, "mtime": 1, "sha256": "old"},
+    )
+
+    assert copied["source"] == "/home/operator/gcode/RESULTS.TXT"
+    assert copied["destination_directory"] == "/home/operator/gcode/Results"
+    assert copied["destination_name"].startswith("Op_1_-_Top__")
+    assert copied["destination_name"].endswith("Z__RESULTS.TXT")
+    assert archived == f"/home/operator/gcode/Results/{copied['destination_name']}"
+
+
+def test_mill_results_paths_allow_pathpilot_results_beside_gcode(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.mill_file_directory = "/home/operator/gcode/Gcode"
+        settings.mill_results_source_path = "/home/operator/gcode/RESULTS.TXT"
+        settings.mill_results_archive_directory = "/home/operator/gcode/results"
+
+        assert service._mill_results_paths(settings) == (
+            "/home/operator/gcode/RESULTS.TXT",
+            "/home/operator/gcode/results",
+        )
+        assert service._mill_results_file_connection(settings)["directory"] == "/home/operator/gcode"
+
+
+def test_mill_results_archive_rejects_unchanged_file(client: TestClient, monkeypatch) -> None:
+    signature = {"size": 20, "mtime": 2, "sha256": "same"}
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: signature)
+
+    try:
+        service._archive_mill_results(settings, "job.nc", signature)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert "did not change" in str(exc.detail)
+    else:
+        raise AssertionError("An unchanged RESULTS.TXT must not be archived.")
+
+
+def test_run_mode_machine_cycle_archives_fresh_results(client: TestClient, monkeypatch) -> None:
+    signatures = iter((
+        {"size": 10, "mtime": 1, "sha256": "before"},
+        {"size": 20, "mtime": 2, "sha256": "after"},
+    ))
+    copied = []
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.robot_connection_mode = "physical"
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_password = "secret"
+        settings.mill_results_archiving_enabled = True
+        pallet = Pallet(
+            id="results-cycle-pallet",
+            name="Results Cycle",
+            workholding="Fixture",
+            weight_kg=1.0,
+            content_status="raw_stock",
+            program_path="parts/finish.nc",
+            location="machine",
+        )
+        session.add(pallet)
+        session.commit()
+
+    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: next(signatures))
+    monkeypatch.setattr(service, "_run_mode_cnc_cycle", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        service,
+        "copy_remote_file_as",
+        lambda **kwargs: copied.append(kwargs) or f"{kwargs['destination_directory']}/{kwargs['destination_name']}",
+    )
+
+    completed = service._run_mode_machine_cycle(client.app.state.session_factory, pallet.id)
+
+    assert completed is True
+    assert len(copied) == 1
+    assert copied[0]["destination_name"].startswith("finish__")
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        assert settings.run_mode_state == "results_archived"
+        assert "finish__" in settings.run_mode_detail
+
+
+def test_results_archive_failure_alerts_without_stopping_run_mode(client: TestClient, monkeypatch) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.robot_connection_mode = "physical"
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_password = "secret"
+        settings.mill_results_archiving_enabled = True
+        pallet = Pallet(
+            id="missing-results-pallet",
+            name="Missing Results",
+            workholding="Fixture",
+            weight_kg=1.0,
+            content_status="raw_stock",
+            program_path="finish.nc",
+            location="machine",
+        )
+        session.add(pallet)
+        session.commit()
+
+    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: None)
+    monkeypatch.setattr(service, "_run_mode_cnc_cycle", lambda *args, **kwargs: True)
+
+    assert service._run_mode_machine_cycle(client.app.state.session_factory, pallet.id) is True
+    board = client.get("/api/board").json()
+    assert board["run_mode"]["enabled"] is True
+    assert board["run_mode"]["state"] == "results_archive_warning"
+    assert "Production continued normally" in board["run_mode"]["alert"]
+
+    dismissed = client.post("/api/run-mode/alert/dismiss", json={}).json()
+    assert dismissed["run_mode"]["alert"] is None
+    assert dismissed["run_mode"]["enabled"] is True
+
+
+def test_stale_run_mode_fault_can_be_cleared_without_changing_queue(client: TestClient) -> None:
+    board = client.post(
+        "/api/pallets",
+        json={
+            "expected_revision": 0,
+            "workholding": "Vise",
+            "weight_kg": 1,
+            "content_status": "raw_stock",
+        },
+    ).json()
+    pallet = board["pallets"][0]
+    board = client.post(
+        f"/api/pallets/{pallet['id']}/queue",
+        json={"expected_revision": board["revision"], "queue_index": 0},
+    ).json()
+    expected_queue_position = board["pallets"][0]["queue_position"]
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = False
+        settings.run_mode_state = "faulted"
+        settings.run_mode_detail = "Old controller communication fault."
+        session.commit()
+        revision = settings.revision
+
+    cleared = client.post(
+        "/api/run-mode/status/clear",
+        json={"expected_revision": revision},
+    )
+
+    assert cleared.status_code == 200
+    result = cleared.json()
+    assert result["run_mode"]["state"] == "idle"
+    assert result["run_mode"]["detail"] == ""
+    assert result["pallets"][0]["queue_position"] == expected_queue_position
+
+
+def test_active_run_mode_status_cannot_be_cleared(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "faulted"
+        settings.run_mode_detail = "Current fault."
+        session.commit()
+        revision = settings.revision
+
+    response = client.post(
+        "/api/run-mode/status/clear",
+        json={"expected_revision": revision},
+    )
+
+    assert response.status_code == 409
+    assert "Stop Run Mode" in response.json()["detail"]
 
 
 def test_relaunch_endpoint_queues_helper(client: TestClient, monkeypatch) -> None:
@@ -597,3 +1046,55 @@ def test_relaunch_endpoint_queues_helper(client: TestClient, monkeypatch) -> Non
     assert response.status_code == 202
     assert response.json()["status"] == "relaunching"
     assert started == {"called": True}
+
+
+def test_relaunch_is_blocked_during_robot_motion(client: TestClient, monkeypatch) -> None:
+    board = client.post(
+        "/api/pallets",
+        json={
+            "expected_revision": 0,
+            "workholding": "Vise",
+            "weight_kg": 1,
+            "content_status": "raw_stock",
+        },
+    ).json()
+    pallet = board["pallets"][0]
+    with client.app.state.session_factory() as session:
+        session.add(RobotMotion(
+            id="active-motion",
+            pallet_id=pallet["id"],
+            operation="pick",
+            source_slot=1,
+            destination_slot=None,
+            program_path="/programs/pick.script",
+            status="running",
+            retry_count=0,
+            observed_busy=False,
+            created_at="2026-01-01T00:00:00+00:00",
+        ))
+        session.commit()
+    monkeypatch.setattr(
+        "app.main.queue_backend_relaunch",
+        lambda: (_ for _ in ()).throw(AssertionError("must not relaunch during motion")),
+    )
+
+    response = client.post("/api/system/relaunch")
+
+    assert response.status_code == 409
+    assert "active robot movement" in response.json()["detail"]
+
+
+def test_settings_accept_partial_update_without_resetting_robot_connection(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "mongo"
+        session.commit()
+
+    response = client.put("/api/settings", json={"expected_revision": 0, "weight_unit": "kg"})
+
+    assert response.status_code == 200
+    saved = response.json()["board"]["settings"]
+    assert saved["weight_unit"] == "kg"
+    assert saved["robot_connection_mode"] == "physical"
+    assert saved["robot_host"] == "mongo"

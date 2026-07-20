@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260712-5">
-    <script src="/static/settings.js?v=20260716-18" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260719-11">
+    <script src="/static/settings.js?v=20260719-29" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -114,7 +114,7 @@
                 <input id="robot-host" placeholder="192.168.0.10" maxlength="255">
               </label>
               <label>
-                RTDE port
+                Robot telemetry port
                 <input id="robot-port" type="number" min="1" max="65535" step="1">
               </label>
             </div>
@@ -128,7 +128,34 @@
                 <input id="robot-timeout-seconds" type="number" min="0.1" max="10" step="0.1">
               </label>
             </div>
-            <p class="field-help" id="robot-connection-help">Simulated mode allows manual input/output toggles on the Debugging page. Physical mode reads only live RTDE data from the configured robot.</p>
+            <p class="field-help" id="robot-connection-help">Simulated mode allows manual input/output toggles on the Debugging page. Physical mode reads only live robot data. Mongo's CB-series realtime interface uses port 30003.</p>
+            <fieldset class="location-fieldset supervisor-settings">
+              <legend>Robot-originated supervisor</legend>
+              <label class="checkbox-control">
+                <input id="robot-supervisor-enabled" type="checkbox">
+                <span>Use persistent supervisor for commands and telemetry<small>Requires a successful no-motion bootstrap. Leave disabled until the handshake status below is verified.</small></span>
+              </label>
+              <div class="form-row">
+                <label>Desktop hostname seen by Mongo<input id="robot-supervisor-hostname" maxlength="255" placeholder="DESKTOP-KF5I73N.lan"></label>
+                <label>Backend listen interface<input id="robot-supervisor-listen-host" maxlength="255" placeholder="0.0.0.0"></label>
+                <label>Supervisor TCP port<input id="robot-supervisor-port" type="number" min="1" max="65535" step="1"></label>
+              </div>
+              <div class="form-row">
+                <label>Heartbeat interval (seconds)<input id="robot-supervisor-heartbeat-seconds" type="number" min="0.25" max="10" step="0.25"></label>
+                <label>Telemetry rate (Hz)<input id="robot-supervisor-telemetry-hz" type="number" min="0.25" max="10" step="0.25"></label>
+                <label>Maximum reconnect delay (seconds)<input id="robot-supervisor-reconnect-limit-seconds" type="number" min="1" max="60" step="1"></label>
+              </div>
+              <label class="checkbox-control">
+                <input id="robot-supervisor-fallback" type="checkbox">
+                <span>Allow legacy fallback before dispatch only<small>Fallback is permitted only when no supervisor socket existed and no command byte was attempted. Uncertain commands always latch instead.</small></span>
+              </label>
+              <div class="inline-actions">
+                <button class="button secondary" id="install-supervisor-firewall" type="button">Install Windows firewall rule</button>
+                <button class="button secondary" id="bootstrap-robot-supervisor" type="button">Run no-motion bootstrap</button>
+                <span class="field-help" id="robot-supervisor-status" role="status" aria-live="polite">Not tested.</span>
+              </div>
+              <p class="field-help">Windows must allow inbound TCP on this port. Rebuild generated scripts after changing the hostname, port, poses, or motion settings.</p>
+            </fieldset>
           </div>
         </section>
 
@@ -181,29 +208,42 @@
 
         <section class="settings-panel">
           <div class="panel-intro">
-            <p class="section-number">05</p>
-            <h2>Robot pallet locations</h2>
-            <p>All robot positions use millimeters in the robot base frame and radians for tool orientation.</p>
+            <p class="section-number">06</p>
+            <h2>Workflow stations</h2>
+            <p>Choose whether the optional On deck and Dripping stations appear in the schedule and workflow.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control">
+              <input id="on-deck-enabled" type="checkbox">
+              <span>Show On deck staging station<small>Displays a single staging position for the next pallet in the workflow.</small></span>
+            </label>
+            <label class="checkbox-control">
+              <input id="dripping-enabled" type="checkbox">
+              <span>Show Dripping return station<small>Displays a single return-staging position for completed pallets.</small></span>
+            </label>
+            <label class="checkbox-control">
+              <input id="run-mode-safety-confirm" type="checkbox">
+              <span>Confirm every run step<small>When enabled, Run Mode asks for approval before each physical or machine action.</small></span>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">Robot poses</p>
+            <h2>Robot poses and locations</h2>
+            <p>Configure every robot position used by pallet handling in one place. Cartesian positions use millimeters in the robot base frame; tool orientation and joint poses use radians.</p>
           </div>
           <div class="panel-fields">
             <div class="location-grid" id="pool-location-grid"></div>
-            <div class="form-row">
-              <label class="checkbox-control">
-                <input id="on-deck-enabled" type="checkbox">
-                <span>Enable On deck station<small>Shows the staged pallet position and includes its robot scripts in the workflow.</small></span>
-              </label>
-              <label class="checkbox-control">
-                <input id="dripping-enabled" type="checkbox">
-                <span>Enable Dripping station<small>Shows the return-staging position and includes its robot scripts in the workflow.</small></span>
-              </label>
-            </div>
             <div class="form-row location-stations">
               <fieldset class="location-fieldset" id="on-deck-location-fields"><legend>On deck location</legend></fieldset>
               <fieldset class="location-fieldset" id="dripping-location-fields"><legend>Dripping location</legend></fieldset>
             </div>
             <fieldset class="location-fieldset" id="robot-mill-load-unload-fields"></fieldset>
+            <fieldset class="location-fieldset" id="robot-mill-pre-entry-fields"></fieldset>
             <fieldset class="location-fieldset" id="robot-mill-safe-entry-exit-fields"></fieldset>
-            <p class="field-help">The robot uses the shared safe entry/exit pose before entering the mill and after retracting. These mill-loading poses are stored for the next robot/mill integration stage.</p>
+            <p class="field-help">Changing any pose or motion value requires rebuilding generated scripts before physical pallet movements use the new configuration.</p>
           </div>
         </section>
 
@@ -282,8 +322,8 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">06</p>
-            <h2>Debug program buttons</h2>
-            <p>Configure independent Robot and Mill program-button counts for the Debugging page.</p>
+            <h2>Debugging controls</h2>
+            <p>Control diagnostic access and configure the Robot and Mill program buttons shown on the Debugging page.</p>
           </div>
           <div class="panel-fields">
             <label>
@@ -328,9 +368,9 @@
               <input id="mill-programs-page-enabled" type="checkbox">
               <span>Show Mill Programs page<small>Enables the Mill Programs navigation tab and its PathPilot file-management tools.</small></span>
             </label>
-            <label>
-              PathPilot program directory
-              <input id="mill-file-directory" maxlength="500" placeholder="/home/operator/gcode">
+              <label>
+                PathPilot program directory
+                <input id="mill-file-directory" maxlength="500" placeholder="/home/operator/gcode/Gcode">
             </label>
             <label>
               Mill program extensions
@@ -344,7 +384,23 @@
               Local editor command
               <input id="mill-editor-command" maxlength="500" placeholder="code">
             </label>
-            <p class="field-help">Uses the PathPilot host, SSH port, username, password, and timeout above. All file operations stay inside this program directory. Default: <code>/home/operator/gcode</code>.</p>
+            <fieldset class="location-fieldset">
+              <legend>Cycle results archive</legend>
+              <label class="checkbox-control">
+                <input id="mill-results-archiving-enabled" type="checkbox">
+                <span>Archive RESULTS.TXT after each pallet program<small>If the file is missing or unchanged, Run Mode records a warning and continues to the next pallet.</small></span>
+              </label>
+              <label>
+                RESULTS.TXT source path
+                <input id="mill-results-source-path" maxlength="500" placeholder="/home/operator/gcode/RESULTS.TXT">
+              </label>
+              <label>
+                Results archive directory
+                <input id="mill-results-archive-directory" maxlength="500" placeholder="/home/operator/gcode/results">
+              </label>
+              <p class="field-help">PathPilot normally writes <code>RESULTS.TXT</code> beside the <code>Gcode</code> folder. Both paths must stay inside the PathPilot controller data directory. Archives use <code>program__UTC-timestamp__RESULTS.TXT</code> filenames; the archive directory is created automatically.</p>
+            </fieldset>
+            <p class="field-help">Uses the PathPilot host, SSH port, username, password, and timeout above. All file operations stay inside this program directory. Default: <code>/home/operator/gcode/Gcode</code>.</p>
           </div>
         </section>
 
@@ -357,13 +413,14 @@
           <div class="panel-fields">
             <label class="checkbox-control">
               <input id="pallet-motion-enabled" type="checkbox">
-              <span>Enable physical pallet movements<small>Off by default. Requires a physical robot, healthy RTDE, idle runtime, and configured program mappings.</small></span>
+              <span>Enable physical pallet movements<small>Off by default. Requires a physical robot, healthy live telemetry, idle runtime, and configured program mappings.</small></span>
             </label>
             <label>Movement timeout (seconds)<input id="pallet-motion-timeout-seconds" type="number" min="2" max="1800" step="1"></label>
             <div class="form-row">
               <label>Y approach clearance (mm)<input id="pallet-motion-approach-y-clearance" type="number" min="-1000" max="1000" step="1"></label>
               <label>Mill +X withdrawal clearance (mm)<input id="pallet-motion-mill-approach-x-clearance" type="number" min="0" max="1000" step="1"><small>This positive distance is always added to the saved mill X coordinate. Retraction uses straight-line motion.</small></label>
-              <label>Z lift clearance (mm)<input id="pallet-motion-lift-z-clearance" type="number" min="1" max="1000" step="1"></label>
+              <label>Pool Z lift clearance (mm)<input id="pallet-motion-lift-z-clearance" type="number" min="1" max="1000" step="1"><small>Used only for pallet pool pick and place.</small></label>
+              <label>Mill Z lift clearance (mm)<input id="pallet-motion-mill-lift-z-clearance" type="number" min="1" max="1000" step="1"><small>Used only while loading or unloading the mill.</small></label>
             </div>
             <div class="form-row">
               <label>Max travel speed (rad/s)<input id="pallet-motion-max-travel-speed" type="number" min="0.01" max="3" step="0.01"></label>
@@ -405,26 +462,30 @@
               </div>
             </fieldset>
             <fieldset class="location-fieldset" id="pallet-motion-safe-pre-fields"></fieldset>
+            <fieldset class="location-fieldset">
+              <legend>Intermediate joint-safe poses</legend>
+              <p class="field-help">Create ordered, named joint configurations and assign each to one or more Pool positions. Assigned poses are traversed after the shared safe pose and again in reverse before the final return.</p>
+              <div class="motion-pose-heading"><strong>New intermediate joint-safe pose</strong><span>Capture a physically verified J0-J5 robot posture, then assign the Pool positions that must travel through it.</span></div>
+              <label>Pose name<input id="intermediate-safe-pose-name" maxlength="80" placeholder="e.g. Rack entry clearance"></label>
+              <div class="location-axis-row joint-waypoint-row">
+                <label>J0 (rad)<input id="intermediate-safe-pose-j0" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="0"></label>
+                <label>J1 (rad)<input id="intermediate-safe-pose-j1" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="1"></label>
+                <label>J2 (rad)<input id="intermediate-safe-pose-j2" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="2"></label>
+                <label>J3 (rad)<input id="intermediate-safe-pose-j3" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="3"></label>
+                <label>J4 (rad)<input id="intermediate-safe-pose-j4" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="4"></label>
+                <label>J5 (rad)<input id="intermediate-safe-pose-j5" type="number" step="any" data-round-to-decimals="3" data-joint-waypoint="intermediate-new" data-joint-index="5"></label>
+              </div>
+              <button class="button ghost capture-robot-pose" type="button" data-capture-joint-waypoint="intermediate-new">Capture current joint positions</button>
+              <div class="intermediate-safe-pose-slots" id="intermediate-safe-pose-slots"></div>
+              <div class="inline-actions"><button class="button secondary" id="add-intermediate-safe-pose" type="button">Add intermediate safe pose</button></div>
+              <div class="managed-library-list" id="intermediate-safe-pose-list"></div>
+            </fieldset>
             <div class="inline-actions">
               <button class="button secondary" id="rebuild-motion-scripts" type="button">Rebuild generated scripts</button>
               <span class="field-help" id="motion-program-file-status">Saves these settings, writes local .script files, then synchronizes the same files to the robot.</span>
             </div>
             <div class="managed-library-list" id="generated-motion-program-list"></div>
-            <fieldset class="location-fieldset">
-              <legend>Travel waypoints</legend>
-              <div class="waypoint-add-row">
-                <input id="motion-waypoint-name" maxlength="80" placeholder="Name">
-                <input id="motion-waypoint-x" type="number" step="any" data-round-to-decimals="3" placeholder="X mm">
-                <input id="motion-waypoint-y" type="number" step="any" data-round-to-decimals="3" placeholder="Y mm">
-                <input id="motion-waypoint-z" type="number" step="any" data-round-to-decimals="3" placeholder="Z mm">
-                <input id="motion-waypoint-rx" type="number" step="any" data-round-to-decimals="3" placeholder="Rx rad">
-                <input id="motion-waypoint-ry" type="number" step="any" data-round-to-decimals="3" placeholder="Ry rad">
-                <input id="motion-waypoint-rz" type="number" step="any" data-round-to-decimals="3" placeholder="Rz rad">
-                <button class="button secondary" id="add-motion-waypoint" type="button">Add waypoint</button>
-              </div>
-              <div class="managed-library-list" id="motion-waypoint-list"></div>
-            </fieldset>
-            <p class="field-help">Pool pick and place scripts use the Y approach clearance. Mill load and unload scripts use the dedicated X approach clearance. All X/Y/Z values are millimeters in the robot base frame; Rx/Ry/Rz define the pallet tool orientation in radians. The application manages Busy, Success, and Fault state using live TCP-motion telemetry; no robot I/O channels are reserved for those flags.</p>
+            <p class="field-help">The shared safe pose and intermediate safe poses are explicit J0-J5 joint configurations. Capture them from physically verified robot postures; generated scripts use joint-space <code>movej</code> transitions and never infer an arm configuration from Cartesian coordinates. Pool pick and place scripts use the Y approach clearance. Mill load and unload scripts use the dedicated X approach clearance. The pallet and mill entry poses remain Cartesian for controlled linear moves near fixtures.</p>
           </div>
         </section>
 
@@ -468,6 +529,19 @@
         <div class="relaunch-status hidden" id="relaunch-status" role="status" aria-live="polite"></div>
       </form>
     </main>
+    <div class="modal-shell hidden" id="pose-capture-modal" role="dialog" aria-modal="true" aria-labelledby="pose-capture-title">
+      <div class="dialog-card">
+        <div class="dialog-header">
+          <p class="eyebrow">Overwrite taught pose</p>
+          <h2 id="pose-capture-title">Replace this pose with the current robot position?</h2>
+        </div>
+        <p id="pose-capture-message">This will replace the values currently shown for the selected pose. It does not save the new values until you press Save settings.</p>
+        <div class="dialog-actions">
+          <button class="button ghost" id="pose-capture-cancel" type="button">Keep current values</button>
+          <button class="button danger" id="pose-capture-confirm" type="button">Capture and replace</button>
+        </div>
+      </div>
+    </div>
     <div class="modal-shell hidden" id="unsaved-modal" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
       <div class="dialog-card">
         <div class="dialog-header">

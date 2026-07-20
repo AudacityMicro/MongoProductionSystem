@@ -7,6 +7,17 @@ const ui = {
   source: document.querySelector("#debug-source"),
   machineState: document.querySelector("#debug-machine-state"),
   timestamp: document.querySelector("#debug-timestamp"),
+  retryMongoConnection: document.querySelector("#retry-mongo-connection"),
+  clearMongoFault: document.querySelector("#clear-mongo-fault"),
+  networkTest: document.querySelector("#run-network-test"),
+  networkTestResult: document.querySelector("#network-test-result"),
+  diagnosticEventList: document.querySelector("#diagnostic-event-list"),
+  supervisorStatusGrid: document.querySelector("#robot-supervisor-status-grid"),
+  supervisorDetail: document.querySelector("#robot-supervisor-detail"),
+  supervisorCommandRows: document.querySelector("#robot-supervisor-command-rows"),
+  supervisorBootstrap: document.querySelector("#debug-supervisor-bootstrap"),
+  supervisorMaintenance: document.querySelector("#debug-supervisor-maintenance"),
+  supervisorClearLatch: document.querySelector("#debug-supervisor-clear-latch"),
   summaryMachinePallet: document.querySelector("#summary-machine-pallet"),
   summaryQueueCount: document.querySelector("#summary-queue-count"),
   summaryPoolCount: document.querySelector("#summary-pool-count"),
@@ -32,6 +43,10 @@ const ui = {
   millMotionLoad: document.querySelector("#debug-load-mill"),
   millMotionUnload: document.querySelector("#debug-unload-mill"),
   millMotionStatus: document.querySelector("#debug-mill-motion-status"),
+  reliabilityStart: document.querySelector("#start-reliability-test"),
+  reliabilityCancel: document.querySelector("#cancel-reliability-test"),
+  reliabilityStatus: document.querySelector("#reliability-test-status"),
+  reliabilityQueue: document.querySelector("#reliability-test-queue"),
   programDialog: document.querySelector("#program-button-dialog"),
   programForm: document.querySelector("#program-button-form"),
   programName: document.querySelector("#program-button-name"),
@@ -68,6 +83,71 @@ const ui = {
   cncAnalogOutputs: document.querySelector("#cnc-analog-outputs"),
 };
 
+let supervisorState = null;
+
+function organizeDebuggingPage() {
+  const grid = document.querySelector("#debug-robot .debug-grid");
+  const articles = new Map([...grid.querySelectorAll(":scope > .debug-section")].map(article => [article.querySelector("h2")?.textContent.trim(), article]));
+  const groups = [
+    {
+      eyebrow: "Robot operations",
+      title: "Manual test controls",
+      description: "Run controller programs and test pallet transfers.",
+      panels: ["Program run buttons", "Pick or place a pool pallet", "Load or unload the mill", "Queue reliability test"],
+      wide: ["Program run buttons"],
+    },
+    {
+      eyebrow: "Controller I/O",
+      title: "Signals and field values",
+      description: "Digital faceplate plus raw analog channels.",
+      panels: ["Digital I/O faceplate", "Analog and I/O values", "Analog outputs"],
+      wide: ["Digital I/O faceplate"],
+    },
+    {
+      eyebrow: "Motion telemetry",
+      title: "Robot position and runtime",
+      description: "TCP, joint, state, and additional realtime values.",
+      panels: ["TCP pose, speed, and force", "Joint positions, velocities, and current", "Robot state", "Pose and joints", "Additional actual values"],
+      wide: ["TCP pose, speed, and force", "Joint positions, velocities, and current"],
+    },
+  ];
+  groups.forEach(group => {
+    const section = document.createElement("section");
+    section.className = "debug-subgroup";
+    section.innerHTML = `<header class="debug-subgroup-heading"><div><p>${group.eyebrow}</p><h3>${group.title}</h3></div><span>${group.description}</span></header><div class="debug-subgroup-grid"></div>`;
+    const container = section.querySelector(".debug-subgroup-grid");
+    group.panels.forEach(title => {
+      const article = articles.get(title);
+      if (!article) return;
+      article.classList.toggle("debug-section-wide", group.wide.includes(title));
+      container.append(article);
+    });
+    grid.append(section);
+  });
+
+  const cnc = document.querySelector(".cnc-debug-section");
+  [...cnc.querySelectorAll(":scope > .cnc-subsection-heading")].forEach((heading, index) => {
+    const title = heading.querySelector("h3")?.textContent.trim() || "Details";
+    const details = document.createElement("details");
+    details.className = "debug-disclosure";
+    details.open = index < 2;
+    const summary = document.createElement("summary");
+    summary.className = "cnc-subsection-heading";
+    while (heading.firstChild) summary.append(heading.firstChild);
+    heading.replaceWith(details);
+    details.append(summary);
+    let sibling = details.nextSibling;
+    while (sibling && !sibling.classList?.contains("cnc-subsection-heading")) {
+      const next = sibling.nextSibling;
+      details.append(sibling);
+      sibling = next;
+    }
+    summary.setAttribute("aria-label", `${title} details`);
+  });
+}
+
+organizeDebuggingPage();
+
 let lastError = "";
 let snapshotState = null;
 let editingProgramIndex = null;
@@ -102,7 +182,9 @@ async function loadPalletMotionTestSettings() {
     }).join("");
     const ready = result.settings.pallet_motion_enabled;
     const millPosesReady = Boolean(
-      result.settings.robot_mill_load_unload && result.settings.robot_mill_safe_entry_exit,
+      result.settings.robot_mill_load_unload
+        && result.settings.pallet_motion_generation?.mill_pre_entry_waypoint
+        && result.settings.robot_mill_safe_entry_exit,
     );
     millPalletMotionReady = ready && millPosesReady;
     ui.palletMotionPick.disabled = !ready;
@@ -115,7 +197,7 @@ async function loadPalletMotionTestSettings() {
     ui.millMotionStatus.textContent = !ready
       ? "Enable physical pallet movements in Settings to use this tool."
       : !millPosesReady
-        ? "Configure and save the robot mill load/unload and safe entry/exit poses in Settings first."
+        ? "Configure and save the robot mill load/unload, pre-entry, and safe entry/exit poses in Settings first."
         : "Ready. Rebuild generated scripts after changing either mill robot pose.";
   } catch (error) {
     ui.palletMotionStatus.textContent = `Pallet-motion test unavailable: ${error.message}`;
@@ -129,11 +211,19 @@ async function loadPalletMotionTestSettings() {
 }
 
 function showToast(message, kind = "success") {
-  ui.toast.textContent = message;
+  const dismiss = document.createElement("button");
+  dismiss.className = "toast-dismiss";
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  ui.toast.replaceChildren(document.createTextNode(message), dismiss);
   ui.toast.className = `toast ${kind}`;
   clearTimeout(showToast.timeout);
   showToast.timeout = setTimeout(() => ui.toast.classList.add("hidden"), 4500);
 }
+
+ui.toast.addEventListener("click", event => {
+  if (event.target.closest(".toast-dismiss")) ui.toast.classList.add("hidden");
+});
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -604,10 +694,209 @@ function renderProgramControls(snapshot) {
     : `<p class="debug-table-empty">Enable one or more program buttons in Settings.</p>`;
 }
 
+function renderSupervisorStatus(status) {
+  supervisorState = status;
+  const supervisorMode = status.latched
+    ? "LATCHED"
+    : status.maintenance_mode
+      ? "Maintenance"
+      : !status.activation_verified
+        ? "Awaiting handshake"
+        : status.enabled
+          ? "Enabled"
+          : "Verified / disabled";
+  const fields = [
+    ["Protocol", status.protocol || "Unavailable"],
+    ["Listener", status.listening ? `${status.listen_host}:${status.listen_port}` : "Unavailable"],
+    ["Connection", status.connected ? "Connected" : "Disconnected"],
+    ["Peer", status.peer || "Unavailable"],
+    ["Heartbeat", status.heartbeat_age_seconds == null ? "Unavailable" : `${status.heartbeat_age_seconds}s ago`],
+    ["Telemetry", status.telemetry_age_seconds == null ? "Unavailable" : `${status.telemetry_age_seconds}s ago`],
+    ["App session", status.app_session ?? "Unavailable"],
+    ["Robot session", status.robot_session ?? "Unavailable"],
+    ["Sequence", `${status.robot_last_sequence ?? "?"} / expected ${status.expected_sequence ?? "?"}`],
+    ["Last event", status.robot_last_event ?? "Unavailable"],
+    ["State", supervisorMode],
+  ];
+  ui.supervisorStatusGrid.innerHTML = fields.map(([label, value]) => `
+    <article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>
+  `).join("");
+  ui.supervisorDetail.className = `network-test-result ${status.reconciliation_required ? "error" : status.connected ? "healthy" : "warning"}`;
+  ui.supervisorDetail.textContent = status.reconciliation_required
+    ? "Reconciliation required. Inspect the physical result and recover the pallet motion before clearing the supervisor latch."
+    : status.connected
+      ? `Supervisor handshake is live${status.enabled ? " and commands are enabled" : ", but command routing is not enabled"}.`
+      : (status.last_disconnect_detail || "Mongo has not connected to the backend listener.");
+  const commands = status.commands || [];
+  ui.supervisorCommandRows.innerHTML = commands.length ? commands.map(command => `
+    <tr>
+      <td>${escapeHtml(command.sequence)}</td>
+      <td>${escapeHtml(command.operation)}</td>
+      <td>${escapeHtml(command.transport)}</td>
+      <td>${escapeHtml(command.status)}</td>
+      <td>${escapeHtml(command.fault_detail || command.result_code || "-")}</td>
+    </tr>
+  `).join("") : tableEmpty(5, "No supervisor commands have been dispatched.");
+  ui.supervisorMaintenance.textContent = status.maintenance_mode ? "Exit Maintenance Mode" : "Enter Maintenance Mode";
+  ui.supervisorMaintenance.disabled = !status.activation_verified && !status.maintenance_mode;
+  ui.supervisorClearLatch.disabled = !status.latched && !status.reconciliation_required;
+}
+
+function renderDiagnosticTimeline(snapshot) {
+  const events = [...(snapshot.events || [])].reverse().slice(0, 12);
+  ui.diagnosticEventList.innerHTML = events.length ? events.map(item => `
+    <article class="diagnostic-event severity-${escapeHtml(item.severity)}">
+      <span>${escapeHtml(new Date(item.timestamp).toLocaleTimeString())}</span>
+      <strong>${escapeHtml(item.component)} / ${escapeHtml(item.event)}</strong>
+      <p>${escapeHtml(item.message)}</p>
+      ${item.correlation_id ? `<code>${escapeHtml(item.correlation_id)}</code>` : ""}
+    </article>
+  `).join("") : `<p class="debug-table-empty">No diagnostic events have been recorded.</p>`;
+}
+
+async function loadDiagnostics() {
+  try {
+    renderDiagnosticTimeline(await api("/api/debug/diagnostics?limit=50", {cache: "no-store"}));
+  } catch (error) {
+    ui.diagnosticEventList.textContent = `Diagnostics unavailable: ${error.message}`;
+  }
+}
+
+async function loadSupervisorDebugging() {
+  try {
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor", {cache: "no-store"}));
+  } catch (error) {
+    ui.supervisorDetail.className = "network-test-result error";
+    ui.supervisorDetail.textContent = error.message;
+  }
+}
+
+function renderReliabilityTest(result) {
+  const active = result.active;
+  const run = active || result.latest;
+  ui.reliabilityStart.disabled = Boolean(active);
+  ui.reliabilityCancel.disabled = !active || active.cancel_requested;
+  if (!run) {
+    ui.reliabilityStatus.className = "network-test-result";
+    ui.reliabilityStatus.textContent = "No reliability test has been run. The current production queue will be captured when Start is pressed.";
+    ui.reliabilityQueue.innerHTML = "";
+    return;
+  }
+  const labels = {
+    requested: "Starting",
+    running: "Running",
+    completed: "Completed",
+    cancelled: "Cancelled",
+    faulted: "Faulted",
+    interrupted: "Interrupted",
+  };
+  const current = run.current_pallet_name
+    ? ` Current: ${run.current_pallet_name} from Pool ${String(run.current_pool_slot).padStart(2, "0")}.`
+    : "";
+  const stopping = run.cancel_requested ? " Stop requested; the active pallet will be returned first." : "";
+  ui.reliabilityStatus.className = `network-test-result ${["faulted", "interrupted"].includes(run.status) ? "error" : run.status === "completed" ? "healthy" : "warning"}`;
+  ui.reliabilityStatus.innerHTML = `<strong>${escapeHtml(labels[run.status] || run.status)} · ${run.completed_pallets}/${run.total_pallets} pallets complete</strong><span>${escapeHtml(run.failure_detail || current + stopping || "Queue snapshot captured.")}</span>`;
+  const queue = run.queue_snapshot || [];
+  ui.reliabilityQueue.innerHTML = queue.map((item, index) => {
+    const complete = index < run.completed_pallets;
+    const currentItem = run.current_index === index;
+    return `<article class="reliability-queue-item ${complete ? "complete" : currentItem ? "active" : ""}"><span>${index + 1}</span><strong>${escapeHtml(item.pallet_name)}</strong><small>Pool ${String(item.pool_slot).padStart(2, "0")}</small><em>${complete ? "Returned" : currentItem ? "In progress" : "Pending"}</em></article>`;
+  }).join("");
+}
+
+async function loadReliabilityTest() {
+  try {
+    renderReliabilityTest(await api("/api/debug/reliability-test", {cache: "no-store"}));
+  } catch (error) {
+    ui.reliabilityStatus.className = "network-test-result error";
+    ui.reliabilityStatus.textContent = error.message;
+  }
+}
+
+ui.reliabilityStart.addEventListener("click", async () => {
+  if (!snapshotState) return;
+  if (!window.confirm("Run the current queue as a robot reliability test? Each pallet will be picked, moved only to the outer mill staging waypoint, and returned to the same Pool position. The mill door and Erowa will not be operated.")) return;
+  ui.reliabilityStart.disabled = true;
+  try {
+    renderReliabilityTest(await api("/api/debug/reliability-test", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: snapshotState.revision}),
+    }));
+    showToast("Queue reliability test started.");
+  } catch (error) {
+    showToast(error.message, "error");
+    await loadReliabilityTest();
+  }
+});
+
+ui.reliabilityCancel.addEventListener("click", async () => {
+  ui.reliabilityCancel.disabled = true;
+  try {
+    renderReliabilityTest(await api("/api/debug/reliability-test/cancel", {method: "POST", body: "{}"}));
+    showToast("Stop requested. The test will end after the current pallet is returned.");
+  } catch (error) {
+    showToast(error.message, "error");
+    await loadReliabilityTest();
+  }
+});
+
+ui.supervisorBootstrap.addEventListener("click", async () => {
+  ui.supervisorBootstrap.disabled = true;
+  ui.supervisorBootstrap.textContent = "Waiting for Mongo...";
+  try {
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor/bootstrap", {method: "POST", body: "{}"}));
+    showToast("No-motion supervisor handshake verified.");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.supervisorBootstrap.disabled = false;
+    ui.supervisorBootstrap.textContent = "No-motion bootstrap";
+  }
+});
+
+ui.supervisorMaintenance.addEventListener("click", async () => {
+  if (!supervisorState) return;
+  const enabling = !supervisorState.maintenance_mode;
+  if (enabling && !window.confirm("Enter Maintenance Mode? Scheduled supervisor commands will be unavailable until the supervisor is restarted and re-handshakes.")) return;
+  ui.supervisorMaintenance.disabled = true;
+  try {
+    const board = await api("/api/board", {cache: "no-store"});
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor/maintenance", {
+      method: "PUT",
+      body: JSON.stringify({expected_revision: board.revision, enabled: enabling}),
+    }));
+    showToast(enabling ? "Supervisor stopped for Maintenance Mode." : "Supervisor restarted and reconnected.");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    await loadSupervisorDebugging();
+  }
+});
+
+ui.supervisorClearLatch.addEventListener("click", async () => {
+  if (!supervisorState) return;
+  const candidate = (supervisorState.commands || []).find(command => ["latched", "uncertain", "operator_completed", "operator_faulted"].includes(command.status));
+  if (!candidate) return showToast("No ledger command is available to reconcile.", "error");
+  if (!window.confirm(`Clear the Mongo supervisor latch for sequence ${candidate.sequence}? Reconcile the physical pallet-motion fault first.`)) return;
+  try {
+    const board = await api("/api/board", {cache: "no-store"});
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor/reconcile", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, sequence: candidate.sequence, resolution: "clear_latch"}),
+    }));
+    showToast("Supervisor latch cleared after operator reconciliation.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+});
+
 function render(snapshot) {
   snapshotState = snapshot;
   ui.notes.textContent = snapshot.notes;
-  ui.connectionLight.className = `debug-connection-light ${snapshot.connected ? "active" : "unknown"}`;
+  const connectionClass = snapshot.connection_state === "degraded"
+    ? "degraded"
+    : (snapshot.connected ? "active" : "unknown");
+  ui.connectionLight.className = `debug-connection-light ${connectionClass}`;
   ui.connectionLabel.textContent = snapshot.connection_label || (snapshot.connected ? "Connected" : "Unavailable");
   ui.source.textContent = snapshot.source;
   ui.machineState.textContent = snapshot.machine_state;
@@ -661,6 +950,7 @@ async function loadDebugging() {
     const snapshot = await api("/api/debug/robot-io");
     lastError = "";
     render(snapshot);
+    if (!snapshot.connected && snapshot.connection_state !== "degraded") void loadNetworkTestStatus();
   } catch (error) {
     ui.state.lastChild.textContent = " Unavailable";
     if (error.message !== lastError) {
@@ -669,6 +959,92 @@ async function loadDebugging() {
     }
   }
 }
+
+ui.retryMongoConnection.addEventListener("click", async () => {
+  ui.retryMongoConnection.disabled = true;
+  ui.retryMongoConnection.textContent = "Retrying...";
+  try {
+    const result = await api("/api/debug/robot-io/retry", {method: "POST", body: "{}"});
+    showToast(result.message);
+    await new Promise(resolve => window.setTimeout(resolve, 300));
+    await loadDebugging();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.retryMongoConnection.disabled = false;
+    ui.retryMongoConnection.textContent = "Retry Mongo connection";
+  }
+});
+
+ui.clearMongoFault.addEventListener("click", async () => {
+  if (!snapshotState) {
+    showToast("Robot status is not loaded yet.", "error");
+    return;
+  }
+  const confirmed = window.confirm(
+    "Inspect the cell and identify the cause before clearing the fault. This will not release an E-stop, power the arm, resume a program, or move the robot. Continue?",
+  );
+  if (!confirmed) return;
+  ui.clearMongoFault.disabled = true;
+  ui.clearMongoFault.textContent = "Clearing...";
+  try {
+    const result = await api("/api/debug/robot-fault/clear", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: snapshotState.revision, confirmed: true}),
+    });
+    showToast(result.message);
+    await loadDebugging();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.clearMongoFault.disabled = false;
+    ui.clearMongoFault.textContent = "Clear robot fault/error";
+  }
+});
+
+function renderNetworkTest(result) {
+  const times = result.transit_times_ms.length
+    ? result.transit_times_ms.map(value => `${value} ms`).join(", ")
+    : "No replies";
+  ui.networkTestResult.className = `network-test-result ${result.packet_loss_percent > 0 ? "warning" : "healthy"}`;
+  ui.networkTestResult.innerHTML = `<strong>${result.sent} sent / ${result.received} received / ${result.packet_loss_percent}% loss</strong><span>Latency: ${result.minimum_ms ?? "-"} / ${result.average_ms ?? "-"} / ${result.maximum_ms ?? "-"} ms (min / avg / max)</span><small>Reply times: ${escapeHtml(times)}</small>`;
+}
+
+async function loadNetworkTestStatus() {
+  try {
+    const status = await api("/api/debug/network-test");
+    if (status.active) {
+      ui.networkTestResult.className = "network-test-result";
+      ui.networkTestResult.textContent = "Automatic network test running after robot telemetry loss. This can take up to 20 seconds.";
+      return;
+    }
+    if (!status.latest) return;
+    if (status.latest.result) {
+      renderNetworkTest(status.latest.result);
+      return;
+    }
+    ui.networkTestResult.className = "network-test-result error";
+    ui.networkTestResult.textContent = status.latest.error || "Network test did not return a result.";
+  } catch {
+    // The robot diagnostic remains usable if this optional status request fails.
+  }
+}
+
+ui.networkTest.addEventListener("click", async () => {
+  ui.networkTest.disabled = true;
+  ui.networkTest.textContent = "Testing network...";
+  ui.networkTestResult.className = "network-test-result";
+  ui.networkTestResult.textContent = "Sending 20 packets to 8.8.8.8. This can take up to 20 seconds when packets are timing out.";
+  try {
+    renderNetworkTest(await api("/api/debug/network-test", {method: "POST", body: "{}"}));
+  } catch (error) {
+    ui.networkTestResult.className = "network-test-result error";
+    ui.networkTestResult.textContent = error.message;
+  } finally {
+    ui.networkTest.disabled = false;
+    ui.networkTest.textContent = "Run 20-packet test";
+  }
+});
 
 async function loadCncDebugging() {
   try {
@@ -912,10 +1288,37 @@ ui.millProgramForm.addEventListener("submit", async event => {
   }
 });
 
-loadDebugging();
-loadCncDebugging();
 loadCncIoLabels();
 loadRobotProgramsNav();
 loadPalletMotionTestSettings();
-window.setInterval(loadDebugging, 2000);
-window.setInterval(loadCncDebugging, 2000);
+
+async function pollRobotDebugging() {
+  if (!document.hidden) await Promise.all([loadDebugging(), loadReliabilityTest()]);
+  window.setTimeout(pollRobotDebugging, 2000);
+}
+
+async function pollCncDebugging() {
+  if (!document.hidden) await loadCncDebugging();
+  window.setTimeout(pollCncDebugging, 5000);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  loadDebugging();
+  loadCncDebugging();
+});
+
+pollRobotDebugging();
+async function pollSupervisorDebugging() {
+  if (!document.hidden) await loadSupervisorDebugging();
+  window.setTimeout(pollSupervisorDebugging, 2000);
+}
+
+async function pollDiagnostics() {
+  if (!document.hidden) await loadDiagnostics();
+  window.setTimeout(pollDiagnostics, 10000);
+}
+
+pollSupervisorDebugging();
+pollDiagnostics();
+pollCncDebugging();

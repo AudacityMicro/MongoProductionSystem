@@ -12,7 +12,8 @@ let pointerSelection = null;
 
 async function api(url, options = {}) { const response = await fetch(url, options); const data = await response.json().catch(() => ({})); if (!response.ok) { const detail = data.detail; const error = new Error(typeof detail === "string" ? detail : detail?.message || `Request failed with status ${response.status}`); error.status = response.status; error.detail = detail; throw error; } return data; }
 async function syncProgramManagerNav() { try { const result = await api("/api/settings"); document.querySelectorAll("[data-mill-programs-nav]").forEach(link => link.classList.toggle("hidden", !result.settings.mill_programs_page_enabled)); } catch { /* Keep unavailable links hidden. */ } }
-function toast(message, kind = "success") { ui.toast.textContent = message; ui.toast.className = `toast ${kind}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => ui.toast.classList.add("hidden"), 4500); }
+function toast(message, kind = "success") { const dismiss = document.createElement("button"); dismiss.className = "toast-dismiss"; dismiss.type = "button"; dismiss.textContent = "Dismiss"; ui.toast.replaceChildren(document.createTextNode(message), dismiss); ui.toast.className = `toast ${kind}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => ui.toast.classList.add("hidden"), 4500); }
+ui.toast.addEventListener("click", event => { if (event.target.closest(".toast-dismiss")) ui.toast.classList.add("hidden"); });
 function escapeHtml(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
 function selectedEntries() { return listing?.entries.filter(entry => selectedPaths.has(entry.path)) || []; }
 function selectedEntry() { return selectedEntries().length === 1 ? selectedEntries()[0] : null; }

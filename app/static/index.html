@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260715-4">
-    <script src="/static/app.js?v=20260716-1" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260720-12">
+    <script src="/static/app.js?v=20260720-30" defer></script>
   </head>
   <body class="schedule-page">
     <header class="topbar">
@@ -37,10 +37,6 @@
         </div>
         <div class="toolbar">
           <div class="run-mode-controls">
-            <label>
-              <input id="run-safety-confirm" type="checkbox" checked>
-              <span>Confirm every run step</span>
-            </label>
             <button class="button run-mode-button" id="run-mode-toggle" type="button">Start run mode</button>
           </div>
           <button class="button secondary" id="autoschedule-queue" type="button">Optimize by tools</button>
@@ -48,9 +44,18 @@
         </div>
       </section>
 
-      <div class="notice hidden" id="program-warning" role="status"></div>
+      <div class="notice dismissible-notice hidden" id="program-warning" role="status">
+        <span id="program-warning-message"></span>
+        <button class="notice-dismiss" id="dismiss-program-warning" type="button">Dismiss</button>
+      </div>
       <section class="run-mode-status" id="run-mode-status" aria-live="polite"></section>
-      <section class="robot-motion-status hidden" id="robot-motion-status" aria-live="polite"></section>
+      <section class="robot-motion-status hidden" id="robot-motion-status" aria-live="polite">
+        <div id="robot-motion-summary"></div>
+        <div class="status-actions">
+          <button class="button danger hidden" type="button" id="recover-robot-motion">Recover</button>
+          <button class="notice-dismiss" id="dismiss-robot-motion" type="button">Dismiss</button>
+        </div>
+      </section>
 
       <div class="board-layout">
         <div class="operations-rail">
@@ -189,12 +194,13 @@
         <div class="program-picker">
           <label>
             Assigned program
-            <input id="pallet-program" list="program-options" placeholder="No program assigned" autocomplete="off">
-            <datalist id="program-options"></datalist>
+            <select id="pallet-program">
+              <option value="">No program assigned</option>
+            </select>
           </label>
           <button class="button secondary" type="button" id="refresh-programs">Refresh programs</button>
         </div>
-        <p class="field-help">Programs are read from the folder configured in Settings.</p>
+        <p class="field-help" id="pallet-program-help">Programs are read only from the configured Gcode folder.</p>
         <div class="dialog-actions">
           <button class="button ghost" type="button" data-close-pallet>Cancel</button>
           <button class="button primary" id="save-pallet" type="submit">Save pallet</button>
@@ -232,8 +238,8 @@
           <select id="mill-putaway-slot"></select>
         </label>
         <div class="dialog-actions">
-          <button class="button ghost" value="cancel">Cancel</button>
-          <button class="button" value="confirm">Unload and put away</button>
+          <button class="button ghost" id="cancel-mill-putaway" type="button">Cancel</button>
+          <button class="button" type="submit">Unload and put away</button>
         </div>
       </form>
     </dialog>
@@ -260,7 +266,7 @@
         <div class="dialog-heading"><div><p class="eyebrow">Movement fault</p><h2>Reconcile pallet location</h2></div></div>
         <p id="motion-recovery-message"></p>
         <label>Observed pallet location<select id="motion-recovery-resolution"></select></label>
-        <div class="dialog-actions"><button class="button ghost" value="cancel">Cancel</button><button class="button danger" type="submit">Save recovery</button></div>
+        <div class="dialog-actions"><button class="button ghost" id="cancel-motion-recovery" type="button">Cancel</button><button class="button danger" id="save-motion-recovery" type="submit">Save recovery</button></div>
       </form>
     </dialog>
 

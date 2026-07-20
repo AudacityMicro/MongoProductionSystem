@@ -181,6 +181,23 @@ class PoolMotionProgram(BaseModel):
         return value.strip()
 
 
+class RobotJointWaypoint(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    joints_rad: list[float] = Field(min_length=6, max_length=6)
+
+    @field_validator("name")
+    @classmethod
+    def strip_joint_waypoint_name(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("joints_rad")
+    @classmethod
+    def finite_joint_positions(cls, value: list[float]) -> list[float]:
+        if not all(math.isfinite(joint) for joint in value):
+            raise ValueError("Joint waypoint values must be finite numbers.")
+        return [_round_three_decimals(joint) for joint in value]
+
+
 class RobotWaypoint(CartesianLocation):
     name: str = Field(min_length=1, max_length=80)
     rx_rad: float = 0
@@ -200,10 +217,24 @@ class RobotWaypoint(CartesianLocation):
         return _round_three_decimals(value)
 
 
+class IntermediateSafePose(RobotJointWaypoint):
+    pool_slots: list[int] = Field(default_factory=list, max_length=256)
+
+    @field_validator("pool_slots")
+    @classmethod
+    def unique_pool_slots(cls, value: list[int]) -> list[int]:
+        if any(slot < 1 or slot > 256 for slot in value):
+            raise ValueError("Intermediate safe-pose pool assignments must be between 1 and 256.")
+        if len(value) != len(set(value)):
+            raise ValueError("Intermediate safe-pose pool assignments must be unique.")
+        return sorted(value)
+
+
 class PalletMotionGeneration(BaseModel):
     approach_y_clearance_mm: float = Field(default=100, ge=-1000, le=1000)
     mill_approach_x_clearance_mm: float = Field(default=100, ge=0, le=1000)
     lift_z_clearance_mm: float = Field(default=100, gt=0, le=1000)
+    mill_lift_z_clearance_mm: float = Field(default=100, gt=0, le=1000)
     max_travel_speed_rad_s: float = Field(default=0.6, gt=0, le=3.0)
     pickup_setdown_speed_m_s: float = Field(default=0.08, gt=0, le=1.0)
     rx_rad: float = 0
@@ -216,9 +247,10 @@ class PalletMotionGeneration(BaseModel):
     erowa_unlock_action: RobotOutputAction | None = None
     erowa_lock_action: RobotOutputAction | None = None
     mill_actuation_wait_seconds: float = Field(default=2.0, ge=0, le=30)
-    safe_pre_waypoint: RobotWaypoint | None = None
-    safe_post_waypoint: RobotWaypoint | None = None
-    travel_waypoints: list[RobotWaypoint] = Field(default_factory=list, max_length=24)
+    mill_pre_entry_waypoint: RobotWaypoint | None = None
+    safe_pre_waypoint: RobotJointWaypoint | None = None
+    safe_post_waypoint: RobotJointWaypoint | None = None
+    intermediate_safe_poses: list[IntermediateSafePose] = Field(default_factory=list, max_length=24)
 
     @field_validator("rx_rad", "ry_rad", "rz_rad")
     @classmethod
@@ -246,8 +278,12 @@ class RecoverPalletMotion(RevisionRequest):
     resolution: Literal["source_pool", "robot_held", "destination_pool", "machine"]
 
 
+class ClearRobotFault(RevisionRequest):
+    confirmed: bool
+
+
 class StartRunMode(RevisionRequest):
-    safety_confirm: bool = True
+    safety_confirm: bool | None = None
 
 
 class SetRunModeSafety(RevisionRequest):
@@ -260,12 +296,13 @@ class ConfirmRunModeAction(RevisionRequest):
 
 
 class SettingsUpdate(RevisionRequest):
-    source_folder: str = Field(max_length=1000)
-    program_extensions: list[str] = Field(min_length=1)
-    weight_unit: WeightUnit
-    pool_slot_count: int = Field(ge=1, le=256)
+    source_folder: str | None = Field(default=None, max_length=1000)
+    program_extensions: list[str] | None = Field(default=None, min_length=1)
+    weight_unit: WeightUnit | None = None
+    pool_slot_count: int | None = Field(default=None, ge=1, le=256)
     on_deck_enabled: bool | None = None
     dripping_enabled: bool | None = None
+    run_mode_safety_confirm: bool | None = None
     pool_locations: list[PoolLocation] | None = None
     on_deck_location: CartesianLocation | None = None
     dripping_location: CartesianLocation | None = None
@@ -274,15 +311,23 @@ class SettingsUpdate(RevisionRequest):
     mill_load_unload_g53: MillG53Location | None = None
     # Compatibility for the prior millimeter-based field while cached clients expire.
     mill_pallet_change_g53: CartesianLocation | None = None
-    debug_menu_enabled: bool = False
+    debug_menu_enabled: bool | None = None
     # Older cached Settings pages did not send this field. Keep it optional so
     # those pages cannot silently re-lock an operator's saved I/O permission.
     manual_io_control_enabled: bool | None = None
-    robot_connection_mode: RobotConnectionMode = "simulated"
-    robot_host: str = Field(default="", max_length=255)
-    robot_port: int = Field(default=30004, ge=1, le=65535)
-    robot_poll_hz: int = Field(default=10, ge=1, le=125)
-    robot_timeout_seconds: float = Field(default=1.0, gt=0, le=10)
+    robot_connection_mode: RobotConnectionMode | None = None
+    robot_host: str | None = Field(default=None, max_length=255)
+    robot_port: int | None = Field(default=None, ge=1, le=65535)
+    robot_poll_hz: int | None = Field(default=None, ge=1, le=125)
+    robot_timeout_seconds: float | None = Field(default=None, gt=0, le=10)
+    robot_supervisor_enabled: bool | None = None
+    robot_supervisor_hostname: str | None = Field(default=None, max_length=255)
+    robot_supervisor_listen_host: str | None = Field(default=None, max_length=255)
+    robot_supervisor_port: int | None = Field(default=None, ge=1, le=65535)
+    robot_supervisor_heartbeat_seconds: float | None = Field(default=None, ge=0.25, le=10)
+    robot_supervisor_telemetry_hz: float | None = Field(default=None, ge=0.25, le=10)
+    robot_supervisor_reconnect_limit_seconds: float | None = Field(default=None, ge=1, le=60)
+    robot_supervisor_pre_dispatch_fallback: bool | None = None
     debug_program_button_count: int | None = Field(default=None, ge=1, le=16)
     debug_mill_program_button_count: int | None = Field(default=None, ge=1, le=16)
     robot_file_access_enabled: bool | None = None
@@ -313,13 +358,19 @@ class SettingsUpdate(RevisionRequest):
     mill_programs_page_enabled: bool | None = None
     mill_programs_filter_enabled: bool | None = None
     mill_editor_command: str | None = Field(default=None, max_length=500)
+    mill_results_archiving_enabled: bool | None = None
+    mill_results_source_path: str | None = Field(default=None, max_length=500)
+    mill_results_archive_directory: str | None = Field(default=None, max_length=500)
 
-    @field_validator("robot_host")
+    @field_validator("robot_host", "robot_supervisor_hostname", "robot_supervisor_listen_host")
     @classmethod
-    def strip_robot_host(cls, value: str) -> str:
-        return value.strip()
+    def strip_robot_host(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
-    @field_validator("robot_file_host", "robot_file_username", "robot_file_directory", "cnc_host", "cnc_ssh_username", "mill_file_directory")
+    @field_validator(
+        "robot_file_host", "robot_file_username", "robot_file_directory", "cnc_host", "cnc_ssh_username",
+        "mill_file_directory", "mill_results_source_path", "mill_results_archive_directory",
+    )
     @classmethod
     def strip_robot_file_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
@@ -352,6 +403,15 @@ class SettingsUpdate(RevisionRequest):
                 seen.add(key)
                 names.append(name)
         return names
+
+
+class SupervisorReconcile(RevisionRequest):
+    sequence: int = Field(ge=1)
+    resolution: Literal["accept_completed", "mark_faulted", "clear_latch"]
+
+
+class SupervisorMaintenance(RevisionRequest):
+    enabled: bool
 
 
 

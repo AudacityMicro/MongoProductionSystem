@@ -8,10 +8,11 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,7 @@ from app.database import (
 )
 from app.schemas import (
     CreatePallet,
+    ClearRobotFault,
     CncTelemetryConnectionTest,
     MovePallet,
     RecoverPalletMotion,
@@ -39,6 +41,8 @@ from app.schemas import (
     StartRunMode,
     StartMillPalletTransfer,
     StartPalletMotion,
+    SupervisorMaintenance,
+    SupervisorReconcile,
     ToggleDebugIo,
     RunDebugProgram,
     RunDebugMillProgram,
@@ -47,6 +51,7 @@ from app.schemas import (
     UpdatePallet,
 )
 from app.service import (
+    get_settings,
     board_snapshot,
     autoschedule_queue_preview,
     cnc_debug_snapshot,
@@ -68,7 +73,11 @@ from app.service import (
     rename_debug_io,
     reorder_queue,
     current_robot_pose,
+    network_diagnostic,
+    network_diagnostic_status,
     robot_io_snapshot,
+    retry_robot_telemetry,
+    clear_robot_controller_fault,
     robot_file_manager_settings,
     robot_programs_page_settings,
     mill_file_manager_settings,
@@ -76,8 +85,10 @@ from app.service import (
     robot_program_files,
     remove_fusion_tool_library,
     run_debug_program,
+    restore_supervisor_after_arbitrary_program,
     run_debug_mill_program,
     mill_program_files,
+    pallet_program_files,
     run_debug_mill_pallet_motion,
     run_debug_pallet_motion,
     simulate_signal,
@@ -87,16 +98,33 @@ from app.service import (
     start_pallet_motion,
     start_mill_pallet_transfer,
     recover_pallet_motion,
+    assert_robot_file_mutation_ready,
+    assert_system_relaunch_ready,
     interrupt_active_pallet_motion,
+    interrupt_robot_reliability_test,
     interrupt_run_mode,
     execute_run_mode,
     start_run_mode,
     stop_run_mode,
     set_run_mode_safety,
     confirm_run_mode_action,
+    dismiss_run_mode_alert,
+    clear_stale_run_mode_status,
     rebuild_pallet_motion_scripts,
     rebuild_mill_load_position_program,
+    bootstrap_robot_supervisor,
+    reconcile_robot_supervisor,
+    robot_supervisor_status,
+    set_robot_supervisor_maintenance,
+    start_robot_supervisor_listener,
+    stop_robot_supervisor_listener,
+    diagnostic_snapshot,
+    robot_reliability_status,
+    start_robot_reliability_test,
+    cancel_robot_reliability_test,
+    execute_robot_reliability_test,
 )
+from app.diagnostics import diagnostics
 from app.robot_files import (
     RobotFileAccessError,
     RobotFileConflict,
@@ -111,6 +139,8 @@ from app.robot_files import (
     upload_robot_file,
 )
 from app.settings import settings
+from app.cnc_linuxcnc import resume_cnc_connections, suspend_cnc_connections
+from app.robot_rtde import resume_robot_connections, suspend_robot_connections
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -136,6 +166,24 @@ def queue_backend_relaunch() -> None:
     )
 
 
+def queue_supervisor_firewall_setup(port: int) -> None:
+    helper = PROJECT_ROOT / "install_supervisor_firewall.ps1"
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+            "-Port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+
+
 def resolve_editor_command(command: str) -> list[str]:
     parts = shlex.split(command, posix=False)
     if not parts:
@@ -154,15 +202,36 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        resume_cnc_connections()
+        resume_robot_connections()
         run_migrations(url)
         engine = create_database_engine(url)
         application.state.engine = engine
         application.state.session_factory = create_session_factory(engine)
         with application.state.session_factory() as session:
             interrupt_active_pallet_motion(session)
+            interrupt_robot_reliability_test(session)
             interrupt_run_mode(session)
-        yield
-        engine.dispose()
+            start_robot_supervisor_listener(session)
+        diagnostics().record(
+            "application",
+            "started",
+            "Mongo Production System backend started.",
+            details={"process_id": os.getpid(), "version": __version__, "database_url_type": url.split(":", 1)[0]},
+        )
+        try:
+            yield
+        finally:
+            diagnostics().record(
+                "application",
+                "stopping",
+                "Mongo Production System backend is stopping.",
+                details={"process_id": os.getpid()},
+            )
+            stop_robot_supervisor_listener()
+            suspend_cnc_connections()
+            suspend_robot_connections()
+            engine.dispose()
 
     application = FastAPI(
         title="Mongo Production System API",
@@ -172,6 +241,41 @@ def create_app(database_url: str | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @application.middleware("http")
+    async def record_request_diagnostics(request: Request, call_next):
+        started = time.perf_counter()
+        correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            diagnostics().record(
+                "http",
+                "unhandled_exception",
+                "Unhandled API request exception.",
+                severity="error",
+                correlation_id=correlation_id,
+                details={"method": request.method, "path": request.url.path, "error": repr(exc)},
+            )
+            raise
+        duration_ms = round((time.perf_counter() - started) * 1000, 1)
+        if response.status_code >= 400 or duration_ms >= 1000 or request.method not in {"GET", "HEAD", "OPTIONS"}:
+            diagnostics().record(
+                "http",
+                "request_completed",
+                f"{request.method} {request.url.path} completed with status {response.status_code}.",
+                severity="error" if response.status_code >= 500 else "warning" if response.status_code >= 400 or duration_ms >= 1000 else "info",
+                correlation_id=correlation_id,
+                details={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": duration_ms,
+                    "client": request.client.host if request.client else None,
+                },
+            )
+        response.headers["X-Correlation-ID"] = correlation_id
+        return response
 
     @application.middleware("http")
     async def prevent_stale_frontend_assets(request: Request, call_next):
@@ -224,6 +328,16 @@ def create_app(database_url: str | None = None) -> FastAPI:
             "started_at": STARTED_AT,
         }
 
+    @application.post("/api/system/supervisor-firewall", status_code=status.HTTP_202_ACCEPTED)
+    def install_supervisor_firewall(session: Session = Depends(get_session)) -> dict[str, object]:
+        application_settings = get_settings(session)
+        queue_supervisor_firewall_setup(application_settings.robot_supervisor_port)
+        return {
+            "status": "prompted",
+            "port": application_settings.robot_supervisor_port,
+            "message": "Windows administrator approval was requested on the application computer.",
+        }
+
     @application.get("/api/board")
     def get_board(session: Session = Depends(get_session)) -> dict:
         return board_snapshot(session)
@@ -265,6 +379,19 @@ def create_app(database_url: str | None = None) -> FastAPI:
         session: Session = Depends(get_session),
     ) -> dict:
         confirm_run_mode_action(session, payload)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/alert/dismiss")
+    def dismiss_production_run_mode_alert(session: Session = Depends(get_session)) -> dict:
+        dismiss_run_mode_alert(session)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/status/clear")
+    def clear_production_run_mode_status(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        clear_stale_run_mode_status(session, payload.expected_revision)
         return board_snapshot(session)
 
     @application.get("/api/dashboard")
@@ -524,13 +651,111 @@ def create_app(database_url: str | None = None) -> FastAPI:
     ) -> dict:
         return run_debug_mill_pallet_motion(session, payload)
 
+    @application.get("/api/debug/reliability-test")
+    def get_robot_reliability_test(session: Session = Depends(get_session)) -> dict[str, object]:
+        return robot_reliability_status(session)
+
+    @application.post("/api/debug/reliability-test", status_code=status.HTTP_202_ACCEPTED)
+    def start_queue_reliability_test(
+        payload: RevisionRequest,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        run_id = start_robot_reliability_test(session, payload.expected_revision)
+        threading.Thread(
+            target=execute_robot_reliability_test,
+            args=(request.app.state.session_factory, run_id),
+            daemon=True,
+            name=f"robot-reliability-{run_id[:8]}",
+        ).start()
+        return robot_reliability_status(session)
+
+    @application.post("/api/debug/reliability-test/cancel")
+    def cancel_queue_reliability_test(session: Session = Depends(get_session)) -> dict[str, object]:
+        return cancel_robot_reliability_test(session)
+
     @application.get("/api/debug/robot-io")
     def get_robot_io(session: Session = Depends(get_session)) -> dict:
         return robot_io_snapshot(session)
 
+    @application.get("/api/debug/robot-supervisor")
+    def get_robot_supervisor_status(session: Session = Depends(get_session)) -> dict:
+        return robot_supervisor_status(session)
+
+    @application.post("/api/debug/robot-supervisor/bootstrap")
+    def bootstrap_robot_supervisor_connection(session: Session = Depends(get_session)) -> dict:
+        return bootstrap_robot_supervisor(session)
+
+    @application.post("/api/debug/robot-supervisor/reconcile")
+    def reconcile_robot_supervisor_connection(
+        payload: SupervisorReconcile,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return reconcile_robot_supervisor(session, payload)
+
+    @application.put("/api/debug/robot-supervisor/maintenance")
+    def change_robot_supervisor_maintenance(
+        payload: SupervisorMaintenance,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return set_robot_supervisor_maintenance(session, payload)
+
+    @application.post("/api/debug/robot-io/retry")
+    def retry_robot_io(session: Session = Depends(get_session)) -> dict:
+        return retry_robot_telemetry(session)
+
+    @application.post("/api/debug/robot-fault/clear")
+    def clear_robot_fault_error(
+        payload: ClearRobotFault,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return clear_robot_controller_fault(session, payload)
+
     @application.get("/api/debug/robot-pose")
     def get_current_robot_pose(session: Session = Depends(get_session)) -> dict:
         return current_robot_pose(session)
+
+    @application.post("/api/debug/network-test")
+    def run_network_test() -> dict:
+        return network_diagnostic()
+
+    @application.get("/api/debug/network-test")
+    def get_network_test_status() -> dict:
+        return network_diagnostic_status()
+
+    @application.get("/api/debug/diagnostics")
+    def get_diagnostics(
+        limit: int = Query(default=200, ge=1, le=1000),
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        payload = diagnostic_snapshot(session, limit)
+        payload["application"] = {
+            "version": __version__,
+            "process_id": os.getpid(),
+            "started_at": STARTED_AT,
+            "threads": sorted(
+                {thread.name for thread in threading.enumerate() if thread.is_alive()}
+            ),
+        }
+        return payload
+
+    @application.get("/api/debug/diagnostics/export")
+    def export_diagnostics(session: Session = Depends(get_session)) -> Response:
+        payload = diagnostic_snapshot(session, 1000)
+        payload["application"] = {
+            "version": __version__,
+            "process_id": os.getpid(),
+            "started_at": STARTED_AT,
+            "threads": sorted(
+                {thread.name for thread in threading.enumerate() if thread.is_alive()}
+            ),
+        }
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return Response(
+            content=json.dumps(payload, indent=2, ensure_ascii=True),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="mongo-diagnostics-{stamp}.json"'},
+        )
 
     @application.get("/api/debug/cnc")
     def get_cnc_debug(session: Session = Depends(get_session)) -> dict:
@@ -593,6 +818,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def get_debug_mill_program_files(session: Session = Depends(get_session)) -> dict:
         return {"files": mill_program_files(session)}
 
+    @application.get("/api/pallet-programs")
+    def get_pallet_program_files(session: Session = Depends(get_session)) -> dict:
+        return {"files": pallet_program_files(session)}
+
     @application.get("/api/robot-files")
     def get_robot_files(
         path: str | None = Query(default=None, max_length=1000),
@@ -642,6 +871,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         destination_directory: str = Form(default=""),
         session: Session = Depends(get_session),
     ) -> dict:
+        assert_robot_file_mutation_ready(session)
         connection, _ = robot_file_connection(session)
         try:
             path = upload_robot_file(
@@ -661,6 +891,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
         payload: RobotFileAction,
         session: Session = Depends(get_session),
     ) -> dict:
+        if payload.action in {"copy", "move", "rename", "delete", "create_folder"}:
+            assert_robot_file_mutation_ready(session)
         connection, robot_settings = robot_file_connection(session)
         try:
             if payload.action == "copy":
@@ -792,9 +1024,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @application.post("/api/debug/programs/run")
     def run_debug_program_button(
         payload: RunDebugProgram,
+        request: Request,
         session: Session = Depends(get_session),
     ) -> dict:
-        run_debug_program(session, payload)
+        restore_supervisor = run_debug_program(session, payload)
+        if restore_supervisor:
+            threading.Thread(
+                target=restore_supervisor_after_arbitrary_program,
+                args=(request.app.state.session_factory,),
+                daemon=True,
+                name="restore-robot-supervisor",
+            ).start()
         return robot_io_snapshot(session)
 
     @application.post("/api/debug/mill-programs/run")
@@ -806,13 +1046,23 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return cnc_debug_snapshot(session)
 
     @application.post("/api/system/relaunch", status_code=status.HTTP_202_ACCEPTED)
-    def relaunch_system() -> dict[str, str]:
+    def relaunch_system(session: Session = Depends(get_session)) -> dict[str, str]:
+        assert_system_relaunch_ready(session)
         queue_backend_relaunch()
+        suspend_cnc_connections()
+        suspend_robot_connections()
         return {
             "status": "relaunching",
             "message": "Backend relaunch has been queued.",
             "version": __version__,
         }
+
+    @application.post("/api/system/prepare-shutdown")
+    def prepare_system_shutdown(session: Session = Depends(get_session)) -> dict[str, str]:
+        assert_system_relaunch_ready(session)
+        suspend_cnc_connections()
+        suspend_robot_connections()
+        return {"status": "ready", "message": "Controller connections were closed cleanly."}
 
     return application
 

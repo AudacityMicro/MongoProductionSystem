@@ -12,4 +12,6 @@ function render(data) {
   ui.updated.textContent = `Updated ${new Date().toLocaleTimeString()}`; ui.state.classList.add("online"); ui.state.lastChild.textContent = " Online";
 }
 async function load() { try { const response = await fetch("/api/dashboard", {cache: "no-store"}); const data = await response.json(); if (!response.ok) throw new Error(data.detail || "Dashboard unavailable"); render(data); const settings = await (await fetch("/api/settings", {cache: "no-store"})).json(); document.querySelectorAll("[data-robot-programs-nav]").forEach(link => link.classList.toggle("hidden", !settings.settings.robot_programs_page_enabled)); document.querySelectorAll("[data-mill-programs-nav]").forEach(link => link.classList.toggle("hidden", !settings.settings.mill_programs_page_enabled)); } catch (error) { ui.state.lastChild.textContent = " Unavailable"; } }
-load(); window.setInterval(load, 5000);
+async function poll() { if (!document.hidden) await load(); window.setTimeout(poll, 5000); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+poll();

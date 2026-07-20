@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 import math
 import hashlib
+import os
+import random
+import re
+import subprocess
 import time
+from copy import deepcopy
+from threading import Event, RLock, Thread
 from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -15,22 +21,71 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
-from app.models import AppSettings, Pallet, RobotMotion
+from app.diagnostics import diagnostics
+from app.models import AppSettings, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
-from app.cnc_linuxcnc import CncTelemetryError, read_linuxcnc_io_labels, read_linuxcnc_snapshot, run_linuxcnc_program
-from app.robot_dashboard import RobotDashboardError, loaded_robot_program, run_robot_program
-from app.robot_files import RobotFileAccessError, list_robot_program_files, upload_robot_file
+from app.cnc_linuxcnc import (
+    CncTelemetryError,
+    read_linuxcnc_cycle_state,
+    read_linuxcnc_io_labels,
+    read_linuxcnc_snapshot,
+    run_linuxcnc_program,
+)
+from app.robot_dashboard import (
+    RobotDashboardError,
+    clear_robot_fault,
+    robot_dashboard_health,
+    robot_program_running,
+    run_robot_program,
+)
+from app.robot_files import (
+    RobotFileAccessError,
+    copy_remote_file_as,
+    list_robot_program_files,
+    read_robot_file,
+    remote_file_signature,
+    upload_robot_file,
+)
 from app.robot_scripts import (
+    PALLET_MOTION_SCRIPT_REVISION,
     GENERATED_REMOTE_DIRECTORY,
     build_mill_pallet_motion_script,
     build_pallet_motion_script,
+    build_reliability_motion_script,
+    build_robot_supervisor_script,
     generated_script_directory,
     run_robot_script,
     sync_generated_scripts,
+    with_pallet_payload,
+    with_supervisor_sequence,
+)
+from app.robot_supervisor import (
+    EVENT_ACCEPTED,
+    EVENT_COMPLETED,
+    EVENT_FAULTED,
+    EVENT_LATCHED,
+    EVENT_RUNNING,
+    OP_CLEAR_LATCH,
+    OP_ENTER_MAINTENANCE,
+    OP_LOAD_MILL,
+    OP_PICK_POOL,
+    OP_PUT_POOL,
+    OP_RELIABILITY_POOL,
+    OP_SET_CONFIGURABLE_OUTPUT,
+    OP_SET_STANDARD_OUTPUT,
+    OP_SET_TOOL_OUTPUT,
+    OP_UNLOAD_MILL,
+    robot_supervisor,
 )
 from app.pallet_names import PALLET_NAMES
-from app.robot_rtde import RobotTelemetryError, read_robot_snapshot, toggle_robot_digital_output
+from app.robot_rtde import (
+    RobotTelemetryError,
+    read_robot_snapshot,
+    reset_robot_connections,
+    toggle_robot_digital_output,
+)
 from app.schemas import (
+    ClearRobotFault,
     CreatePallet,
     MovePallet,
     QueuePallet,
@@ -75,6 +130,11 @@ def assert_run_mode_inactive(settings: AppSettings) -> None:
         raise problem(409, "Stop run mode before making manual schedule or controller changes.")
 
 
+def assert_pallet_manageable_during_run(settings: AppSettings, pallet: Pallet) -> None:
+    if settings.run_mode_enabled and pallet.location == "machine":
+        raise problem(409, "The pallet in the mill cannot be changed while Run Mode is active.")
+
+
 def normalize_extensions(values: list[str]) -> list[str]:
     normalized: list[str] = []
     for value in values:
@@ -88,7 +148,18 @@ def normalize_extensions(values: list[str]) -> list[str]:
     return normalized
 
 
-def available_programs(settings: AppSettings) -> tuple[list[str], str | None]:
+_PROGRAM_SCAN_CACHE: dict[tuple[str, str], tuple[float, list[str], str | None]] = {}
+_PROGRAM_SCAN_LOCK = RLock()
+_PALLET_PROGRAM_REMOTE_CACHE: dict[tuple[object, ...], tuple[float, list[str]]] = {}
+_PALLET_PROGRAM_REMOTE_LOCK = RLock()
+_NETWORK_TEST_LOCK = RLock()
+_NETWORK_TEST_ACTIVE = False
+_NETWORK_TEST_LAST_AUTOMATIC_START = 0.0
+_NETWORK_TEST_LAST_MANUAL_START = 0.0
+_NETWORK_TEST_LATEST: dict[str, object] | None = None
+
+
+def _scan_available_programs(settings: AppSettings) -> tuple[list[str], str | None]:
     if not settings.source_folder.strip():
         return [], "No program source folder is configured."
     root = Path(settings.source_folder).expanduser()
@@ -99,17 +170,228 @@ def available_programs(settings: AppSettings) -> tuple[list[str], str | None]:
     if not root.is_dir():
         return [], "The configured program source path is not a folder."
 
+    if root.name.casefold() == "gcode":
+        program_root = root
+    else:
+        try:
+            program_root = next(
+                (child for child in root.iterdir() if child.is_dir() and child.name.casefold() == "gcode"),
+                None,
+            )
+        except OSError:
+            return [], "The configured program source folder could not be read completely."
+        if program_root is None:
+            return [], "The configured program source is missing its Gcode subfolder."
+
     extensions = set(json.loads(settings.program_extensions))
     programs: list[str] = []
     try:
-        for path in root.rglob("*"):
+        for path in program_root.rglob("*"):
             if path.is_file() and path.suffix.lower() in extensions:
                 resolved = path.resolve()
-                if resolved.is_relative_to(root):
-                    programs.append(resolved.relative_to(root).as_posix())
+                if resolved.is_relative_to(program_root):
+                    programs.append(resolved.relative_to(program_root).as_posix())
     except OSError:
         return [], "The program source folder could not be read completely."
     return sorted(programs, key=str.casefold), None
+
+
+def available_programs(settings: AppSettings, *, force: bool = False) -> tuple[list[str], str | None]:
+    key = (settings.source_folder.strip(), settings.program_extensions)
+    with _PROGRAM_SCAN_LOCK:
+        cached = _PROGRAM_SCAN_CACHE.get(key)
+        now = time.monotonic()
+        # Network program folders are operator-refreshed. Rescanning an SMB share
+        # from every board poll can freeze scheduling whenever the mill is offline.
+        if not force and cached:
+            return list(cached[1]), cached[2]
+        programs, warning = _scan_available_programs(settings)
+        _PROGRAM_SCAN_CACHE[key] = (now, list(programs), warning)
+        return programs, warning
+
+
+def _run_network_diagnostic() -> dict[str, object]:
+    """Run a fixed public-target ping test from the application host."""
+    target = "8.8.8.8"
+    count = 20
+    command = ["ping", "-n", str(count), "-w", "1000", target] if os.name == "nt" else ["ping", "-c", str(count), "-W", "1", target]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError as exc:
+        raise problem(503, "The server cannot run ping because the system ping utility is unavailable.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise problem(504, "The 20-packet network test timed out before completing.") from exc
+    except OSError as exc:
+        raise problem(503, f"The network test could not start: {exc}") from exc
+
+    output = f"{result.stdout}\n{result.stderr}"
+    values = [float(value.replace(",", ".")) for value in re.findall(r"(?:time|zeit|temps|tiempo)\s*[=<]\s*(\d+(?:[.,]\d+)?)\s*ms", output, flags=re.IGNORECASE)]
+    received_match = re.search(r"received\s*=\s*(\d+)", output, flags=re.IGNORECASE)
+    received = min(count, int(received_match.group(1))) if received_match else min(count, len(values))
+    loss_percent = round((count - received) * 100 / count, 1)
+    transit_times = [round(value, 3) for value in values]
+    return {
+        "target": target,
+        "sent": count,
+        "received": received,
+        "packet_loss_percent": loss_percent,
+        "minimum_ms": min(transit_times) if transit_times else None,
+        "average_ms": round(sum(transit_times) / len(transit_times), 3) if transit_times else None,
+        "maximum_ms": max(transit_times) if transit_times else None,
+        "transit_times_ms": transit_times,
+    }
+
+
+def _finish_network_diagnostic(trigger: str) -> None:
+    global _NETWORK_TEST_ACTIVE, _NETWORK_TEST_LATEST
+    try:
+        result = _run_network_diagnostic()
+        latest: dict[str, object] = {"trigger": trigger, "completed_at": datetime.now(timezone.utc).isoformat(), "result": result}
+    except HTTPException as exc:
+        latest = {"trigger": trigger, "completed_at": datetime.now(timezone.utc).isoformat(), "error": str(exc.detail)}
+    except Exception as exc:  # Keep an automatic diagnostic failure from affecting robot telemetry.
+        latest = {"trigger": trigger, "completed_at": datetime.now(timezone.utc).isoformat(), "error": f"Network test failed: {exc}"}
+    with _NETWORK_TEST_LOCK:
+        _NETWORK_TEST_LATEST = latest
+        _NETWORK_TEST_ACTIVE = False
+    diagnostics().record(
+        "network",
+        "diagnostic_completed",
+        "Network diagnostic completed.",
+        severity="error" if latest.get("error") else "info",
+        details=latest,
+    )
+
+
+def network_diagnostic() -> dict[str, object]:
+    """Run a user-requested network test, limited to one start per 30 seconds."""
+    global _NETWORK_TEST_ACTIVE, _NETWORK_TEST_LAST_MANUAL_START, _NETWORK_TEST_LATEST
+    now = time.monotonic()
+    with _NETWORK_TEST_LOCK:
+        if _NETWORK_TEST_ACTIVE:
+            raise problem(409, "A network test is already running.")
+        remaining = 30 - (now - _NETWORK_TEST_LAST_MANUAL_START)
+        if remaining > 0:
+            raise problem(429, f"Wait {math.ceil(remaining)} seconds before starting another manual network test.")
+        _NETWORK_TEST_ACTIVE = True
+        _NETWORK_TEST_LAST_MANUAL_START = now
+    _finish_network_diagnostic("manual")
+    with _NETWORK_TEST_LOCK:
+        latest = deepcopy(_NETWORK_TEST_LATEST)
+    if latest and isinstance(latest.get("result"), dict):
+        return latest["result"]
+    raise problem(503, str(latest.get("error") if latest else "Network test did not return a result."))
+
+
+def trigger_network_diagnostic_on_robot_loss() -> None:
+    """Start at most one background test every three minutes after live telemetry fails."""
+    global _NETWORK_TEST_ACTIVE, _NETWORK_TEST_LAST_AUTOMATIC_START
+    now = time.monotonic()
+    with _NETWORK_TEST_LOCK:
+        if _NETWORK_TEST_ACTIVE or now - _NETWORK_TEST_LAST_AUTOMATIC_START < 180:
+            return
+        _NETWORK_TEST_ACTIVE = True
+        _NETWORK_TEST_LAST_AUTOMATIC_START = now
+    Thread(target=_finish_network_diagnostic, args=("automatic_robot_disconnect",), daemon=True, name="network-diagnostic").start()
+
+
+def network_diagnostic_status() -> dict[str, object]:
+    with _NETWORK_TEST_LOCK:
+        return {"active": _NETWORK_TEST_ACTIVE, "latest": deepcopy(_NETWORK_TEST_LATEST)}
+
+
+def diagnostic_snapshot(session: Session, limit: int = 200) -> dict[str, object]:
+    """Return a redacted support snapshot without contacting either controller."""
+    settings = get_settings(session)
+    supervisor = robot_supervisor().status()
+    commands = session.scalars(
+        select(RobotSupervisorCommand)
+        .order_by(RobotSupervisorCommand.sequence.desc())
+        .limit(100)
+    ).all()
+    motions = session.scalars(
+        select(RobotMotion)
+        .order_by(RobotMotion.created_at.desc())
+        .limit(100)
+    ).all()
+    reliability_runs = session.scalars(
+        select(RobotReliabilityRun)
+        .order_by(RobotReliabilityRun.created_at.desc())
+        .limit(20)
+    ).all()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "settings_revision": settings.revision,
+        "controller_configuration": {
+            "robot_mode": settings.robot_connection_mode,
+            "robot_host": settings.robot_host,
+            "robot_port": settings.robot_port,
+            "robot_poll_hz": settings.robot_poll_hz,
+            "robot_timeout_seconds": settings.robot_timeout_seconds,
+            "supervisor_enabled": settings.robot_supervisor_enabled,
+            "supervisor_activation_verified": settings.robot_supervisor_activation_verified,
+            "supervisor_hostname": settings.robot_supervisor_hostname,
+            "supervisor_listen_host": settings.robot_supervisor_listen_host,
+            "supervisor_port": settings.robot_supervisor_port,
+            "supervisor_heartbeat_seconds": settings.robot_supervisor_heartbeat_seconds,
+            "supervisor_telemetry_hz": settings.robot_supervisor_telemetry_hz,
+            "cnc_enabled": settings.cnc_telemetry_enabled,
+            "cnc_host": settings.cnc_host,
+            "cnc_ssh_port": settings.cnc_ssh_port,
+            "run_mode_enabled": settings.run_mode_enabled,
+            "run_mode_state": settings.run_mode_state,
+        },
+        "supervisor": supervisor,
+        "network_test": network_diagnostic_status(),
+        "recent_supervisor_commands": [
+            {
+                "id": item.id,
+                "sequence": item.sequence,
+                "robot_session": item.robot_session,
+                "app_session": item.app_session,
+                "motion_id": item.robot_motion_id,
+                "operation": item.operation,
+                "opcode": item.opcode,
+                "argument": item.argument,
+                "transport": item.transport,
+                "status": item.status,
+                "attempted": item.attempted,
+                "created_at": item.created_at,
+                "sent_at": item.sent_at,
+                "accepted_at": item.accepted_at,
+                "started_at": item.started_at,
+                "completed_at": item.completed_at,
+                "result_code": item.result_code,
+                "fault_detail": item.fault_detail,
+            }
+            for item in commands
+        ],
+        "recent_robot_motions": [
+            {
+                "id": item.id,
+                "pallet_id": item.pallet_id,
+                "operation": item.operation,
+                "source_slot": item.source_slot,
+                "destination_slot": item.destination_slot,
+                "status": item.status,
+                "retry_count": item.retry_count,
+                "created_at": item.created_at,
+                "started_at": item.started_at,
+                "completed_at": item.completed_at,
+                "failure_detail": item.failure_detail,
+            }
+            for item in motions
+        ],
+        "recent_reliability_runs": [_reliability_run_item(item) for item in reliability_runs],
+        "events": diagnostics().recent(limit),
+    }
 
 
 def validate_program(program_path: str | None, programs: set[str]) -> str | None:
@@ -117,9 +399,9 @@ def validate_program(program_path: str | None, programs: set[str]) -> str | None
         return None
     normalized = Path(program_path.replace("\\", "/")).as_posix()
     if normalized.startswith("../") or Path(normalized).is_absolute():
-        raise problem(422, "Program path must be relative to the source folder.")
+        raise problem(422, "Program path must be relative to the Gcode folder.")
     if normalized not in programs:
-        raise problem(422, "Selected program is not available in the source folder.")
+        raise problem(422, "Selected program is not available in the Gcode folder.")
     return normalized
 
 
@@ -195,11 +477,20 @@ def pallet_motion_programs(settings: AppSettings) -> list[dict]:
     return [item for item in stored if isinstance(item, dict) and isinstance(item.get("slot"), int)]
 
 
+def _reliability_program(settings: AppSettings, slot: int) -> str:
+    mapping = next((item for item in pallet_motion_programs(settings) if item["slot"] == slot), None)
+    program = mapping.get("reliability_program") if mapping else None
+    if not isinstance(program, str) or not program.strip():
+        raise problem(409, f"Pool {slot:02d} has no generated reliability program. Rebuild generated scripts first.")
+    return program
+
+
 def pallet_motion_generation(settings: AppSettings) -> dict:
     defaults = {
         "approach_y_clearance_mm": 100.0,
         "mill_approach_x_clearance_mm": 100.0,
         "lift_z_clearance_mm": 100.0,
+        "mill_lift_z_clearance_mm": 100.0,
         "max_travel_speed_rad_s": 0.6,
         "pickup_setdown_speed_m_s": 0.08,
         "rx_rad": 0.0,
@@ -212,21 +503,26 @@ def pallet_motion_generation(settings: AppSettings) -> dict:
         "erowa_unlock_action": None,
         "erowa_lock_action": None,
         "mill_actuation_wait_seconds": 2.0,
+        "mill_pre_entry_waypoint": None,
         "safe_pre_waypoint": None,
         "safe_post_waypoint": None,
-        "travel_waypoints": [],
+        "intermediate_safe_poses": [],
     }
     try:
         stored = json.loads(settings.pallet_motion_generation or "{}")
     except json.JSONDecodeError:
         stored = {}
-    return {**defaults, **stored} if isinstance(stored, dict) else defaults
+    if not isinstance(stored, dict):
+        return defaults
+    stored.pop("travel_waypoints", None)
+    return {**defaults, **stored}
 
 
 def _motion_script_signature(settings: AppSettings) -> str:
     """Fingerprint every saved value that changes generated files or their destination."""
     deployment_host = settings.robot_file_host.strip() or settings.robot_host.strip()
     inputs = {
+        "generator_revision": PALLET_MOTION_SCRIPT_REVISION,
         "generation": pallet_motion_generation(settings),
         "locations": pallet_location_positions(settings),
         "stations": {
@@ -237,6 +533,13 @@ def _motion_script_signature(settings: AppSettings) -> str:
             "host": deployment_host,
             "port": settings.robot_file_port,
             "directory": settings.robot_file_directory,
+        },
+        "supervisor": {
+            "hostname": settings.robot_supervisor_hostname,
+            "port": settings.robot_supervisor_port,
+            "heartbeat_seconds": settings.robot_supervisor_heartbeat_seconds,
+            "telemetry_hz": settings.robot_supervisor_telemetry_hz,
+            "reconnect_limit_seconds": settings.robot_supervisor_reconnect_limit_seconds,
         },
     }
     encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -258,7 +561,21 @@ def _motion_program(settings: AppSettings, slot: int, operation: str) -> str:
     path = PurePosixPath(filename)
     if not filename or not path.is_absolute() or ".." in path.parts or path.suffix.lower() not in {".urp", ".script"}:
         raise problem(422, f"Rebuild generated scripts or configure an absolute {operation} robot program for Pool {slot:02d}.")
+    if path.suffix.lower() == ".script" and motion_scripts_need_rebuild(settings):
+        raise problem(409, "Generated pallet scripts do not match the saved safety and transition settings. Rebuild them before commanding a move.")
     return filename
+
+
+def _assert_pool_motion_position_configured(settings: AppSettings, slot: int) -> None:
+    position = next(
+        (item for item in pallet_location_positions(settings)["pool_locations"] if item["slot"] == slot),
+        None,
+    )
+    if position is None:
+        raise problem(422, f"No configured position exists for Pool {slot:02d}.")
+    coordinates = [float(position[axis]) for axis in ("x_mm", "y_mm", "z_mm")]
+    if not all(math.isfinite(value) for value in coordinates) or all(abs(value) < 0.001 for value in coordinates):
+        raise problem(422, f"Teach a valid robot position for Pool {slot:02d} before commanding movement.")
 
 
 def _mill_motion_program(settings: AppSettings, operation: str) -> str:
@@ -311,6 +628,72 @@ def rebuild_mill_load_position_program(session: Session, expected_revision: int)
     except RobotFileAccessError as exc:
         raise problem(502, f"Could not upload the mill loading program: {exc}") from exc
     return {"filename": MILL_LOAD_POSITION_PROGRAM_NAME, "local_path": str(local_path), "remote_path": remote_path}
+
+
+def _pathpilot_controller_data_root(settings: AppSettings) -> PurePosixPath:
+    program_root = PurePosixPath(settings.mill_file_directory)
+    if not program_root.is_absolute() or ".." in program_root.parts:
+        raise problem(422, "The PathPilot program directory must be an absolute path without '..'.")
+    # PathPilot stores RESULTS.TXT and its standard results directory beside
+    # Gcode, not inside it. Permit that controller data root only.
+    return program_root.parent if program_root.name.casefold() == "gcode" else program_root
+
+
+def _mill_results_paths(settings: AppSettings) -> tuple[str, str]:
+    controller_root = _pathpilot_controller_data_root(settings)
+    source = PurePosixPath(settings.mill_results_source_path)
+    archive = PurePosixPath(settings.mill_results_archive_directory)
+    for path, label in ((source, "RESULTS.TXT source"), (archive, "results archive directory")):
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or path.parts[:len(controller_root.parts)] != controller_root.parts
+        ):
+            raise problem(422, f"The {label} must remain inside the PathPilot controller data directory.")
+    if source == archive:
+        raise problem(422, "The RESULTS.TXT source and archive directory must be different paths.")
+    return str(source), str(archive)
+
+
+def _mill_file_connection(settings: AppSettings) -> dict[str, object]:
+    return {
+        "host": settings.cnc_host.strip(),
+        "port": settings.cnc_ssh_port,
+        "username": settings.cnc_ssh_username,
+        "password": settings.cnc_ssh_password,
+        "directory": settings.mill_file_directory,
+        "timeout_seconds": settings.cnc_timeout_seconds,
+    }
+
+
+def _mill_results_file_connection(settings: AppSettings) -> dict[str, object]:
+    connection = _mill_file_connection(settings)
+    connection["directory"] = str(_pathpilot_controller_data_root(settings))
+    return connection
+
+
+def _archive_mill_results(
+    settings: AppSettings,
+    program_path: str,
+    previous_signature: dict[str, int | str] | None,
+) -> str:
+    source, archive_directory = _mill_results_paths(settings)
+    connection = _mill_results_file_connection(settings)
+    current_signature = remote_file_signature(path=source, **connection)
+    if current_signature is None:
+        raise problem(409, f"PathPilot did not create {source} for {program_path}.")
+    if current_signature == previous_signature:
+        raise problem(409, f"PathPilot's {PurePosixPath(source).name} did not change during {program_path}; the old result was not archived.")
+
+    program_name = re.sub(r"[^A-Za-z0-9._-]+", "_", PurePosixPath(program_path).stem).strip("._-") or "program"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    archive_name = f"{program_name}__{timestamp}__RESULTS.TXT"
+    return copy_remote_file_as(
+        source=source,
+        destination_directory=archive_directory,
+        destination_name=archive_name,
+        **connection,
+    )
 
 
 def _serialize_motion(motion: RobotMotion, pallet: Pallet | None = None) -> dict:
@@ -405,6 +788,21 @@ def _robot_waypoint(value: object, name: str) -> dict | None:
         return {"name": str(value.get("name") or name), **{axis: float(value[axis]) for axis in axes}}
     except (TypeError, ValueError):
         return None
+
+
+def _joint_waypoint(value: object, name: str) -> dict | None:
+    if not isinstance(value, dict) or not isinstance(value.get("joints_rad"), list):
+        return None
+    joints = value["joints_rad"]
+    if len(joints) != 6:
+        return None
+    try:
+        parsed = [float(joint) for joint in joints]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(joint) for joint in parsed):
+        return None
+    return {"name": str(value.get("name") or name), "joints_rad": parsed}
 
 
 def _mill_g53_position(value: object) -> dict[str, float]:
@@ -527,6 +925,7 @@ def board_snapshot(session: Session) -> dict:
             "pool_slot_count": settings.pool_slot_count,
             "on_deck_enabled": settings.on_deck_enabled,
             "dripping_enabled": settings.dripping_enabled,
+            "run_mode_safety_confirm": settings.run_mode_safety_confirm,
             **pallet_location_positions(settings),
             "debug_menu_enabled": settings.debug_menu_enabled,
             "manual_io_control_enabled": settings.manual_io_control_enabled,
@@ -536,6 +935,16 @@ def board_snapshot(session: Session) -> dict:
             "robot_port": settings.robot_port,
             "robot_poll_hz": settings.robot_poll_hz,
             "robot_timeout_seconds": settings.robot_timeout_seconds,
+            "robot_supervisor_enabled": settings.robot_supervisor_enabled,
+            "robot_supervisor_activation_verified": settings.robot_supervisor_activation_verified,
+            "robot_supervisor_hostname": settings.robot_supervisor_hostname,
+            "robot_supervisor_listen_host": settings.robot_supervisor_listen_host,
+            "robot_supervisor_port": settings.robot_supervisor_port,
+            "robot_supervisor_heartbeat_seconds": settings.robot_supervisor_heartbeat_seconds,
+            "robot_supervisor_telemetry_hz": settings.robot_supervisor_telemetry_hz,
+            "robot_supervisor_reconnect_limit_seconds": settings.robot_supervisor_reconnect_limit_seconds,
+            "robot_supervisor_pre_dispatch_fallback": settings.robot_supervisor_pre_dispatch_fallback,
+            "robot_supervisor_maintenance_mode": settings.robot_supervisor_maintenance_mode,
             "debug_program_button_count": settings.debug_program_button_count,
             "debug_mill_program_button_count": settings.debug_mill_program_button_count,
             "robot_file_access_enabled": settings.robot_file_access_enabled,
@@ -561,6 +970,9 @@ def board_snapshot(session: Session) -> dict:
             "mill_programs_page_enabled": settings.mill_programs_page_enabled,
             "mill_programs_filter_enabled": settings.mill_programs_filter_enabled,
             "mill_editor_command": settings.mill_editor_command,
+            "mill_results_archiving_enabled": settings.mill_results_archiving_enabled,
+            "mill_results_source_path": settings.mill_results_source_path,
+            "mill_results_archive_directory": settings.mill_results_archive_directory,
             "fusion_tool_library_path": settings.fusion_tool_library_path,
             "fusion_tool_libraries": [{"path": path, "name": Path(path).name} for path in fusion_tool_library_paths(settings)],
         },
@@ -569,6 +981,7 @@ def board_snapshot(session: Session) -> dict:
             "safety_confirm": settings.run_mode_safety_confirm,
             "state": settings.run_mode_state,
             "detail": settings.run_mode_detail,
+            "alert": settings.run_mode_alert or None,
             "current_pallet_id": settings.run_mode_current_pallet_id,
             "current_pallet_name": current_run_pallet.name if current_run_pallet else None,
             "return_slot": settings.run_mode_return_slot,
@@ -736,22 +1149,95 @@ def _board_summary(settings: AppSettings, pallets: list[Pallet]) -> dict:
     }
 
 
+_CNC_TELEMETRY_CACHE: dict[tuple[object, ...], tuple[float, dict | None, str | None]] = {}
+_CNC_TELEMETRY_REFRESHING: set[tuple[object, ...]] = set()
+_CNC_TELEMETRY_LOCK = RLock()
+
+
+def _cnc_telemetry_key(settings: AppSettings) -> tuple[object, ...]:
+    return (
+        settings.cnc_host.strip(),
+        settings.cnc_ssh_port,
+        settings.cnc_ssh_username,
+        settings.cnc_ssh_password,
+        settings.cnc_timeout_seconds,
+    )
+
+
+def _refresh_cnc_telemetry(
+    key: tuple[object, ...],
+    connection: tuple[str, int, str, str, float],
+    completed: Event,
+) -> None:
+    telemetry: dict | None = None
+    error: str | None = None
+    try:
+        telemetry = read_linuxcnc_snapshot(*connection)
+    except CncTelemetryError as exc:
+        error = str(exc)
+    finally:
+        with _CNC_TELEMETRY_LOCK:
+            _CNC_TELEMETRY_CACHE[key] = (time.monotonic(), telemetry, error)
+            _CNC_TELEMETRY_REFRESHING.discard(key)
+        completed.set()
+
+
+def _clear_telemetry_caches() -> None:
+    with _CNC_TELEMETRY_LOCK:
+        _CNC_TELEMETRY_CACHE.clear()
+    with _ROBOT_TELEMETRY_LOCK:
+        _ROBOT_TELEMETRY_CACHE.clear()
+
+
 def _configured_cnc_telemetry(settings: AppSettings) -> tuple[dict | None, str]:
     if not settings.cnc_telemetry_enabled:
         return None, "Mill telemetry is not connected yet."
     if not settings.cnc_host.strip():
         return None, "CNC telemetry is enabled, but no controller host is configured."
-    try:
-        telemetry = read_linuxcnc_snapshot(
+    key = _cnc_telemetry_key(settings)
+    now = time.monotonic()
+    start_refresh = False
+    completed = Event()
+    with _CNC_TELEMETRY_LOCK:
+        cached = _CNC_TELEMETRY_CACHE.get(key)
+        if cached and now - cached[0] < 5.0:
+            if cached[1] is not None:
+                return deepcopy(cached[1]), "Live PathPilot zbot carousel assignments."
+            return None, f"PathPilot telemetry is unavailable: {cached[2] or 'connection failed'}"
+        if key not in _CNC_TELEMETRY_REFRESHING:
+            _CNC_TELEMETRY_REFRESHING.add(key)
+            start_refresh = True
+
+    if start_refresh:
+        connection = (
             settings.cnc_host.strip(),
             settings.cnc_ssh_port,
             settings.cnc_ssh_username,
             settings.cnc_ssh_password,
             settings.cnc_timeout_seconds,
         )
-    except CncTelemetryError as exc:
-        return None, f"PathPilot ATC telemetry is unavailable: {exc}"
-    return telemetry, "Live PathPilot zbot carousel assignments."
+        Thread(
+            target=_refresh_cnc_telemetry,
+            args=(key, connection, completed),
+            daemon=True,
+            name="cnc-telemetry-refresh",
+        ).start()
+        # Fast mocked readers complete here in tests. Real network reads never hold
+        # a page request for longer than this small first-sample allowance.
+        completed.wait(0.1)
+
+    with _CNC_TELEMETRY_LOCK:
+        refreshed = _CNC_TELEMETRY_CACHE.get(key)
+    if refreshed and refreshed[1] is not None:
+        source = "Live PathPilot zbot carousel assignments." if now - refreshed[0] < 5.0 else (
+            "Showing the last PathPilot telemetry while a refresh is running."
+        )
+        return deepcopy(refreshed[1]), source
+    if cached and cached[1] is not None:
+        return deepcopy(cached[1]), "Showing the last PathPilot telemetry while a refresh is running."
+    if refreshed and refreshed[2]:
+        return None, f"PathPilot telemetry is unavailable: {refreshed[2]}"
+    return None, "PathPilot telemetry refresh is in progress."
 
 
 def _atc_inventory(telemetry: dict | None, descriptions: dict[int, dict] | None = None) -> list[dict]:
@@ -1129,6 +1615,112 @@ def _simulated_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
     return _apply_debug_program_controls(_apply_debug_labels(snapshot, settings), settings)
 
 
+def _supervisor_robot_snapshot(settings: AppSettings, summary: dict) -> dict:
+    status = robot_supervisor().status()
+    telemetry = status.get("telemetry") or {}
+    connected = bool(status.get("connected") and telemetry)
+    age = status.get("telemetry_age_seconds")
+    fresh = connected and age is not None and age <= settings.robot_supervisor_heartbeat_seconds * 4
+
+    def rows(mask_name: str, prefix: str, count: int, direction: str, bank: str) -> list[dict]:
+        mask = telemetry.get(mask_name) if fresh else None
+        if not isinstance(mask, int):
+            return [
+                {
+                    "channel": f"{prefix}{index}", "index": index, "bit": index,
+                    "value": None, "writable": False, "direction": direction, "bank": bank,
+                }
+                for index in range(count)
+            ]
+        return _mask_rows(mask, prefix, count, writable=direction == "output", direction=direction, bank=bank)
+
+    tcp = telemetry.get("tcp_pose") if fresh else []
+    tcp_speed = telemetry.get("tcp_speed") if fresh else []
+    joints = telemetry.get("joint_positions_rad") if fresh else []
+    joint_speeds = telemetry.get("joint_velocities_rad_s") if fresh else []
+    joint_currents = telemetry.get("joint_currents_a") if fresh else []
+    joint_temperatures = telemetry.get("joint_temperatures_c") if fresh else []
+    axes = ("X", "Y", "Z", "Rx", "Ry", "Rz")
+    joint_names = ("Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3")
+    snapshot = {
+        "revision": settings.revision,
+        "timestamp": telemetry.get("received_at") or datetime.now(timezone.utc).isoformat(),
+        "source": "robot-supervisor",
+        "connected": bool(fresh),
+        "telemetry_connected": bool(fresh),
+        "connection_state": "live" if fresh else ("degraded" if status.get("connected") else "unavailable"),
+        "connection_label": "Supervisor live" if fresh else "Supervisor connected - awaiting telemetry" if status.get("connected") else "Supervisor disconnected",
+        "machine_state": settings.machine_state,
+        "summary": summary,
+        "robot": {
+            "mode": settings.robot_connection_mode,
+            "host": settings.robot_host.strip(),
+            "port": settings.robot_supervisor_port,
+            "controller_version": None,
+            "recipe_fields": ["supervisor-v1"],
+        },
+        "supervisor": status,
+        "digital_input_groups": [
+            {"title": "Standard inputs", "rows": rows("standard_inputs", "DI", 8, "input", "standard")},
+            {"title": "Configurable inputs", "rows": rows("configurable_inputs", "CI", 8, "input", "configurable")},
+            {"title": "Tool inputs", "rows": rows("tool_inputs", "TI", 2, "input", "tool")},
+        ],
+        "digital_output_groups": [
+            {"title": "Standard outputs", "rows": rows("standard_outputs", "DO", 8, "output", "standard")},
+            {"title": "Configurable outputs", "rows": rows("configurable_outputs", "CO", 8, "output", "configurable")},
+            {"title": "Tool outputs", "rows": rows("tool_outputs", "TO", 2, "output", "tool")},
+        ],
+        "analog_inputs": [],
+        "analog_outputs": [],
+        "state_rows": [
+            {"label": "Robot mode", "value": telemetry.get("robot_mode") if fresh else "Unavailable"},
+            {"label": "Safety mode", "value": telemetry.get("safety_mode") if fresh else "Unavailable"},
+            {"label": "Runtime state", "value": telemetry.get("runtime_state") if fresh else "Unavailable"},
+            {"label": "Supervisor sequence", "value": status.get("robot_last_sequence")},
+            {"label": "Supervisor latch", "value": "Latched" if status.get("latched") else "Clear"},
+        ],
+        "pose_rows": [
+            {"channel": axis, "label": f"TCP {axis}", "value": tcp[index]}
+            for index, axis in enumerate(axes) if index < len(tcp)
+        ],
+        "tcp_speed_rows": [
+            {"channel": axis, "label": f"TCP speed {axis}", "value": tcp_speed[index]}
+            for index, axis in enumerate(axes) if index < len(tcp_speed)
+        ],
+        "joint_rows": [
+            {"channel": f"J{index}", "label": name, "value": joints[index]}
+            for index, name in enumerate(joint_names) if index < len(joints)
+        ],
+        "tcp_detail_rows": [
+            {
+                "axis": axis,
+                "actual_pose": tcp[index] if index < len(tcp) else None,
+                "actual_speed": tcp_speed[index] if index < len(tcp_speed) else None,
+                "actual_force": None,
+                "target_pose": None,
+                "target_speed": None,
+            }
+            for index, axis in enumerate(axes)
+        ],
+        "joint_detail_rows": [
+            {
+                "joint": name,
+                "actual_position": joints[index] if index < len(joints) else None,
+                "actual_velocity": joint_speeds[index] if index < len(joint_speeds) else None,
+                "actual_current": joint_currents[index] if index < len(joint_currents) else None,
+                "actual_temperature": joint_temperatures[index] if index < len(joint_temperatures) else None,
+                "target_position": None,
+                "target_velocity": None,
+                "target_current": None,
+            }
+            for index, name in enumerate(joint_names)
+        ],
+        "extra_actual_rows": [],
+        "notes": "Telemetry and commands are using the robot-originated supervisor connection." if fresh else status.get("last_disconnect_detail") or "Waiting for supervisor telemetry.",
+    }
+    return _apply_debug_labels(_apply_debug_program_controls(snapshot, settings), settings)
+
+
 def _cnc_unavailable_snapshot(label: str, notes: str) -> dict:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1167,17 +1759,10 @@ def cnc_debug_snapshot(session: Session) -> dict:
     if not settings.cnc_host.strip():
         return _apply_debug_mill_program_controls(_cnc_unavailable_snapshot("Host not configured", "Enter the PathPilot controller IP address in Settings."), settings)
 
-    try:
-        telemetry = read_linuxcnc_snapshot(
-            settings.cnc_host.strip(),
-            settings.cnc_ssh_port,
-            settings.cnc_ssh_username,
-            settings.cnc_ssh_password,
-            settings.cnc_timeout_seconds,
-        )
-    except CncTelemetryError as exc:
+    telemetry, telemetry_source = _configured_cnc_telemetry(settings)
+    if telemetry is None:
         return _apply_debug_mill_program_controls(
-            _cnc_unavailable_snapshot("Controller unavailable", f"PathPilot telemetry failed: {exc}"), settings,
+            _cnc_unavailable_snapshot("Controller unavailable", telemetry_source), settings,
         )
 
     task_states = {1: "Estop", 2: "Estop reset", 3: "Machine off", 4: "Machine on"}
@@ -1191,7 +1776,7 @@ def cnc_debug_snapshot(session: Session) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "connected": True,
         "connection_label": "Live read-only telemetry",
-        "source": "PathPilot / LinuxCNC over SSH",
+        "source": telemetry_source,
         "machine_model": "Tormach 1500MX",
         "controller_state": task_states.get(telemetry.get("task_state"), f"State {telemetry.get('task_state')}") + f" / {task_modes.get(telemetry.get('task_mode'), 'Unknown mode')}",
         "program": telemetry.get("program") or "No program loaded",
@@ -1248,12 +1833,119 @@ def test_cnc_telemetry_connection(host: str, port: int, username: str, password:
     }
 
 
+_ROBOT_TELEMETRY_CACHE: dict[
+    tuple[object, ...], tuple[float, dict | None, str | None, float | None]
+] = {}
+_ROBOT_TELEMETRY_REFRESHING: set[tuple[object, ...]] = set()
+_ROBOT_TELEMETRY_LOCK = RLock()
+_ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 30.0
+_MOTION_TELEMETRY_READ_RETRY_SECONDS = 6.0
+# A temporary loss of RTDE must not mark a dispatched robot program as failed.
+# The reconnect circuit remains bounded, while the motion monitor waits long
+# enough for a lossy local network to recover before requiring reconciliation.
+_MOTION_TELEMETRY_OUTAGE_GRACE_SECONDS = 45.0
+
+
+def _refresh_robot_telemetry(
+    key: tuple[object, ...],
+    connection: tuple[str, int, int, float],
+    completed: Event,
+) -> None:
+    snapshot: dict | None = None
+    error: str | None = None
+    try:
+        snapshot = read_robot_snapshot(*connection)
+    except RobotTelemetryError as exc:
+        error = str(exc)
+    finally:
+        now = time.monotonic()
+        with _ROBOT_TELEMETRY_LOCK:
+            previous = _ROBOT_TELEMETRY_CACHE.get(key)
+            if snapshot is not None:
+                _ROBOT_TELEMETRY_CACHE[key] = (now, snapshot, None, now)
+            else:
+                previous_snapshot = previous[1] if previous else None
+                previous_success_at = previous[3] if previous else None
+                _ROBOT_TELEMETRY_CACHE[key] = (
+                    now, previous_snapshot, error, previous_success_at,
+                )
+            _ROBOT_TELEMETRY_REFRESHING.discard(key)
+        completed.set()
+
+
+def _cached_robot_telemetry(settings: AppSettings) -> tuple[dict | None, str | None]:
+    key = (
+        settings.robot_host.strip(),
+        settings.robot_port,
+        settings.robot_poll_hz,
+        settings.robot_timeout_seconds,
+    )
+    now = time.monotonic()
+    start_refresh = False
+    completed = Event()
+    with _ROBOT_TELEMETRY_LOCK:
+        cached = _ROBOT_TELEMETRY_CACHE.get(key)
+        fresh_for = 1.0 if cached and cached[1] is not None and not cached[2] else 4.0
+        if cached and now - cached[0] < fresh_for:
+            snapshot = deepcopy(cached[1])
+            if snapshot is not None and cached[2] and cached[3] is not None:
+                age = now - cached[3]
+                if age <= _ROBOT_TELEMETRY_STALE_GRACE_SECONDS:
+                    snapshot["telemetry_stale"] = True
+                    snapshot["last_live_sample_age_seconds"] = round(age, 1)
+                    return snapshot, cached[2]
+                return None, cached[2]
+            return snapshot, cached[2]
+        if key not in _ROBOT_TELEMETRY_REFRESHING:
+            _ROBOT_TELEMETRY_REFRESHING.add(key)
+            start_refresh = True
+
+    if start_refresh:
+        connection = (
+            settings.robot_host.strip(),
+            settings.robot_port,
+            settings.robot_poll_hz,
+            settings.robot_timeout_seconds,
+        )
+        Thread(
+            target=_refresh_robot_telemetry,
+            args=(key, connection, completed),
+            daemon=True,
+            name="robot-telemetry-refresh",
+        ).start()
+        completed.wait(0.1)
+
+    with _ROBOT_TELEMETRY_LOCK:
+        refreshed = _ROBOT_TELEMETRY_CACHE.get(key)
+    if refreshed and refreshed[1] is not None:
+        snapshot = deepcopy(refreshed[1])
+        if refreshed[2] and refreshed[3] is not None:
+            age = time.monotonic() - refreshed[3]
+            if age > _ROBOT_TELEMETRY_STALE_GRACE_SECONDS:
+                return None, refreshed[2]
+            snapshot["telemetry_stale"] = True
+            snapshot["last_live_sample_age_seconds"] = round(age, 1)
+        return snapshot, refreshed[2]
+    if cached and cached[1] is not None:
+        age = now - cached[3] if cached[3] is not None else float("inf")
+        if age <= _ROBOT_TELEMETRY_STALE_GRACE_SECONDS:
+            snapshot = deepcopy(cached[1])
+            snapshot["telemetry_stale"] = True
+            snapshot["last_live_sample_age_seconds"] = round(age, 1)
+            return snapshot, "Telemetry refresh is in progress; showing the last live sample."
+    if refreshed and refreshed[2]:
+        return None, refreshed[2]
+    return None, "Telemetry refresh is in progress."
+
+
 def robot_io_snapshot(session: Session) -> dict:
     settings = get_settings(session)
     pallets = session.scalars(select(Pallet)).all()
     summary = _board_summary(settings, pallets)
 
     if settings.robot_connection_mode == "physical":
+        if settings.robot_supervisor_enabled:
+            return _supervisor_robot_snapshot(settings, summary)
         if not settings.robot_host.strip():
             return {
                 "revision": settings.revision,
@@ -1281,54 +1973,78 @@ def robot_io_snapshot(session: Session) -> dict:
                 "extra_actual_rows": [],
                 "notes": "Physical robot mode is selected, but no robot host is configured.",
             }
-        try:
-            snapshot = read_robot_snapshot(
-                settings.robot_host.strip(),
-                settings.robot_port,
-                settings.robot_poll_hz,
-                settings.robot_timeout_seconds,
-            )
+        snapshot, telemetry_error = _cached_robot_telemetry(settings)
+        if snapshot is not None:
             snapshot["revision"] = settings.revision
             snapshot["summary"] = summary
             snapshot["machine_state"] = settings.machine_state
             snapshot["robot"]["mode"] = settings.robot_connection_mode
-            try:
-                snapshot["program_controls"] = _apply_debug_program_controls({}, settings)["program_controls"]
-                snapshot["program_controls"]["loaded_program"] = loaded_robot_program(
-                    settings.robot_host.strip(), settings.robot_timeout_seconds
-                )
-            except RobotDashboardError as exc:
-                snapshot = _apply_debug_program_controls(snapshot, settings)
-                snapshot["program_controls"]["file_list_note"] = f"Controller program query unavailable: {exc}"
+            snapshot = _apply_debug_program_controls(snapshot, settings)
+            snapshot["program_controls"]["file_list_note"] = (
+                "Loaded-program polling is disabled to protect the controller connection. "
+                "Program buttons still query Dashboard when an operator runs a program."
+            )
+            if telemetry_error:
+                snapshot["warning"] = telemetry_error
+                if snapshot.get("telemetry_stale"):
+                    age = snapshot.get("last_live_sample_age_seconds", 0)
+                    snapshot["connection_label"] = f"Telemetry degraded - last live sample {age:.1f}s ago"
+                    snapshot["connection_state"] = "degraded"
+                    snapshot["telemetry_connected"] = False
+            else:
+                snapshot["connection_state"] = "live"
+                snapshot["telemetry_connected"] = True
             return _apply_debug_labels(snapshot, settings)
-        except RobotTelemetryError as exc:
-            return {
-                "revision": settings.revision,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "source": "unavailable",
-                "connected": False,
-                "connection_label": "Physical robot unavailable",
-                "machine_state": settings.machine_state,
-                "summary": summary,
-                "robot": {
-                    "mode": settings.robot_connection_mode,
-                    "host": settings.robot_host.strip(),
-                    "port": settings.robot_port,
-                    "controller_version": None,
-                    "recipe_fields": [],
-                },
-                "digital_input_groups": [],
-                "digital_output_groups": [],
-                "analog_inputs": [],
-                "analog_outputs": [],
-                "state_rows": [],
-                "pose_rows": [],
-                "tcp_speed_rows": [],
-                "joint_rows": [],
-                "extra_actual_rows": [],
-                "notes": f"Physical robot mode is selected, but live RTDE telemetry is unavailable: {exc}",
-                "warning": str(exc),
-            }
+        controller_health = robot_dashboard_health(
+            settings.robot_host.strip(), settings.robot_timeout_seconds,
+        )
+        controller_reachable = bool(controller_health.get("reachable"))
+        if not controller_reachable:
+            trigger_network_diagnostic_on_robot_loss()
+        unavailable = {
+            "revision": settings.revision,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "robot-dashboard" if controller_reachable else "unavailable",
+            "connected": controller_reachable,
+            "telemetry_connected": False,
+            "connection_state": "degraded" if controller_reachable else "unavailable",
+            "connection_label": (
+                "Controller reachable - live telemetry unavailable"
+                if controller_reachable else "Physical robot unavailable"
+            ),
+            "machine_state": settings.machine_state,
+            "summary": summary,
+            "robot": {
+                "mode": settings.robot_connection_mode,
+                "host": settings.robot_host.strip(),
+                "port": settings.robot_port,
+                "controller_version": None,
+                "recipe_fields": [],
+            },
+            "digital_input_groups": [],
+            "digital_output_groups": [],
+            "analog_inputs": [],
+            "analog_outputs": [],
+            "state_rows": [],
+            "pose_rows": [],
+            "tcp_speed_rows": [],
+            "joint_rows": [],
+            "extra_actual_rows": [],
+            "notes": (
+                f"The robot Dashboard is reachable, but its live state stream is unavailable: {telemetry_error}"
+                if controller_reachable
+                else f"Physical robot mode is selected, but live telemetry is unavailable: {telemetry_error}. "
+                f"Dashboard probe: {controller_health.get('error') or 'unavailable'}"
+            ),
+            "warning": telemetry_error,
+        }
+        unavailable = _apply_debug_program_controls(unavailable, settings)
+        unavailable["program_controls"]["file_list_note"] = (
+            "Controller commands are reachable, but pallet movement remains blocked until fresh live telemetry returns."
+            if controller_reachable
+            else "Program controls are unavailable until the robot controller reconnects."
+        )
+        return _apply_debug_labels(unavailable, settings)
 
     if settings.robot_connection_mode == "simulated":
         snapshot = _simulated_robot_snapshot(settings, summary)
@@ -1415,6 +2131,40 @@ def robot_io_snapshot(session: Session) -> dict:
     }
 
 
+def retry_robot_telemetry(session: Session) -> dict:
+    """Allow an explicit reconnect only while no automated operation is active."""
+    settings = get_settings(session)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before resetting the robot connection.")
+    motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if motion:
+        raise problem(409, "Wait for the active robot movement before resetting its connection.")
+    reset_robot_connections()
+    with _ROBOT_TELEMETRY_LOCK:
+        _ROBOT_TELEMETRY_CACHE.clear()
+        _ROBOT_TELEMETRY_REFRESHING.clear()
+    return {"status": "retrying", "message": "Mongo connection state was reset; one reconnect sequence is starting."}
+
+
+def clear_robot_controller_fault(session: Session, payload: ClearRobotFault) -> dict:
+    """Acknowledge one recoverable controller fault without powering or moving the arm."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if not payload.confirmed:
+        raise problem(422, "Confirm that the cell was inspected before clearing a robot fault.")
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Configure a physical Mongo controller before clearing its fault.")
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before clearing a robot fault.")
+    motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if motion:
+        raise problem(409, "Wait for the active robot movement before clearing its controller fault.")
+    try:
+        return clear_robot_fault(settings.robot_host.strip(), settings.robot_timeout_seconds)
+    except RobotDashboardError as exc:
+        raise problem(409, f"Robot fault was not cleared: {exc}") from exc
+
+
 def current_robot_pose(session: Session) -> dict:
     settings = get_settings(session)
     if settings.robot_connection_mode != "physical":
@@ -1429,7 +2179,7 @@ def current_robot_pose(session: Session) -> dict:
     if pose is None:
         raise problem(409, "The robot is connected, but its actual TCP pose is unavailable.")
 
-    return {
+    result = {
         "x_mm": round(pose[0] * 1000, 3),
         "y_mm": round(pose[1] * 1000, 3),
         "z_mm": round(pose[2] * 1000, 3),
@@ -1438,6 +2188,10 @@ def current_robot_pose(session: Session) -> dict:
         "rz_rad": round(pose[5], 6),
         "timestamp": snapshot.get("timestamp"),
     }
+    joints = _actual_joint_positions(snapshot)
+    if joints is not None:
+        result["joints_rad"] = [round(joint, 6) for joint in joints]
+    return result
 
 
 def bump(settings: AppSettings) -> None:
@@ -1475,19 +2229,20 @@ def next_pallet_name(session: Session) -> str:
     used_names = {
         name.casefold() for name in session.scalars(select(Pallet.name)).all()
     }
-    for name in PALLET_NAMES:
-        if name.casefold() not in used_names:
-            return name
+    available_names = [name for name in PALLET_NAMES if name.casefold() not in used_names]
+    if available_names:
+        return random.choice(available_names)
     raise problem(409, "All configured pallet names are currently in use.")
 
 
 def create_pallet(session: Session, payload: CreatePallet) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
     if not math.isfinite(payload.weight_kg):
         raise problem(422, "Weight must be a finite positive number.")
-    programs, _ = available_programs(settings)
+    program_path = None
+    if payload.program_path:
+        program_path = validate_program(payload.program_path, set(pallet_program_files(session)))
     pallet = Pallet(
         id=str(uuid4()),
         name=next_pallet_name(session),
@@ -1495,7 +2250,7 @@ def create_pallet(session: Session, payload: CreatePallet) -> None:
         queue_position=None,
         pool_slot_number=first_open_pool_slot(session, settings),
         **payload.model_dump(exclude={"expected_revision", "program_path"}),
-        program_path=validate_program(payload.program_path, set(programs)),
+        program_path=program_path,
     )
     session.add(pallet)
     bump(settings)
@@ -1505,17 +2260,19 @@ def create_pallet(session: Session, payload: CreatePallet) -> None:
 def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, pallet)
     if not math.isfinite(payload.weight_kg):
         raise problem(422, "Weight must be a finite positive number.")
-    programs, _ = available_programs(settings)
+    program_path = None
+    if payload.program_path:
+        program_path = validate_program(payload.program_path, set(pallet_program_files(session)))
     values = payload.model_dump(exclude={"expected_revision", "program_path"})
     for key, value in values.items():
         setattr(pallet, key, value)
-    pallet.program_path = validate_program(payload.program_path, set(programs))
+    pallet.program_path = program_path
     bump(settings)
     commit_or_conflict(session)
 
@@ -1523,10 +2280,10 @@ def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> No
 def duplicate_pallet(session: Session, pallet_id: str, expected_revision: int) -> None:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    assert_run_mode_inactive(settings)
     source = session.get(Pallet, pallet_id)
     if not source:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, source)
     session.add(
         Pallet(
             id=str(uuid4()),
@@ -1560,11 +2317,13 @@ def compact_queue(session: Session, exclude_id: str | None = None) -> None:
 def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
     _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, pallet)
+    if settings.run_mode_enabled and payload.destination == "machine":
+        raise problem(409, "The mill position cannot be changed manually while Run Mode is active.")
     if pallet.location == "robot_held" or payload.destination == "robot_held":
         raise problem(409, "Use the pallet-motion controls to move a Robot-held pallet.")
 
@@ -1617,18 +2376,49 @@ def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
 
 
 def _robot_motion_activity(session: Session) -> tuple[bool, dict[str, object]]:
-    first_snapshot = robot_io_snapshot(session)
+    settings = get_settings(session)
+
+    def motion_snapshot() -> dict:
+        if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+            return robot_io_snapshot(session)
+        deadline = time.monotonic() + _MOTION_TELEMETRY_READ_RETRY_SECONDS
+        last_error: RobotTelemetryError | None = None
+        while True:
+            try:
+                return read_robot_snapshot(
+                    settings.robot_host.strip(),
+                    settings.robot_port,
+                    settings.robot_poll_hz,
+                    settings.robot_timeout_seconds,
+                )
+            except RobotTelemetryError as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    raise problem(
+                        409,
+                        f"Live robot telemetry remained unavailable after bounded retries. "
+                        f"Pallet movement is blocked: {last_error}",
+                    ) from exc
+                time.sleep(0.25)
+
+    # Motion interlocks use the controller stream directly. Building the full
+    # Debugging-page snapshot also queries Dashboard and database display data,
+    # which adds latency but no safety information to this check.
+    first_snapshot = motion_snapshot()
     if not first_snapshot.get("connected"):
         raise problem(409, "Live robot telemetry is unavailable. Pallet movement is blocked.")
 
     # RTDE velocity values can have a noticeable noise floor while a robot is holding
     # position. Compare two actual TCP poses instead, so stationary noise cannot block a move.
-    time.sleep(0.35)
-    snapshot = robot_io_snapshot(session)
+    time.sleep(0.2)
+    snapshot = motion_snapshot()
     if not snapshot.get("connected"):
         raise problem(409, "Live robot telemetry is unavailable. Pallet movement is blocked.")
     first_pose = _actual_tcp_pose(first_snapshot)
     second_pose = _actual_tcp_pose(snapshot)
+    state = {row.get("label"): row.get("value") for row in snapshot.get("state_rows", [])}
+    state["_tcp_pose"] = second_pose
+    state["_joint_detail_rows"] = snapshot.get("joint_detail_rows", [])
     if first_pose is not None and second_pose is not None:
         linear_delta = math.sqrt(sum((second_pose[index] - first_pose[index]) ** 2 for index in range(3)))
         angular_delta = math.sqrt(sum((second_pose[index] - first_pose[index]) ** 2 for index in range(3, 6)))
@@ -1641,9 +2431,83 @@ def _robot_motion_activity(session: Session) -> tuple[bool, dict[str, object]]:
             angular_speed = math.sqrt(sum(float(components[index]) ** 2 for index in range(3, 6)))
             moving = linear_speed >= 0.01 or angular_speed >= 0.1
         except (TypeError, ValueError, IndexError):
-            moving = False
-    state = {row.get("label"): row.get("value") for row in snapshot.get("state_rows", [])}
+            moving = str(state.get("Runtime state", "")).casefold() in {"running", "playing", "resuming"}
     return moving, state
+
+
+def _motion_safety_error(state: dict[str, object]) -> str | None:
+    safety_mode = state.get("Safety mode")
+    if safety_mode is not None and safety_mode not in {1, "normal", "NORMAL"}:
+        return f"Robot safety mode changed during movement ({safety_mode!s})."
+    return None
+
+
+def _motion_runtime_is_idle(state: dict[str, object]) -> bool:
+    runtime_state = state.get("Runtime state")
+    return runtime_state is None or runtime_state in {1, "stopped", "idle", "STOPPED", "IDLE"}
+
+
+def _motion_final_pose_error(
+    state: dict[str, object],
+    settings: AppSettings,
+    program_path: str,
+) -> str | None:
+    if PurePosixPath(program_path).suffix.lower() != ".script":
+        return None
+    safe = _joint_waypoint(pallet_motion_generation(settings).get("safe_pre_waypoint"), "shared safe waypoint")
+    if safe is None:
+        return "The generated script stopped, but its configured joint-space safe waypoint is invalid."
+    actual = _actual_joint_positions({"joint_detail_rows": state.get("_joint_detail_rows", [])})
+    if actual is None:
+        return "The generated script stopped, but its final joint positions could not be verified."
+    largest_delta = max(abs(actual[index] - safe["joints_rad"][index]) for index in range(6))
+    if largest_delta > 0.05:
+        return f"The generated script stopped {largest_delta:.3f} rad away from its configured joint-space safe waypoint."
+    return None
+
+
+def _mark_pick_as_held_after_lift(
+    session: Session,
+    motion: RobotMotion,
+    state: dict[str, object],
+    settings: AppSettings,
+) -> bool:
+    """Reflect a completed physical pickup while the robot safely retreats."""
+    if motion.operation != "pick" or PurePosixPath(motion.program_path).suffix.lower() != ".script":
+        return False
+    pallet = session.get(Pallet, motion.pallet_id)
+    if not pallet or pallet.location == "robot_held":
+        return False
+    if pallet.location != "pool" or pallet.pool_slot_number != motion.source_slot:
+        return False
+    pose = state.get("_tcp_pose")
+    if not isinstance(pose, tuple) or len(pose) < 3:
+        return False
+
+    locations = pallet_location_positions(settings).get("pool_locations", [])
+    location = next((item for item in locations if item.get("slot") == motion.source_slot), None)
+    generation = pallet_motion_generation(settings)
+    if not location:
+        return False
+    try:
+        target_x = float(location["x_mm"]) / 1000
+        target_y = float(location["y_mm"]) / 1000
+        target_z = (float(location["z_mm"]) + float(generation["lift_z_clearance_mm"])) / 1000
+        horizontal_error = math.hypot(float(pose[0]) - target_x, float(pose[1]) - target_y)
+        lifted_clear = float(pose[2]) >= target_z - 0.02
+    except (KeyError, TypeError, ValueError):
+        return False
+    if horizontal_error > 0.04 or not lifted_clear:
+        return False
+
+    held = session.scalar(select(Pallet).where(Pallet.location == "robot_held", Pallet.id != pallet.id))
+    if held:
+        return False
+    pallet.location = "robot_held"
+    pallet.pool_slot_number = None
+    bump(settings)
+    commit_or_conflict(session)
+    return True
 
 
 def _actual_tcp_pose(snapshot: dict) -> tuple[float, float, float, float, float, float] | None:
@@ -1659,6 +2523,19 @@ def _actual_tcp_pose(snapshot: dict) -> tuple[float, float, float, float, float,
     return values
 
 
+def _actual_joint_positions(snapshot: dict) -> tuple[float, float, float, float, float, float] | None:
+    rows = snapshot.get("joint_detail_rows", [])
+    if not isinstance(rows, list) or len(rows) < 6:
+        return None
+    try:
+        values = tuple(float(row["actual_position"]) for row in rows[:6])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return values
+
+
 def _assert_motion_ready(session: Session, settings: AppSettings) -> None:
     if settings.robot_connection_mode != "physical":
         return
@@ -1666,6 +2543,28 @@ def _assert_motion_ready(session: Session, settings: AppSettings) -> None:
         raise problem(403, "Enable physical pallet movements in Settings before commanding Mongo.")
     if not settings.robot_host.strip():
         raise problem(409, "A physical robot host is required for pallet movement.")
+    if settings.robot_supervisor_enabled:
+        if not settings.robot_supervisor_activation_verified:
+            raise problem(409, "Supervisor mode has not passed its no-motion handshake test.")
+        status = robot_supervisor().status()
+        if not status["connected"]:
+            if settings.robot_supervisor_pre_dispatch_fallback:
+                return
+            raise problem(409, "Mongo supervisor is not connected.")
+        if status["latched"]:
+            raise problem(409, "Mongo supervisor is latched. Reconcile it before starting another movement.")
+        telemetry = status.get("telemetry") or {}
+        age = status.get("telemetry_age_seconds")
+        if not telemetry or age is None or age > settings.robot_supervisor_heartbeat_seconds * 4:
+            raise problem(409, "Mongo supervisor telemetry is stale or unavailable.")
+        if telemetry.get("safety_mode") != 1:
+            raise problem(409, f"Robot safety mode is not normal ({telemetry.get('safety_mode')!s}).")
+        if telemetry.get("runtime_state") != 1:
+            raise problem(409, f"Robot runtime is not idle ({telemetry.get('runtime_state')!s}).")
+        tcp_speed = telemetry.get("tcp_speed") or []
+        if any(abs(float(value)) > 0.002 for value in tcp_speed[:3]):
+            raise problem(409, "Robot TCP is moving. Wait until the robot is stationary before starting a pallet movement.")
+        return
     moving, state = _robot_motion_activity(session)
     if moving:
         raise problem(409, "Robot TCP is moving. Wait until the robot is stationary before starting a pallet movement.")
@@ -1685,9 +2584,23 @@ def _locked_motion(session: Session) -> RobotMotion | None:
     )
 
 
+def _active_reliability_run(session: Session) -> RobotReliabilityRun | None:
+    return session.scalar(
+        select(RobotReliabilityRun)
+        .where(RobotReliabilityRun.status.in_(("requested", "running")))
+        .order_by(RobotReliabilityRun.created_at.desc())
+    )
+
+
+def _assert_reliability_inactive(session: Session) -> None:
+    if _active_reliability_run(session):
+        raise problem(409, "Stop or wait for the queue reliability test before using other robot or schedule controls.")
+
+
 def _assert_no_locked_motion(session: Session) -> None:
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before changing pallet records.")
+    _assert_reliability_inactive(session)
 
 
 def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail: str | None = None) -> None:
@@ -1725,6 +2638,477 @@ def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail:
     settings = get_settings(session)
     bump(settings)
     commit_or_conflict(session)
+    diagnostics().record(
+        "robot_motion",
+        "completed" if motion.status == "succeeded" else "faulted",
+        f"Robot motion {motion.operation} {motion.status}.",
+        severity="info" if motion.status == "succeeded" else "error",
+        details={
+            "motion_id": motion.id,
+            "pallet_id": motion.pallet_id,
+            "operation": motion.operation,
+            "source_slot": motion.source_slot,
+            "destination_slot": motion.destination_slot,
+            "retry_count": motion.retry_count,
+            "failure_detail": motion.failure_detail,
+        },
+    )
+
+
+def start_robot_supervisor_listener(session: Session) -> None:
+    settings = get_settings(session)
+    robot_supervisor().start(
+        settings.robot_supervisor_listen_host,
+        settings.robot_supervisor_port,
+        settings.robot_supervisor_heartbeat_seconds,
+        settings.robot_supervisor_telemetry_hz,
+    )
+
+
+def stop_robot_supervisor_listener() -> None:
+    robot_supervisor().stop()
+
+
+def robot_supervisor_status(session: Session) -> dict[str, object]:
+    settings = get_settings(session)
+    status = robot_supervisor().status()
+    # A backend restart can occur after Mongo physically completed a command.
+    # Apply that matching terminal result once, but never cross robot sessions.
+    if (
+        status.get("connected")
+        and status.get("robot_last_sequence") == settings.robot_supervisor_last_sequence
+        and status.get("robot_last_event") == "completed"
+    ):
+        last_command = session.scalar(
+            select(RobotSupervisorCommand).where(
+                RobotSupervisorCommand.sequence == settings.robot_supervisor_last_sequence
+            )
+        )
+        if (
+            last_command
+            and last_command.robot_session == status.get("robot_session")
+            and last_command.status in {"sent", "accepted", "running", "uncertain"}
+        ):
+            last_command.status = "completed"
+            last_command.completed_at = datetime.now(timezone.utc).isoformat()
+            session.commit()
+            motion = session.get(RobotMotion, last_command.robot_motion_id) if last_command.robot_motion_id else None
+            if motion and motion.status == "faulted" and "Backend restarted" in (motion.failure_detail or ""):
+                commands = session.scalars(
+                    select(RobotSupervisorCommand)
+                    .where(RobotSupervisorCommand.robot_motion_id == motion.id)
+                    .order_by(RobotSupervisorCommand.sequence)
+                ).all()
+                final_operations = {
+                    "pick": "pick_pool",
+                    "put": "put_pool",
+                    "load_mill": "load_mill",
+                    "unload_mill": "put_pool",
+                }
+                if (
+                    commands
+                    and all(item.status == "completed" for item in commands)
+                    and commands[-1].operation == final_operations.get(motion.operation)
+                ):
+                    _finish_motion(session, motion, True)
+                    settings = get_settings(session)
+                    status = robot_supervisor().status()
+    recent = session.scalars(
+        select(RobotSupervisorCommand)
+        .order_by(RobotSupervisorCommand.sequence.desc())
+        .limit(20)
+    ).all()
+    robot_sequence = status.get("robot_last_sequence")
+    expected_sequence = settings.robot_supervisor_last_sequence
+    latest_expected = next((item for item in recent if item.sequence == expected_sequence), None)
+    session_mismatch = bool(
+        status.get("connected")
+        and expected_sequence > 0
+        and latest_expected
+        and latest_expected.robot_session is not None
+        and latest_expected.robot_session != status.get("robot_session")
+    )
+    status.update({
+        "enabled": settings.robot_supervisor_enabled,
+        "activation_verified": settings.robot_supervisor_activation_verified,
+        "maintenance_mode": settings.robot_supervisor_maintenance_mode,
+        "expected_sequence": expected_sequence,
+        "reconciliation_required": bool(
+            status.get("latched")
+            or session_mismatch
+            or (status.get("connected") and robot_sequence is not None and robot_sequence != expected_sequence)
+        ),
+        "session_mismatch": session_mismatch,
+        "pre_dispatch_fallback": settings.robot_supervisor_pre_dispatch_fallback,
+        "commands": [
+            {
+                "sequence": item.sequence,
+                "robot_session": item.robot_session,
+                "robot_motion_id": item.robot_motion_id,
+                "operation": item.operation,
+                "transport": item.transport,
+                "status": item.status,
+                "attempted": item.attempted,
+                "created_at": item.created_at,
+                "sent_at": item.sent_at,
+                "accepted_at": item.accepted_at,
+                "started_at": item.started_at,
+                "completed_at": item.completed_at,
+                "result_code": item.result_code,
+                "fault_detail": item.fault_detail,
+            }
+            for item in recent
+        ],
+    })
+    return status
+
+
+def bootstrap_robot_supervisor(session: Session) -> dict[str, object]:
+    settings = get_settings(session)
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Configure a physical Mongo controller before bootstrapping its supervisor.")
+    if settings.run_mode_enabled or _locked_motion(session):
+        raise problem(409, "Stop Run Mode and resolve all pallet movements before bootstrapping the supervisor.")
+    restore_enabled_after_success = settings.robot_supervisor_enabled
+    settings.robot_supervisor_enabled = False
+    settings.robot_supervisor_activation_verified = False
+    bump(settings)
+    commit_or_conflict(session)
+    local_script = generated_script_directory(Path(__file__).parents[1]) / "mongo_supervisor.script"
+    if not local_script.is_file():
+        raise problem(409, "Rebuild generated scripts before bootstrapping the supervisor.")
+    start_robot_supervisor_listener(session)
+    listener = robot_supervisor().status()
+    if not listener.get("listening"):
+        raise problem(409, str(listener.get("last_disconnect_detail") or "Supervisor listener did not start."))
+    previous_session = listener.get("robot_session") if listener.get("connected") else None
+    if listener.get("connected"):
+        if listener.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
+            raise problem(409, "The connected supervisor sequence does not match the backend. Reconcile it before restarting the supervisor.")
+        maintenance = _new_supervisor_command(
+            session,
+            motion=None,
+            operation="bootstrap_restart",
+            opcode=OP_ENTER_MAINTENANCE,
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            maintenance,
+            max(5.0, settings.robot_timeout_seconds * 4),
+            allow_pre_dispatch_fallback=False,
+        )
+        if outcome != "completed":
+            raise problem(409, f"The existing supervisor did not stop cleanly: {detail}")
+        settings = get_settings(session)
+    script_content = with_supervisor_sequence(
+        local_script.read_text(encoding="utf-8"),
+        settings.robot_supervisor_last_sequence,
+    )
+    try:
+        run_robot_script(
+            settings.robot_host.strip(),
+            script_content,
+            settings.robot_timeout_seconds,
+        )
+    except RobotFileAccessError as exc:
+        raise problem(502, f"Supervisor bootstrap could not reach Mongo: {exc}") from exc
+    wait_seconds = max(10.0, settings.robot_timeout_seconds * 4)
+    connected = (
+        robot_supervisor().wait_for_robot_session_change(previous_session, wait_seconds)
+        if previous_session is not None
+        else robot_supervisor().wait_until_connected(wait_seconds)
+    )
+    if not connected:
+        raise problem(
+            504,
+            "URControl accepted the no-motion script transfer, but Mongo did not connect to the supervisor listener. "
+            "Verify DNS and Windows Firewall, then inspect the controller log for an unsupported URScript command. "
+            "PolyScope 3.2.20175 may require its final 3.2 maintenance update before external supervisor programs run reliably.",
+        )
+    status = robot_supervisor().status()
+    if status.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
+        settings.robot_supervisor_activation_verified = False
+        bump(settings)
+        commit_or_conflict(session)
+        raise problem(
+            409,
+            f"Supervisor connected, but Mongo reports sequence {status.get('robot_last_sequence')} while the backend expects {settings.robot_supervisor_last_sequence}. Reconcile before enabling it.",
+        )
+    settings.robot_supervisor_activation_verified = True
+    settings.robot_supervisor_enabled = restore_enabled_after_success
+    settings.robot_supervisor_maintenance_mode = False
+    bump(settings)
+    commit_or_conflict(session)
+    return robot_supervisor_status(session)
+
+
+def reconcile_robot_supervisor(session: Session, payload) -> dict[str, object]:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if settings.run_mode_enabled or session.scalar(
+        select(RobotMotion).where(RobotMotion.status.in_(("requested", "running")))
+    ):
+        raise problem(409, "Stop Run Mode and wait for active motion before reconciling the supervisor.")
+    command = session.scalar(
+        select(RobotSupervisorCommand).where(RobotSupervisorCommand.sequence == payload.sequence)
+    )
+    if not command:
+        raise problem(404, "Supervisor command sequence was not found in the durable ledger.")
+    if payload.resolution == "accept_completed":
+        command.status = "operator_completed"
+        command.completed_at = command.completed_at or datetime.now(timezone.utc).isoformat()
+        command.fault_detail = "Operator confirmed the physical atomic operation completed. Reconcile the pallet-motion record separately if its board location is faulted."
+    elif payload.resolution == "mark_faulted":
+        command.status = "operator_faulted"
+        command.completed_at = command.completed_at or datetime.now(timezone.utc).isoformat()
+        command.fault_detail = "Operator confirmed the atomic operation did not complete."
+    else:
+        if not robot_supervisor().status().get("connected"):
+            raise problem(409, "Mongo must be connected before its supervisor latch can be cleared.")
+        clear = _new_supervisor_command(
+            session,
+            motion=None,
+            operation="clear_latch",
+            opcode=OP_CLEAR_LATCH,
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            clear,
+            max(5.0, settings.robot_timeout_seconds * 4),
+            allow_pre_dispatch_fallback=False,
+        )
+        if outcome != "completed":
+            raise problem(409, detail)
+        settings = get_settings(session)
+        settings.robot_supervisor_activation_verified = True
+    bump(settings)
+    commit_or_conflict(session)
+    return robot_supervisor_status(session)
+
+
+def set_robot_supervisor_maintenance(session: Session, payload) -> dict[str, object]:
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if settings.run_mode_enabled or _locked_motion(session):
+        raise problem(409, "Stop Run Mode and resolve all pallet movements before changing Maintenance Mode.")
+    if payload.enabled:
+        if robot_supervisor().status().get("connected"):
+            command = _new_supervisor_command(
+                session,
+                motion=None,
+                operation="enter_maintenance",
+                opcode=OP_ENTER_MAINTENANCE,
+            )
+            outcome, detail = _dispatch_supervisor_command(
+                session,
+                command,
+                max(5.0, settings.robot_timeout_seconds * 4),
+                allow_pre_dispatch_fallback=False,
+            )
+            if outcome != "completed":
+                raise problem(409, detail)
+        settings = get_settings(session)
+        settings.robot_supervisor_maintenance_mode = True
+    else:
+        local_script = generated_script_directory(Path(__file__).parents[1]) / "mongo_supervisor.script"
+        if not local_script.is_file():
+            raise problem(409, "Rebuild generated scripts before leaving Maintenance Mode.")
+        run_robot_script(
+            settings.robot_host.strip(),
+            with_supervisor_sequence(
+                local_script.read_text(encoding="utf-8"),
+                settings.robot_supervisor_last_sequence,
+            ),
+            settings.robot_timeout_seconds,
+        )
+        if not robot_supervisor().wait_until_connected(max(10.0, settings.robot_timeout_seconds * 4)):
+            raise problem(504, "Mongo did not reconnect after Maintenance Mode.")
+        settings = get_settings(session)
+        settings.robot_supervisor_maintenance_mode = False
+        settings.robot_supervisor_activation_verified = True
+    bump(settings)
+    commit_or_conflict(session)
+    return robot_supervisor_status(session)
+
+
+def _new_supervisor_command(
+    session: Session,
+    *,
+    motion: RobotMotion | None,
+    operation: str,
+    opcode: int,
+    argument: int = 0,
+    value: int = 0,
+    payload_g: int = 0,
+) -> RobotSupervisorCommand:
+    settings = get_settings(session)
+    if settings.robot_supervisor_last_sequence >= 2_000_000_000:
+        raise problem(409, "Mongo supervisor sequence space is exhausted. Rebuild and re-bootstrap a new supervisor session before sending commands.")
+    settings.robot_supervisor_last_sequence += 1
+    status = robot_supervisor().status()
+    command = RobotSupervisorCommand(
+        id=str(uuid4()),
+        sequence=settings.robot_supervisor_last_sequence,
+        robot_session=status.get("robot_session"),
+        app_session=status.get("app_session"),
+        robot_motion_id=motion.id if motion else None,
+        operation=operation,
+        opcode=opcode,
+        argument=argument,
+        value=value,
+        payload_g=payload_g,
+        transport="supervisor",
+        status="created",
+        attempted=False,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    session.add(command)
+    bump(settings)
+    commit_or_conflict(session)
+    return command
+
+
+def _dispatch_supervisor_command(
+    session: Session,
+    command: RobotSupervisorCommand,
+    timeout_seconds: float,
+    *,
+    allow_pre_dispatch_fallback: bool,
+) -> tuple[str, str]:
+    receipt = robot_supervisor().dispatch(
+        command.sequence,
+        command.opcode,
+        command.argument,
+        command.value,
+        command.payload_g,
+        expected_robot_session=command.robot_session,
+    )
+    command.attempted = receipt.attempted
+    if not receipt.attempted:
+        # No socket existed and no byte could have reached Mongo. Release this
+        # reserved sequence so the robot never observes an artificial gap.
+        settings = get_settings(session)
+        if settings.robot_supervisor_last_sequence == command.sequence:
+            settings.robot_supervisor_last_sequence -= 1
+            bump(settings)
+        session.delete(command)
+        session.commit()
+        if allow_pre_dispatch_fallback:
+            return "fallback", receipt.detail
+        return "faulted", receipt.detail
+    if not receipt.sent:
+        command.status = "uncertain"
+        command.sent_at = datetime.now(timezone.utc).isoformat()
+        command.fault_detail = receipt.detail
+        session.commit()
+        return "faulted", receipt.detail
+
+    command.status = "sent"
+    command.sent_at = datetime.now(timezone.utc).isoformat()
+    session.commit()
+    event = robot_supervisor().wait_for_event(
+        command.sequence,
+        timeout_seconds,
+        expected_robot_session=command.robot_session,
+    )
+    history = robot_supervisor().events_for(command.sequence)
+    command = session.get(RobotSupervisorCommand, command.id) or command
+    for item in history:
+        command.robot_session = item.robot_session
+        if item.event_code == EVENT_ACCEPTED:
+            command.accepted_at = command.accepted_at or item.received_at
+        elif item.event_code == EVENT_RUNNING:
+            command.started_at = command.started_at or item.received_at
+    if event is None:
+        command.status = "uncertain"
+        command.fault_detail = "Timed out without a matching terminal supervisor event; physical outcome is uncertain."
+        command.completed_at = datetime.now(timezone.utc).isoformat()
+        session.commit()
+        return "faulted", command.fault_detail
+    command.result_code = event.fault_code
+    command.completed_at = event.received_at
+    if event.event_code == EVENT_COMPLETED:
+        command.status = "completed"
+        session.commit()
+        return "completed", ""
+    command.status = "latched" if event.event_code == EVENT_LATCHED else "faulted"
+    command.fault_detail = (
+        f"Mongo reported {event.name} for sequence {event.sequence} with fault code {event.fault_code}. "
+        "Inspect the physical pallet location and reconcile before continuing."
+    )
+    session.commit()
+    return "faulted", command.fault_detail
+
+
+def _execute_motion_via_supervisor(
+    session: Session,
+    motion: RobotMotion,
+    pallet: Pallet,
+) -> str:
+    settings = get_settings(session)
+    payload_g = max(1, round(pallet.weight_kg * 1000))
+    if motion.operation == "pick":
+        steps = [("pick_pool", OP_PICK_POOL, motion.source_slot or 0)]
+    elif motion.operation == "put":
+        steps = [("put_pool", OP_PUT_POOL, motion.destination_slot or 0)]
+    elif motion.operation == "load_mill":
+        steps = []
+        if motion.source_slot:
+            steps.append(("pick_pool", OP_PICK_POOL, motion.source_slot))
+        steps.append(("load_mill", OP_LOAD_MILL, 0))
+    elif motion.operation == "unload_mill":
+        steps = [
+            ("unload_mill", OP_UNLOAD_MILL, 0),
+            ("put_pool", OP_PUT_POOL, motion.destination_slot or 0),
+        ]
+    else:
+        _finish_motion(session, motion, False, f"Unsupported supervisor operation {motion.operation}.")
+        return "faulted"
+
+    any_attempted = False
+    for operation, opcode, argument in steps:
+        if not robot_supervisor().status().get("connected"):
+            if not any_attempted and settings.robot_supervisor_pre_dispatch_fallback:
+                return "fallback"
+            _finish_motion(
+                session,
+                motion,
+                False,
+                "Mongo supervisor disconnected before the next atomic step. Legacy fallback is blocked because this movement may already be partially complete.",
+            )
+            return "faulted"
+        command = _new_supervisor_command(
+            session,
+            motion=motion,
+            operation=operation,
+            opcode=opcode,
+            argument=argument,
+            payload_g=payload_g,
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            command,
+            settings.pallet_motion_timeout_seconds,
+            allow_pre_dispatch_fallback=(
+                not any_attempted and settings.robot_supervisor_pre_dispatch_fallback
+            ),
+        )
+        if command.attempted:
+            any_attempted = True
+        if outcome == "fallback":
+            if any_attempted:
+                _finish_motion(session, motion, False, "Supervisor disconnected after this movement had already started; legacy fallback was blocked.")
+                return "faulted"
+            return "fallback"
+        if outcome != "completed":
+            _finish_motion(session, motion, False, detail)
+            return "faulted"
+        motion.status = "running"
+        motion.started_at = motion.started_at or command.started_at or command.sent_at
+        motion.observed_busy = True
+        session.commit()
+    _finish_motion(session, motion, True)
+    return "completed"
 
 
 def start_pallet_motion(session: Session, payload: StartPalletMotion, automated: bool = False) -> str | None:
@@ -1732,6 +3116,7 @@ def start_pallet_motion(session: Session, payload: StartPalletMotion, automated:
     check_revision(settings, payload.expected_revision)
     if not automated:
         assert_run_mode_inactive(settings)
+    _assert_reliability_inactive(session)
     locked = _locked_motion(session)
     if locked:
         if locked.status == "faulted":
@@ -1740,6 +3125,8 @@ def start_pallet_motion(session: Session, payload: StartPalletMotion, automated:
     if payload.pool_slot_number > settings.pool_slot_count:
         raise problem(422, "Pool position is outside the configured range.")
     _assert_motion_ready(session, settings)
+    if settings.robot_connection_mode == "physical":
+        _assert_pool_motion_position_configured(settings, payload.pool_slot_number)
 
     if payload.operation == "pick":
         if not payload.pallet_id:
@@ -1781,11 +3168,12 @@ def start_pallet_motion(session: Session, payload: StartPalletMotion, automated:
 
 
 def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfer, automated: bool = False) -> str | None:
-    """Queue a complete physical pool-to-mill or mill-to-pool transfer."""
+    """Queue a physical transfer from Pool/Robot-held to Mill or Mill to Pool."""
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     if not automated:
         assert_run_mode_inactive(settings)
+    _assert_reliability_inactive(session)
     locked = _locked_motion(session)
     if locked:
         raise problem(409, "Resolve or wait for the active robot pallet movement before commanding another move.")
@@ -1795,17 +3183,25 @@ def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfe
         if not payload.pallet_id:
             raise problem(422, "Choose a pallet to load into the mill.")
         pallet = session.get(Pallet, payload.pallet_id)
-        if not pallet or pallet.location != "pool" or not pallet.pool_slot_number:
-            raise problem(409, "That pallet must be in a pool position before Mongo can load it into the mill.")
+        if not pallet or pallet.location not in {"pool", "robot_held"}:
+            raise problem(409, "That pallet must be in a pool position or Robot-held before Mongo can load it into the mill.")
         if session.scalar(select(Pallet).where(Pallet.location == "machine")):
             raise problem(409, "The mill already contains a pallet.")
-        source_slot, destination_slot = pallet.pool_slot_number, None
+        source_slot = pallet.pool_slot_number if pallet.location == "pool" else None
+        destination_slot = None
         operation = "load_mill"
-        program_path = (
-            f"{_motion_program(settings, source_slot, 'pick')} -> {_mill_motion_program(settings, 'load')}"
-            if settings.robot_connection_mode == "physical"
-            else "simulated://mill/load"
-        )
+        if settings.robot_connection_mode == "physical":
+            if source_slot:
+                _assert_pool_motion_position_configured(settings, source_slot)
+            robot_steps = (
+                f"{_motion_program(settings, source_slot, 'pick')} -> {_mill_motion_program(settings, 'load')}"
+                if source_slot else _mill_motion_program(settings, "load")
+            )
+            program_path = robot_steps if automated else (
+                f"{MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME} -> {robot_steps}"
+            )
+        else:
+            program_path = "simulated://mill/load"
     else:
         pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
         if not pallet:
@@ -1821,11 +3217,14 @@ def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfe
             raise problem(409, f"Pool position {payload.pool_slot_number:02d} is occupied by {occupant.name}.")
         source_slot, destination_slot = None, payload.pool_slot_number
         operation = "unload_mill"
-        program_path = (
-            f"{_mill_motion_program(settings, 'unload')} -> {_motion_program(settings, destination_slot, 'put')}"
-            if settings.robot_connection_mode == "physical"
-            else "simulated://mill/unload"
-        )
+        if settings.robot_connection_mode == "physical":
+            _assert_pool_motion_position_configured(settings, destination_slot)
+            robot_steps = f"{_mill_motion_program(settings, 'unload')} -> {_motion_program(settings, destination_slot, 'put')}"
+            program_path = robot_steps if automated else (
+                f"{MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME} -> {robot_steps}"
+            )
+        else:
+            program_path = "simulated://mill/unload"
 
     motion = RobotMotion(
         id=str(uuid4()), pallet_id=pallet.id, operation=operation,
@@ -1846,11 +3245,14 @@ def run_debug_pallet_motion(session: Session, payload: RunDebugPalletMotion) -> 
     """Dispatch one generated pallet script for cell setup without changing board state."""
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
+    _assert_reliability_inactive(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active scheduled pallet movement before running a manual test.")
     if payload.pool_slot_number > settings.pool_slot_count:
         raise problem(422, "Pool position is outside the configured range.")
     _assert_motion_ready(session, settings)
+    if settings.robot_connection_mode == "physical":
+        _assert_pool_motion_position_configured(settings, payload.pool_slot_number)
 
     if settings.robot_connection_mode == "simulated":
         return {
@@ -1867,9 +3269,37 @@ def run_debug_pallet_motion(session: Session, payload: RunDebugPalletMotion) -> 
         local_script = generated_script_directory(Path(__file__).parents[1]) / PurePosixPath(program_path).name
         if not local_script.is_file():
             raise problem(409, f"Generated local script is missing: {local_script.name}. Rebuild the pallet-motion scripts first.")
+        pool_position = next(
+            (item for item in pallet_location_positions(settings)["pool_locations"] if item["slot"] == payload.pool_slot_number),
+            None,
+        )
+        if pool_position is None:
+            raise problem(422, "No configured position exists for that pallet-pool slot.")
+        expected_script = build_pallet_motion_script(
+            function_name=f"mps_{payload.operation}_pool_{payload.pool_slot_number:03d}",
+            operation=payload.operation,
+            position=pool_position,
+            generation=pallet_motion_generation(settings),
+        )
+        actual_script = local_script.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if actual_script != expected_script:
+            raise problem(
+                409,
+                "The local generated pallet script does not match the saved retrieval settings. Rebuild generated scripts before running it.",
+            )
+        debug_pallet_query = select(Pallet).where(
+            Pallet.location == ("pool" if payload.operation == "pick" else "robot_held"),
+        )
+        if payload.operation == "pick":
+            debug_pallet_query = debug_pallet_query.where(
+                Pallet.pool_slot_number == payload.pool_slot_number,
+            )
+        debug_pallet = session.scalar(debug_pallet_query)
+        if debug_pallet:
+            expected_script = with_pallet_payload(expected_script, debug_pallet.weight_kg)
         run_robot_script(
             settings.robot_host.strip(),
-            local_script.read_text(encoding="utf-8"),
+            expected_script,
             settings.robot_timeout_seconds,
         )
     else:
@@ -1885,17 +3315,19 @@ def run_debug_pallet_motion(session: Session, payload: RunDebugPalletMotion) -> 
 
 def _mill_motion_script_content(settings: AppSettings, operation: str) -> str:
     generation = pallet_motion_generation(settings)
-    if not isinstance(generation.get("safe_pre_waypoint"), dict):
-        raise problem(422, "Configure the shared safe waypoint before using a mill pallet transfer.")
+    if _joint_waypoint(generation.get("safe_pre_waypoint"), "shared safe waypoint") is None:
+        raise problem(422, "Capture and save the shared joint-space safe waypoint before using a mill pallet transfer.")
     locations = pallet_location_positions(settings)
     mill_pose = locations["robot_mill_load_unload"]
+    mill_pre_entry = _robot_waypoint(generation.get("mill_pre_entry_waypoint"), "Mill pre-entry")
     mill_entry_exit = locations["robot_mill_safe_entry_exit"]
-    if not isinstance(mill_pose, dict) or not isinstance(mill_entry_exit, dict):
-        raise problem(422, "Configure the robot mill load/unload and safe entry/exit poses before using a mill pallet transfer.")
+    if not isinstance(mill_pose, dict) or mill_pre_entry is None or not isinstance(mill_entry_exit, dict):
+        raise problem(422, "Configure the robot mill load/unload, pre-entry, and entry/exit poses before using a mill pallet transfer.")
     return build_mill_pallet_motion_script(
         function_name=f"mps_{operation}_mill",
         operation=operation,
         mill_pose=mill_pose,
+        pre_entry_pose=mill_pre_entry,
         entry_exit_pose=mill_entry_exit,
         generation=generation,
     )
@@ -1905,6 +3337,7 @@ def run_debug_mill_pallet_motion(session: Session, payload: RunDebugMillPalletMo
     """Dispatch a generated mill transfer script without changing scheduled pallet state."""
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
+    _assert_reliability_inactive(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active scheduled pallet movement before running a manual test.")
     _assert_motion_ready(session, settings)
@@ -1924,6 +3357,11 @@ def run_debug_mill_pallet_motion(session: Session, payload: RunDebugMillPalletMo
     script_content = local_script.read_text(encoding="utf-8")
     if script_content != expected_script:
         raise problem(409, "The generated mill-transfer script does not match the saved settings. Rebuild generated scripts before running it.")
+    debug_pallet = session.scalar(select(Pallet).where(
+        Pallet.location == ("robot_held" if payload.operation == "load" else "machine"),
+    ))
+    if debug_pallet:
+        script_content = with_pallet_payload(script_content, debug_pallet.weight_kg)
     run_robot_script(
         settings.robot_host.strip(),
         script_content,
@@ -1937,6 +3375,304 @@ def run_debug_mill_pallet_motion(session: Session, payload: RunDebugMillPalletMo
     }
 
 
+def _reliability_script_content(settings: AppSettings, slot: int) -> str:
+    generation = pallet_motion_generation(settings)
+    staging_pose = _robot_waypoint(generation.get("mill_pre_entry_waypoint"), "Mill pre-entry")
+    if staging_pose is None:
+        raise problem(422, "Capture and save the outer robot mill pre-entry/staging waypoint before running the reliability test.")
+    position = next(
+        (item for item in pallet_location_positions(settings)["pool_locations"] if item["slot"] == slot),
+        None,
+    )
+    if position is None:
+        raise problem(422, f"Pool {slot:02d} is outside the configured pool.")
+    return build_reliability_motion_script(
+        function_name=f"mps_reliability_pool_{slot:03d}",
+        position=position,
+        staging_pose=staging_pose,
+        generation=generation,
+    )
+
+
+def _reliability_run_item(run: RobotReliabilityRun) -> dict[str, object]:
+    try:
+        queue = json.loads(run.queue_snapshot or "[]")
+    except json.JSONDecodeError:
+        queue = []
+    return {
+        "id": run.id,
+        "status": run.status,
+        "total_pallets": run.total_pallets,
+        "completed_pallets": run.completed_pallets,
+        "current_index": run.current_index,
+        "current_pallet_id": run.current_pallet_id,
+        "current_pallet_name": run.current_pallet_name,
+        "current_pool_slot": run.current_pool_slot,
+        "cancel_requested": run.cancel_requested,
+        "created_at": run.created_at,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "failure_detail": run.failure_detail,
+        "queue_snapshot": queue if isinstance(queue, list) else [],
+    }
+
+
+def robot_reliability_status(session: Session) -> dict[str, object]:
+    runs = session.scalars(
+        select(RobotReliabilityRun)
+        .order_by(RobotReliabilityRun.created_at.desc())
+        .limit(10)
+    ).all()
+    active = next((run for run in runs if run.status in {"requested", "running"}), None)
+    return {
+        "active": _reliability_run_item(active) if active else None,
+        "latest": _reliability_run_item(runs[0]) if runs else None,
+        "history": [_reliability_run_item(run) for run in runs],
+    }
+
+
+def start_robot_reliability_test(session: Session, expected_revision: int) -> str:
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before starting the queue reliability test.")
+    if _locked_motion(session):
+        raise problem(409, "Resolve or wait for the active robot pallet movement before starting the reliability test.")
+    _assert_reliability_inactive(session)
+    queue = session.scalars(
+        select(Pallet)
+        .where(Pallet.queue_position.is_not(None))
+        .order_by(Pallet.queue_position)
+    ).all()
+    if not queue:
+        raise problem(409, "Add at least one pallet to the production queue before starting the reliability test.")
+
+    snapshot: list[dict[str, object]] = []
+    for pallet in queue:
+        if pallet.location != "pool" or pallet.pool_slot_number is None:
+            raise problem(409, f"{pallet.name} must be in a Pool position before the reliability test can start.")
+        snapshot.append({
+            "pallet_id": pallet.id,
+            "pallet_name": pallet.name,
+            "queue_position": pallet.queue_position,
+            "pool_slot": pallet.pool_slot_number,
+            "weight_kg": pallet.weight_kg,
+        })
+
+    if settings.robot_connection_mode == "physical":
+        _assert_motion_ready(session, settings)
+        if motion_scripts_need_rebuild(settings):
+            raise problem(409, "Generated robot scripts do not match Settings. Rebuild them before starting the reliability test.")
+        local_root = generated_script_directory(Path(__file__).parents[1])
+        for item in snapshot:
+            slot = int(item["pool_slot"])
+            _assert_pool_motion_position_configured(settings, slot)
+            program_path = _reliability_program(settings, slot)
+            local_script = local_root / PurePosixPath(program_path).name
+            if not local_script.is_file():
+                raise problem(409, f"Generated local script is missing: {local_script.name}. Rebuild generated scripts first.")
+            if local_script.read_text(encoding="utf-8") != _reliability_script_content(settings, slot):
+                raise problem(409, f"{local_script.name} does not match saved poses. Rebuild generated scripts first.")
+
+    run = RobotReliabilityRun(
+        id=str(uuid4()),
+        status="requested",
+        queue_snapshot=json.dumps(snapshot, separators=(",", ":")),
+        total_pallets=len(snapshot),
+        completed_pallets=0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    session.add(run)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise problem(409, "Another queue reliability test started first.") from exc
+    diagnostics().record(
+        "robot_reliability",
+        "started",
+        f"Queue reliability test captured {len(snapshot)} pallets.",
+        details={"run_id": run.id, "queue": snapshot},
+    )
+    return run.id
+
+
+def cancel_robot_reliability_test(session: Session) -> dict[str, object]:
+    run = _active_reliability_run(session)
+    if not run:
+        raise problem(409, "No queue reliability test is active.")
+    run.cancel_requested = True
+    session.commit()
+    diagnostics().record(
+        "robot_reliability",
+        "cancel_requested",
+        "Reliability test will stop after the current pallet is returned.",
+        severity="warning",
+        details={"run_id": run.id, "current_pallet": run.current_pallet_name},
+    )
+    return robot_reliability_status(session)
+
+
+def _finish_reliability_run(
+    session: Session,
+    run: RobotReliabilityRun,
+    status: str,
+    detail: str | None = None,
+) -> None:
+    run.status = status
+    run.failure_detail = detail
+    run.current_index = None
+    run.current_pallet_id = None
+    run.current_pallet_name = None
+    run.current_pool_slot = None
+    run.completed_at = datetime.now(timezone.utc).isoformat()
+    session.commit()
+    diagnostics().record(
+        "robot_reliability",
+        status,
+        detail or f"Queue reliability test {status}.",
+        severity="error" if status in {"faulted", "interrupted"} else "warning" if status == "cancelled" else "info",
+        details={
+            "run_id": run.id,
+            "completed_pallets": run.completed_pallets,
+            "total_pallets": run.total_pallets,
+        },
+    )
+
+
+def _wait_for_reliability_motion(session: Session, settings: AppSettings) -> None:
+    deadline = time.monotonic() + settings.pallet_motion_timeout_seconds
+    observed_motion = False
+    settled_polls = 0
+    telemetry_outage_started: float | None = None
+    while time.monotonic() < deadline:
+        try:
+            moving, state = _robot_motion_activity(session)
+        except HTTPException as exc:
+            now = time.monotonic()
+            telemetry_outage_started = telemetry_outage_started or now
+            trigger_network_diagnostic_on_robot_loss()
+            if now - telemetry_outage_started < _MOTION_TELEMETRY_OUTAGE_GRACE_SECONDS:
+                time.sleep(0.5)
+                continue
+            raise problem(503, f"Robot telemetry remained unavailable during the reliability cycle: {exc.detail}") from exc
+        telemetry_outage_started = None
+        safety_error = _motion_safety_error(state)
+        if safety_error:
+            raise problem(409, safety_error)
+        if moving:
+            observed_motion = True
+            settled_polls = 0
+        elif observed_motion:
+            settled_polls += 1
+            if settled_polls >= 4 and _motion_runtime_is_idle(state):
+                return
+        time.sleep(0.25)
+    if not observed_motion:
+        raise problem(504, "The reliability script was dispatched, but robot motion was never observed.")
+    raise problem(504, "The reliability cycle did not return to a stationary idle state before timeout.")
+
+
+def _execute_reliability_cycle(session: Session, run: RobotReliabilityRun, item: dict[str, object]) -> None:
+    settings = get_settings(session)
+    pallet = session.get(Pallet, str(item["pallet_id"]))
+    slot = int(item["pool_slot"])
+    if not pallet or pallet.location != "pool" or pallet.pool_slot_number != slot:
+        raise problem(409, f"{item['pallet_name']} is no longer in Pool {slot:02d}; the frozen test sequence was stopped.")
+    if settings.robot_connection_mode == "simulated":
+        time.sleep(0.05)
+        return
+    _assert_motion_ready(session, settings)
+
+    if settings.robot_supervisor_enabled:
+        command = _new_supervisor_command(
+            session,
+            motion=None,
+            operation=f"reliability_pool_{slot:03d}",
+            opcode=OP_RELIABILITY_POOL,
+            argument=slot,
+            payload_g=max(1, round(float(item["weight_kg"]) * 1000)),
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            command,
+            settings.pallet_motion_timeout_seconds,
+            allow_pre_dispatch_fallback=settings.robot_supervisor_pre_dispatch_fallback,
+        )
+        if outcome == "completed":
+            return
+        if outcome != "fallback":
+            raise problem(409, detail)
+
+    program_path = _reliability_program(settings, slot)
+    local_script = generated_script_directory(Path(__file__).parents[1]) / PurePosixPath(program_path).name
+    script = with_pallet_payload(local_script.read_text(encoding="utf-8"), float(item["weight_kg"]))
+    run_robot_script(settings.robot_host.strip(), script, settings.robot_timeout_seconds)
+    _wait_for_reliability_motion(session, settings)
+
+
+def execute_robot_reliability_test(session_factory, run_id: str) -> None:
+    with session_factory() as session:
+        run = session.get(RobotReliabilityRun, run_id)
+        if not run or run.status != "requested":
+            return
+        try:
+            queue = json.loads(run.queue_snapshot)
+            run.status = "running"
+            run.started_at = datetime.now(timezone.utc).isoformat()
+            session.commit()
+            for index, item in enumerate(queue):
+                session.refresh(run)
+                if run.cancel_requested:
+                    _finish_reliability_run(session, run, "cancelled", "Stopped between pallets at the operator's request.")
+                    return
+                run.current_index = index
+                run.current_pallet_id = str(item["pallet_id"])
+                run.current_pallet_name = str(item["pallet_name"])
+                run.current_pool_slot = int(item["pool_slot"])
+                session.commit()
+                _execute_reliability_cycle(session, run, item)
+                run.completed_pallets = index + 1
+                run.current_index = None
+                run.current_pallet_id = None
+                run.current_pallet_name = None
+                run.current_pool_slot = None
+                session.commit()
+            _finish_reliability_run(session, run, "completed", "Every pallet in the captured queue completed its pick, staging, and same-slot put-away cycle.")
+        except HTTPException as exc:
+            session.rollback()
+            run = session.get(RobotReliabilityRun, run_id)
+            if run and run.status in {"requested", "running"}:
+                _finish_reliability_run(
+                    session,
+                    run,
+                    "faulted",
+                    f"Reliability test stopped with an uncertain physical pallet state: {exc.detail}",
+                )
+        except (RobotDashboardError, RobotFileAccessError) as exc:
+            session.rollback()
+            run = session.get(RobotReliabilityRun, run_id)
+            if run and run.status in {"requested", "running"}:
+                _finish_reliability_run(session, run, "faulted", f"Reliability test transport failed; inspect the current pallet: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive worker boundary
+            session.rollback()
+            run = session.get(RobotReliabilityRun, run_id)
+            if run and run.status in {"requested", "running"}:
+                _finish_reliability_run(session, run, "faulted", f"Unexpected reliability-test failure; inspect the current pallet: {exc}")
+
+
+def interrupt_robot_reliability_test(session: Session) -> None:
+    run = _active_reliability_run(session)
+    if not run:
+        return
+    _finish_reliability_run(
+        session,
+        run,
+        "interrupted",
+        "Backend restarted during the reliability test. Physical pallet state is uncertain and must be inspected before another test.",
+    )
+
+
 def execute_pallet_motion(session_factory, motion_id: str) -> None:
     """Run one persisted physical motion. Every terminal outcome is committed for recovery."""
     with session_factory() as session:
@@ -1945,12 +3681,37 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
             return
         try:
             settings = get_settings(session)
+
+            pallet = session.get(Pallet, motion.pallet_id)
+            if not pallet:
+                _finish_motion(session, motion, False, "The pallet no longer exists.")
+                return
+
+            mill_position_already_run = False
+            if settings.robot_supervisor_enabled:
+                if motion.operation in {"load_mill", "unload_mill"} and MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path:
+                    try:
+                        _run_manual_mill_load_position_cycle(settings)
+                        mill_position_already_run = True
+                    except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
+                        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                        _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
+                        return
+                supervisor_outcome = _execute_motion_via_supervisor(session, motion, pallet)
+                if supervisor_outcome != "fallback":
+                    return
+
+            def generated_script_content(local_script: Path) -> str:
+                return with_pallet_payload(
+                    local_script.read_text(encoding="utf-8"), pallet.weight_kg,
+                )
+
             def run_script(program_path: str) -> None:
                 if PurePosixPath(program_path).suffix.lower() == ".script":
                     local_script = generated_script_directory(Path(__file__).parents[1]) / PurePosixPath(program_path).name
                     if not local_script.is_file():
                         raise RobotFileAccessError(f"Generated local script is missing: {local_script.name}")
-                    run_robot_script(settings.robot_host.strip(), local_script.read_text(encoding="utf-8"), settings.robot_timeout_seconds)
+                    run_robot_script(settings.robot_host.strip(), generated_script_content(local_script), settings.robot_timeout_seconds)
                 else:
                     run_robot_program(settings.robot_host.strip(), program_path, settings.robot_timeout_seconds)
 
@@ -1972,11 +3733,28 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                 deadline = time.monotonic() + settings.pallet_motion_timeout_seconds
                 observed_stage_motion = False
                 settled_polls = 0
+                telemetry_outage_started: float | None = None
                 while time.monotonic() < deadline:
                     try:
-                        moving, _ = _robot_motion_activity(session)
+                        moving, state = _robot_motion_activity(session)
                     except HTTPException as exc:
-                        _finish_motion(session, motion, False, str(exc.detail))
+                        now = time.monotonic()
+                        telemetry_outage_started = telemetry_outage_started or now
+                        trigger_network_diagnostic_on_robot_loss()
+                        if now - telemetry_outage_started < _MOTION_TELEMETRY_OUTAGE_GRACE_SECONDS:
+                            time.sleep(0.5)
+                            continue
+                        _finish_motion(
+                            session,
+                            motion,
+                            False,
+                            f"Robot telemetry was unavailable throughout the movement-monitoring grace period: {exc.detail}",
+                        )
+                        return False
+                    telemetry_outage_started = None
+                    safety_error = _motion_safety_error(state)
+                    if safety_error:
+                        _finish_motion(session, motion, False, safety_error)
                         return False
                     if moving:
                         motion.observed_busy = True
@@ -1986,19 +3764,39 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                     elif observed_stage_motion:
                         settled_polls += 1
                         if settled_polls >= 4:
+                            if not _motion_runtime_is_idle(state):
+                                continue
+                            pose_error = _motion_final_pose_error(state, settings, program_path)
+                            if pose_error:
+                                _finish_motion(session, motion, False, pose_error)
+                                return False
                             return True
                     time.sleep(0.25)
                 _finish_motion(session, motion, False, "Timed out waiting for the generated script to move the TCP and settle.")
                 return False
 
             if motion.operation == "load_mill":
-                if not run_and_wait(_motion_program(settings, motion.source_slot or 0, "pick"), True):
+                if MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path and not mill_position_already_run:
+                    try:
+                        _run_manual_mill_load_position_cycle(settings)
+                    except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
+                        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                        _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
+                        return
+                if motion.source_slot and not run_and_wait(_motion_program(settings, motion.source_slot, "pick"), True):
                     return
                 if not run_and_wait(_mill_motion_program(settings, "load"), False):
                     return
                 _finish_motion(session, motion, True)
                 return
             if motion.operation == "unload_mill":
+                if MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path and not mill_position_already_run:
+                    try:
+                        _run_manual_mill_load_position_cycle(settings)
+                    except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
+                        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                        _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
+                        return
                 if not run_and_wait(_mill_motion_program(settings, "unload"), True):
                     return
                 if not run_and_wait(_motion_program(settings, motion.destination_slot or 0, "put"), False):
@@ -2015,7 +3813,7 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                             raise RobotDashboardError(f"Generated local script is missing: {local_script.name}")
                         run_robot_script(
                             settings.robot_host.strip(),
-                            local_script.read_text(encoding="utf-8"),
+                            generated_script_content(local_script),
                             settings.robot_timeout_seconds,
                         )
                     else:
@@ -2043,12 +3841,30 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
 
             deadline = time.monotonic() + settings.pallet_motion_timeout_seconds
             settled_polls = 0
+            telemetry_outage_started: float | None = None
             while time.monotonic() < deadline:
                 try:
-                    moving, _ = _robot_motion_activity(session)
+                    moving, state = _robot_motion_activity(session)
                 except HTTPException as exc:
-                    _finish_motion(session, motion, False, str(exc.detail))
+                    now = time.monotonic()
+                    telemetry_outage_started = telemetry_outage_started or now
+                    trigger_network_diagnostic_on_robot_loss()
+                    if now - telemetry_outage_started < _MOTION_TELEMETRY_OUTAGE_GRACE_SECONDS:
+                        time.sleep(0.5)
+                        continue
+                    _finish_motion(
+                        session,
+                        motion,
+                        False,
+                        f"Robot telemetry was unavailable throughout the movement-monitoring grace period: {exc.detail}",
+                    )
                     return
+                telemetry_outage_started = None
+                safety_error = _motion_safety_error(state)
+                if safety_error:
+                    _finish_motion(session, motion, False, safety_error)
+                    return
+                _mark_pick_as_held_after_lift(session, motion, state, settings)
                 if moving:
                     motion.observed_busy = True
                     settled_polls = 0
@@ -2056,6 +3872,12 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                 elif motion.observed_busy:
                     settled_polls += 1
                     if settled_polls >= 4:
+                        if not _motion_runtime_is_idle(state):
+                            continue
+                        pose_error = _motion_final_pose_error(state, settings, motion.program_path)
+                        if pose_error:
+                            _finish_motion(session, motion, False, pose_error)
+                            return
                         _finish_motion(session, motion, True)
                         return
                 time.sleep(0.25)
@@ -2099,6 +3921,12 @@ def _finish_run_mode(session_factory, state: str, detail: str) -> None:
         settings.run_mode_return_slot = None
         bump(settings)
         commit_or_conflict(session)
+    diagnostics().record(
+        "run_mode",
+        state,
+        detail,
+        severity="error" if state == "faulted" else "warning" if state == "interrupted" else "info",
+    )
 
 
 def interrupt_run_mode(session: Session) -> None:
@@ -2126,11 +3954,79 @@ def set_run_mode_safety(session: Session, payload: SetRunModeSafety) -> None:
     commit_or_conflict(session)
 
 
+def _mill_load_position_local_path() -> Path:
+    return Path(__file__).parents[1] / "runtime" / "generated-mill-programs" / MILL_LOAD_POSITION_PROGRAM_NAME
+
+
+def _assert_mill_load_position_program_current(settings: AppSettings) -> str:
+    """Require the local and PathPilot copies to match the saved G53 coordinates."""
+    expected = build_mill_load_position_program(pallet_location_positions(settings)["mill_load_unload_g53"])
+    local_path = _mill_load_position_local_path()
+    try:
+        local_content = local_path.read_text(encoding="ascii")
+    except OSError as exc:
+        raise problem(409, "The mill loading-position program is missing locally. Build it from Settings before starting run mode.") from exc
+    if local_content.replace("\r\n", "\n") != expected:
+        raise problem(409, "The local mill loading-position program does not match Settings. Rebuild it before starting run mode.")
+
+    remote_path = str(MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME)
+    try:
+        remote = read_robot_file(
+            host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
+            username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
+            directory=settings.mill_file_directory, path=remote_path,
+            timeout_seconds=settings.cnc_timeout_seconds,
+        )
+    except RobotFileAccessError as exc:
+        raise problem(409, f"The PathPilot loading-position program could not be verified: {exc}") from exc
+    if remote.get("binary") or remote.get("too_large") or str(remote.get("text", "")).replace("\r\n", "\n") != expected:
+        raise problem(409, "The PathPilot mill loading-position program does not match Settings. Rebuild it before starting run mode.")
+    return remote_path
+
+
+def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> None:
+    if motion_scripts_need_rebuild(settings):
+        raise problem(409, "Generated robot scripts do not match Settings. Rebuild them before starting run mode.")
+    _assert_mill_load_position_program_current(settings)
+    if settings.mill_results_archiving_enabled:
+        _mill_results_paths(settings)
+
+    required_local_scripts = {"load_mill.script", "unload_mill.script"}
+    for pallet in queue:
+        for operation in ("pick", "put"):
+            program = _motion_program(settings, pallet.pool_slot_number or 0, operation)
+            if PurePosixPath(program).suffix.lower() == ".script":
+                required_local_scripts.add(PurePosixPath(program).name)
+    local_script_root = generated_script_directory(Path(__file__).parents[1])
+    missing_scripts = sorted(name for name in required_local_scripts if not (local_script_root / name).is_file())
+    if missing_scripts:
+        raise problem(409, "Generated robot scripts are missing locally: " + ", ".join(missing_scripts) + ". Rebuild them before starting run mode.")
+
+    try:
+        remote_files = set(list_robot_program_files(
+            host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
+            username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
+            directory=str(MILL_PROGRAM_DIRECTORY), extensions=None,
+            timeout_seconds=settings.cnc_timeout_seconds,
+        ))
+    except RobotFileAccessError as exc:
+        raise problem(409, f"Queued PathPilot programs could not be verified: {exc}") from exc
+    extensions = set(json.loads(settings.mill_program_extensions))
+    missing_programs = []
+    for pallet in queue:
+        remote_program = _run_mode_program_path(pallet.program_path or "", extensions)
+        if remote_program not in remote_files:
+            missing_programs.append(f"{pallet.name}: {remote_program}")
+    if missing_programs:
+        raise problem(409, "Queued programs are missing from PathPilot: " + "; ".join(missing_programs))
+
+
 def start_run_mode(session: Session, payload: StartRunMode) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     if settings.run_mode_enabled:
         raise problem(409, "Run mode is already active.")
+    _assert_reliability_inactive(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before starting run mode.")
     if session.scalar(select(Pallet).where(Pallet.location == "machine")):
@@ -2152,8 +4048,31 @@ def start_run_mode(session: Session, payload: StartRunMode) -> None:
             raise problem(403, "Enable physical pallet movements before starting run mode.")
         if not settings.cnc_telemetry_enabled or not settings.cnc_host.strip():
             raise problem(409, "Enable and configure CNC telemetry before starting physical run mode.")
+        if not settings.cnc_ssh_username or not settings.cnc_ssh_password:
+            raise problem(409, "Configure the PathPilot SSH username and password before starting physical run mode.")
+        # Reject the batch before enabling its coordinator unless both machines
+        # are live and idle. Individual commands repeat these interlocks.
+        _assert_motion_ready(session, settings)
+        try:
+            cnc_state = read_linuxcnc_cycle_state(
+                settings.cnc_host.strip(), settings.cnc_ssh_port,
+                settings.cnc_ssh_username, settings.cnc_ssh_password,
+                settings.cnc_timeout_seconds,
+            )
+        except CncTelemetryError as exc:
+            raise problem(409, f"Live CNC telemetry is unavailable. Run mode was not started: {exc}") from exc
+        if cnc_state.get("estop"):
+            raise problem(409, "PathPilot is in E-stop. Run mode was not started.")
+        if not cnc_state.get("enabled"):
+            raise problem(409, "PathPilot is not enabled. Run mode was not started.")
+        if cnc_state.get("interp_state") != 1:
+            raise problem(409, "PathPilot is not idle. Stop or finish its active program before starting run mode.")
+        for pallet in queue:
+            _assert_pool_motion_position_configured(settings, pallet.pool_slot_number or 0)
+        _assert_run_mode_files_ready(settings, queue)
     settings.run_mode_enabled = True
-    settings.run_mode_safety_confirm = payload.safety_confirm
+    if payload.safety_confirm is not None:
+        settings.run_mode_safety_confirm = payload.safety_confirm
     settings.run_mode_state = "starting"
     settings.run_mode_detail = f"Preparing {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
     settings.run_mode_current_pallet_id = None
@@ -2258,40 +4177,188 @@ def _run_mode_motion_succeeded(session_factory, motion_id: str | None) -> bool:
         return bool(motion and motion.status == "succeeded")
 
 
-def _run_mode_machine_cycle(session_factory, pallet_id: str) -> None:
+def _run_cnc_cycle(
+    settings: AppSettings,
+    remote_program: str,
+    *,
+    cycle_label: str,
+    timeout_seconds: float = 24 * 60 * 60,
+    continue_check=None,
+) -> bool:
+    """Run one PathPilot program and wait for LinuxCNC to return to Idle."""
+    if settings.robot_connection_mode == "simulated":
+        time.sleep(0.25)
+        return continue_check() if continue_check else True
+    connection = (
+        settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+        settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+    )
+    require_a = settings.cnc_require_a_axis_homed
+
+    run_linuxcnc_program(*connection, remote_program, require_a)
+    started = time.monotonic()
+    saw_running = False
+    while time.monotonic() - started < timeout_seconds:
+        if continue_check and not continue_check():
+            return False
+        telemetry = read_linuxcnc_cycle_state(*connection)
+        interpreter_state = telemetry.get("interp_state")
+        if interpreter_state != 1:
+            saw_running = True
+        elif saw_running or time.monotonic() - started >= 1.0:
+            return True
+        time.sleep(0.5)
+    raise problem(504, f"{cycle_label} did not return PathPilot to Idle before its timeout.")
+
+
+def _run_manual_mill_load_position_cycle(settings: AppSettings) -> bool:
+    remote_program = _assert_mill_load_position_program_current(settings)
+    return _run_cnc_cycle(
+        settings,
+        remote_program,
+        cycle_label="The mill loading-position program",
+        timeout_seconds=5 * 60,
+    )
+
+
+def _run_mode_cnc_cycle(
+    session_factory,
+    remote_program: str,
+    *,
+    cycle_label: str,
+    timeout_seconds: float = 24 * 60 * 60,
+) -> bool:
+    with session_factory() as session:
+        settings = get_settings(session)
+        if not settings.run_mode_enabled:
+            return False
+
+    def run_mode_is_enabled() -> bool:
+        with session_factory() as check_session:
+            return get_settings(check_session).run_mode_enabled
+
+    return _run_cnc_cycle(
+        settings,
+        remote_program,
+        cycle_label=cycle_label,
+        timeout_seconds=timeout_seconds,
+        continue_check=run_mode_is_enabled,
+    )
+
+
+def _run_mode_load_position_cycle(session_factory) -> bool:
+    with session_factory() as session:
+        settings = get_settings(session)
+        if not settings.run_mode_enabled:
+            return False
+        if settings.robot_connection_mode == "simulated":
+            remote_program = str(MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME)
+        else:
+            remote_program = _assert_mill_load_position_program_current(settings)
+    return _run_mode_cnc_cycle(
+        session_factory,
+        remote_program,
+        cycle_label="The mill loading-position program",
+        timeout_seconds=5 * 60,
+    )
+
+
+def _run_mode_machine_cycle(session_factory, pallet_id: str) -> bool:
     with session_factory() as session:
         settings = get_settings(session)
         pallet = session.get(Pallet, pallet_id)
         if not pallet or pallet.location != "machine" or not pallet.program_path:
             raise problem(409, "The run-mode pallet is no longer ready in the mill.")
-        if settings.robot_connection_mode == "simulated":
-            time.sleep(0.25)
-            return
         remote_program = _run_mode_program_path(
             pallet.program_path,
             set(json.loads(settings.mill_program_extensions)),
         )
-        connection = (
-            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
-            settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+        archive_results = settings.robot_connection_mode == "physical" and settings.mill_results_archiving_enabled
+        results_before = None
+        if archive_results:
+            results_source, _ = _mill_results_paths(settings)
+            results_before = remote_file_signature(
+                path=results_source,
+                **_mill_results_file_connection(settings),
+            )
+        cycle_settings = settings
+        pallet_name = pallet.name
+        program_path = pallet.program_path
+    completed = _run_mode_cnc_cycle(
+        session_factory,
+        remote_program,
+        cycle_label=f"The assigned program for {pallet_name}",
+    )
+    if not completed or not archive_results:
+        return completed
+    with session_factory() as session:
+        settings = get_settings(session)
+        if not settings.run_mode_enabled:
+            return False
+        _set_run_mode_status(
+            session,
+            "archiving_results",
+            f"Archiving RESULTS.TXT for {pallet_name}.",
+            pallet_id=pallet_id,
         )
-        require_a = settings.cnc_require_a_axis_homed
+        try:
+            archived_path = _archive_mill_results(cycle_settings, program_path, results_before)
+        except (HTTPException, RobotFileAccessError) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            settings.run_mode_alert = (
+                f"{pallet_name} completed, but RESULTS.TXT was not archived: {detail}. "
+                "Production continued normally."
+            )
+            _set_run_mode_status(
+                session,
+                "results_archive_warning",
+                settings.run_mode_alert,
+                pallet_id=pallet_id,
+            )
+            return True
+        _set_run_mode_status(
+            session,
+            "results_archived",
+            f"Archived {PurePosixPath(archived_path).name} for {pallet_name}.",
+            pallet_id=pallet_id,
+        )
+    return True
 
-    run_linuxcnc_program(*connection, remote_program, require_a)
-    started = time.monotonic()
-    saw_running = False
-    while time.monotonic() - started < 24 * 60 * 60:
-        with session_factory() as session:
-            if not get_settings(session).run_mode_enabled:
-                return
-        telemetry = read_linuxcnc_snapshot(*connection)
-        interpreter_state = telemetry.get("interp_state")
-        if interpreter_state != 1:
-            saw_running = True
-        elif saw_running or time.monotonic() - started >= 1.0:
-            return
-        time.sleep(0.5)
-    raise problem(504, "The mill program did not return to Idle within 24 hours.")
+
+def dismiss_run_mode_alert(session: Session) -> None:
+    settings = get_settings(session)
+    if not settings.run_mode_alert:
+        return
+    settings.run_mode_alert = ""
+    bump(settings)
+    commit_or_conflict(session)
+
+
+def clear_stale_run_mode_status(session: Session, expected_revision: int) -> None:
+    """Clear a terminal Run Mode banner without changing production or motion state."""
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before clearing its status.")
+    if settings.run_mode_state not in {"faulted", "interrupted"}:
+        raise problem(409, "There is no stale Run Mode fault or interruption to clear.")
+    previous_state = settings.run_mode_state
+    previous_detail = settings.run_mode_detail
+    settings.run_mode_state = "idle"
+    settings.run_mode_detail = ""
+    settings.run_mode_current_pallet_id = None
+    settings.run_mode_return_slot = None
+    settings.run_mode_pending_action = ""
+    settings.run_mode_confirmation_token = ""
+    settings.run_mode_confirmation_granted = False
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record(
+        "run_mode",
+        "status_cleared",
+        "Operator cleared a stale Run Mode status banner.",
+        details={"previous_state": previous_state, "previous_detail": previous_detail},
+    )
 
 
 def execute_run_mode(session_factory) -> None:
@@ -2319,10 +4386,26 @@ def execute_run_mode(session_factory) -> None:
                 )
 
             if not _await_run_mode_action(
-                session_factory, "loading", f"Load {pallet_name} from Pool {return_slot:02d} into the mill?",
+                session_factory, "loading",
+                f"Move the mill to its G53 loading position, then load {pallet_name} from Pool {return_slot:02d}?",
             ):
                 return
             with session_factory() as session:
+                _set_run_mode_status(
+                    session, "positioning_mill",
+                    f"Moving the mill to its G53 loading position before loading {pallet_name}.",
+                    pallet_id=pallet_id, return_slot=return_slot,
+                )
+            if not _run_mode_load_position_cycle(session_factory):
+                return
+            with session_factory() as session:
+                settings = get_settings(session)
+                if not settings.run_mode_enabled:
+                    return
+                _set_run_mode_status(
+                    session, "loading", f"Mongo is loading {pallet_name} into the mill.",
+                    pallet_id=pallet_id, return_slot=return_slot,
+                )
                 settings = get_settings(session)
                 motion_id = start_mill_pallet_transfer(session, StartMillPalletTransfer(
                     expected_revision=settings.revision, operation="load", pallet_id=pallet_id,
@@ -2334,13 +4417,30 @@ def execute_run_mode(session_factory) -> None:
                 session_factory, "machining", f"Start {pallet_name}'s assigned mill program?",
             ):
                 return
-            _run_mode_machine_cycle(session_factory, pallet_id)
+            if not _run_mode_machine_cycle(session_factory, pallet_id):
+                return
 
             if not _await_run_mode_action(
-                session_factory, "unloading", f"Unload {pallet_name} and return it to Pool {return_slot:02d}?",
+                session_factory, "unloading",
+                f"Return the mill to its G53 loading position, then unload {pallet_name} to Pool {return_slot:02d}?",
             ):
                 return
             with session_factory() as session:
+                _set_run_mode_status(
+                    session, "positioning_mill",
+                    f"Moving the mill to its G53 loading position before unloading {pallet_name}.",
+                    pallet_id=pallet_id, return_slot=return_slot,
+                )
+            if not _run_mode_load_position_cycle(session_factory):
+                return
+            with session_factory() as session:
+                settings = get_settings(session)
+                if not settings.run_mode_enabled:
+                    return
+                _set_run_mode_status(
+                    session, "unloading", f"Mongo is unloading {pallet_name} from the mill.",
+                    pallet_id=pallet_id, return_slot=return_slot,
+                )
                 settings = get_settings(session)
                 motion_id = start_mill_pallet_transfer(session, StartMillPalletTransfer(
                     expected_revision=settings.revision, operation="unload", pallet_id=pallet_id,
@@ -2380,7 +4480,7 @@ def recover_pallet_motion(session: Session, motion_id: str, payload: RecoverPall
     allowed = {
         "pick": {"source_pool", "robot_held"},
         "put": {"robot_held", "destination_pool"},
-        "load_mill": {"source_pool", "robot_held", "machine"},
+        "load_mill": {"robot_held", "machine"} | ({"source_pool"} if motion.source_slot else set()),
         "unload_mill": {"machine", "robot_held", "destination_pool"},
     }.get(motion.operation, set())
     if payload.resolution not in allowed:
@@ -2421,10 +4521,34 @@ def interrupt_active_pallet_motion(session: Session) -> None:
     commit_or_conflict(session)
 
 
+def assert_system_relaunch_ready(session: Session) -> None:
+    if _active_reliability_run(session):
+        raise problem(409, "Cancel or wait for the queue reliability test before relaunching the backend.")
+    motion = session.scalar(
+        select(RobotMotion).where(RobotMotion.status.in_(("requested", "running")))
+    )
+    if motion:
+        raise problem(409, "Wait for the active robot movement to finish before relaunching the backend.")
+    if get_settings(session).run_mode_enabled:
+        raise problem(409, "Stop production run mode before relaunching the backend.")
+
+
+def assert_robot_file_mutation_ready(session: Session) -> None:
+    """Prevent controller program changes while an automated workflow owns the robot."""
+    if _locked_motion(session):
+        raise problem(409, "Resolve or wait for the active robot pallet movement before changing controller files.")
+    _assert_reliability_inactive(session)
+    if get_settings(session).run_mode_enabled:
+        raise problem(409, "Stop Run Mode before changing controller files.")
+
+
 def rebuild_pallet_motion_scripts(session: Session) -> dict:
     settings = get_settings(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before rebuilding scripts.")
+    _assert_reliability_inactive(session)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before rebuilding robot scripts.")
     if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
         raise problem(409, "Generated scripts require a configured physical robot.")
     if not settings.robot_file_access_enabled:
@@ -2453,12 +4577,22 @@ def rebuild_pallet_motion_scripts(session: Session) -> dict:
             or not isinstance(output.get("index"), int)
         ):
             raise problem(422, f"The {action_label} command must use a valid robot output channel.")
-    if not isinstance(generation.get("safe_pre_waypoint"), dict):
-        raise problem(422, "Configure the shared safe waypoint before rebuilding scripts.")
-    waypoints = generation.get("travel_waypoints", [])
-    names = [item.get("name", "").casefold() for item in waypoints if isinstance(item, dict)]
-    if len(names) != len(set(names)) or any(not name for name in names):
-        raise problem(422, "Travel waypoint names must be present and unique.")
+    if _joint_waypoint(generation.get("safe_pre_waypoint"), "shared safe waypoint") is None:
+        raise problem(422, "Capture and save the shared joint-space safe waypoint before rebuilding scripts.")
+    if _robot_waypoint(generation.get("mill_pre_entry_waypoint"), "Mill pre-entry") is None:
+        raise problem(422, "Capture and save the robot mill pre-entry waypoint before rebuilding scripts.")
+    intermediate_poses = generation.get("intermediate_safe_poses", [])
+    if not isinstance(intermediate_poses, list) or any(_joint_waypoint(item, "intermediate safe pose") is None for item in intermediate_poses):
+        raise problem(422, "Every intermediate safe pose must contain a name and six finite joint positions.")
+    intermediate_names = [str(item.get("name", "")).casefold() for item in intermediate_poses if isinstance(item, dict)]
+    if len(intermediate_names) != len(intermediate_poses) or not all(intermediate_names) or len(intermediate_names) != len(set(intermediate_names)):
+        raise problem(422, "Intermediate safe-pose names must be unique.")
+    if any(
+        not isinstance(item.get("pool_slots"), list)
+        or any(not isinstance(slot, int) or slot < 1 or slot > settings.pool_slot_count for slot in item["pool_slots"])
+        for item in intermediate_poses
+    ):
+        raise problem(422, "Intermediate safe-pose assignments must refer to configured pool positions.")
 
     locations = pallet_location_positions(settings)
     files: dict[str, str] = {}
@@ -2467,13 +4601,25 @@ def rebuild_pallet_motion_scripts(session: Session) -> dict:
         slot = pool["slot"]
         pick_name = f"pick_pool_{slot:03d}.script"
         put_name = f"put_pool_{slot:03d}.script"
+        reliability_name = f"reliability_pool_{slot:03d}.script"
         files[pick_name] = build_pallet_motion_script(
             function_name=f"mps_pick_pool_{slot:03d}", operation="pick", position=pool, generation=generation,
         )
         files[put_name] = build_pallet_motion_script(
             function_name=f"mps_put_pool_{slot:03d}", operation="put", position=pool, generation=generation,
         )
-        mappings.append({"slot": slot, "pick_program": pick_name, "put_program": put_name})
+        files[reliability_name] = build_reliability_motion_script(
+            function_name=f"mps_reliability_pool_{slot:03d}",
+            position=pool,
+            staging_pose=_robot_waypoint(generation.get("mill_pre_entry_waypoint"), "Mill pre-entry"),
+            generation=generation,
+        )
+        mappings.append({
+            "slot": slot,
+            "pick_program": pick_name,
+            "put_program": put_name,
+            "reliability_program": reliability_name,
+        })
     enabled_stations = []
     if settings.on_deck_enabled:
         enabled_stations.append(("on_deck", locations["on_deck_location"]))
@@ -2488,6 +4634,24 @@ def rebuild_pallet_motion_scripts(session: Session) -> dict:
     for operation in ("load", "unload"):
         name = f"{operation}_mill.script"
         files[name] = _mill_motion_script_content(settings, operation)
+
+    mill_pose = locations.get("robot_mill_load_unload")
+    mill_pre_entry = _robot_waypoint(generation.get("mill_pre_entry_waypoint"), "Mill pre-entry")
+    mill_entry_exit = locations.get("robot_mill_safe_entry_exit")
+    if not isinstance(mill_pose, dict) or mill_pre_entry is None or not isinstance(mill_entry_exit, dict):
+        raise problem(422, "Configure all robot mill poses before rebuilding the supervisor.")
+    files["mongo_supervisor.script"] = build_robot_supervisor_script(
+        backend_hostname=settings.robot_supervisor_hostname,
+        backend_port=settings.robot_supervisor_port,
+        heartbeat_seconds=settings.robot_supervisor_heartbeat_seconds,
+        telemetry_hz=settings.robot_supervisor_telemetry_hz,
+        reconnect_limit_seconds=settings.robot_supervisor_reconnect_limit_seconds,
+        pool_locations=locations["pool_locations"],
+        mill_pose=mill_pose,
+        mill_pre_entry_pose=mill_pre_entry,
+        mill_entry_exit_pose=mill_entry_exit,
+        generation=generation,
+    )
 
     try:
         remote_paths = sync_generated_scripts(
@@ -2508,6 +4672,7 @@ def rebuild_pallet_motion_scripts(session: Session) -> dict:
                 "slot": item["slot"],
                 "pick_program": remote_paths[item["pick_program"]],
                 "put_program": remote_paths[item["put_program"]],
+                "reliability_program": remote_paths[item["reliability_program"]],
             }
             for item in mappings
         ],
@@ -2526,11 +4691,11 @@ def queue_pallet(
 ) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
     _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, pallet)
     if pallet.location == "machine":
         pallet.location = "pool"
         pallet.pool_slot_number = first_open_pool_slot(session, settings)
@@ -2565,11 +4730,11 @@ def dequeue_pallet(
 ) -> None:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    assert_run_mode_inactive(settings)
     _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, pallet)
     if pallet.queue_position is None:
         raise problem(409, "Pallet is not in the Queue.")
     pallet.queue_position = None
@@ -2582,7 +4747,6 @@ def dequeue_pallet(
 def reorder_queue(session: Session, payload: ReorderQueue) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
     _assert_no_locked_motion(session)
     queue = session.scalars(
         select(Pallet).where(Pallet.queue_position.is_not(None))
@@ -2591,6 +4755,10 @@ def reorder_queue(session: Session, payload: ReorderQueue) -> None:
         raise problem(422, "Queue contains duplicate pallet IDs.")
     if set(payload.pallet_ids) != {item.id for item in queue}:
         raise problem(422, "Queue reorder must contain every queued pallet exactly once.")
+    if settings.run_mode_enabled:
+        for item in queue:
+            if item.location == "machine" and payload.pallet_ids[item.queue_position] != item.id:
+                raise problem(409, "The pallet in the mill must keep its current queue position during Run Mode.")
     by_id = {item.id: item for item in queue}
     for item in queue:
         item.queue_position = None
@@ -2604,11 +4772,11 @@ def reorder_queue(session: Session, payload: ReorderQueue) -> None:
 def delete_pallet(session: Session, pallet_id: str, expected_revision: int) -> None:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    assert_run_mode_inactive(settings)
     _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    assert_pallet_manageable_during_run(settings, pallet)
     was_queued = pallet.queue_position is not None
     session.delete(pallet)
     session.flush()
@@ -2618,8 +4786,8 @@ def delete_pallet(session: Session, pallet_id: str, expected_revision: int) -> N
     commit_or_conflict(session)
 
 
-def reconcile_programs(session: Session, settings: AppSettings) -> list[str]:
-    programs, _ = available_programs(settings)
+def reconcile_programs(session: Session, settings: AppSettings, *, force_scan: bool = False) -> list[str]:
+    programs, _ = available_programs(settings, force=force_scan)
     available = set(programs)
     cleared: list[str] = []
     assigned = session.scalars(
@@ -2633,16 +4801,39 @@ def reconcile_programs(session: Session, settings: AppSettings) -> list[str]:
 
 
 def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
+    _assert_reliability_inactive(session)
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     assert_run_mode_inactive(settings)
+    program_catalog_changed = (
+        payload.source_folder is not None or payload.program_extensions is not None
+    )
+    supervisor_script_changed = any(
+        value is not None
+        for value in (
+            payload.pool_slot_count,
+            payload.pool_locations,
+            payload.on_deck_enabled,
+            payload.dripping_enabled,
+            payload.on_deck_location,
+            payload.dripping_location,
+            payload.robot_mill_load_unload,
+            payload.robot_mill_safe_entry_exit,
+            payload.pallet_motion_generation,
+            payload.robot_supervisor_hostname,
+            payload.robot_supervisor_port,
+            payload.robot_supervisor_heartbeat_seconds,
+            payload.robot_supervisor_telemetry_hz,
+            payload.robot_supervisor_reconnect_limit_seconds,
+        )
+    )
     highest_occupied = session.scalar(
         select(Pallet.pool_slot_number)
         .where(Pallet.location == "pool")
         .order_by(Pallet.pool_slot_number.desc())
         .limit(1)
     )
-    if highest_occupied and payload.pool_slot_count < highest_occupied:
+    if highest_occupied and payload.pool_slot_count is not None and payload.pool_slot_count < highest_occupied:
         raise problem(
             409,
             f"Pool position {highest_occupied} is occupied. Move that pallet before reducing capacity.",
@@ -2656,13 +4847,17 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     if payload.dripping_enabled is not None:
         settings.dripping_enabled = payload.dripping_enabled
 
-    settings.source_folder = payload.source_folder.strip()
-    settings.program_extensions = json.dumps(
-        normalize_extensions(payload.program_extensions),
-        separators=(",", ":"),
-    )
-    settings.weight_unit = payload.weight_unit
-    settings.pool_slot_count = payload.pool_slot_count
+    if payload.source_folder is not None:
+        settings.source_folder = payload.source_folder.strip()
+    if payload.program_extensions is not None:
+        settings.program_extensions = json.dumps(
+            normalize_extensions(payload.program_extensions),
+            separators=(",", ":"),
+        )
+    if payload.weight_unit is not None:
+        settings.weight_unit = payload.weight_unit
+    if payload.pool_slot_count is not None:
+        settings.pool_slot_count = payload.pool_slot_count
     store_pallet_location_positions(
         settings,
         [item.model_dump() for item in payload.pool_locations] if payload.pool_locations is not None else None,
@@ -2673,14 +4868,51 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         payload.mill_load_unload_g53.model_dump() if payload.mill_load_unload_g53 is not None else None,
         payload.mill_pallet_change_g53.model_dump() if payload.mill_pallet_change_g53 is not None else None,
     )
-    settings.debug_menu_enabled = payload.debug_menu_enabled
+    if payload.debug_menu_enabled is not None:
+        settings.debug_menu_enabled = payload.debug_menu_enabled
     if payload.manual_io_control_enabled is not None:
         settings.manual_io_control_enabled = payload.manual_io_control_enabled
-    settings.robot_connection_mode = payload.robot_connection_mode
-    settings.robot_host = payload.robot_host
-    settings.robot_port = payload.robot_port
-    settings.robot_poll_hz = payload.robot_poll_hz
-    settings.robot_timeout_seconds = payload.robot_timeout_seconds
+    if payload.run_mode_safety_confirm is not None:
+        settings.run_mode_safety_confirm = payload.run_mode_safety_confirm
+    if payload.robot_connection_mode is not None:
+        settings.robot_connection_mode = payload.robot_connection_mode
+    if payload.robot_host is not None:
+        settings.robot_host = payload.robot_host
+    if payload.robot_port is not None:
+        settings.robot_port = payload.robot_port
+    if payload.robot_poll_hz is not None:
+        settings.robot_poll_hz = payload.robot_poll_hz
+    if payload.robot_timeout_seconds is not None:
+        settings.robot_timeout_seconds = payload.robot_timeout_seconds
+    supervisor_listener_changed = False
+    if payload.robot_supervisor_enabled is not None:
+        if payload.robot_supervisor_enabled and not settings.robot_supervisor_activation_verified:
+            raise problem(409, "Run a successful no-motion supervisor bootstrap test before enabling supervisor commands.")
+        settings.robot_supervisor_enabled = payload.robot_supervisor_enabled
+    if payload.robot_supervisor_hostname is not None:
+        settings.robot_supervisor_hostname = payload.robot_supervisor_hostname
+        settings.robot_supervisor_activation_verified = False
+        settings.robot_supervisor_enabled = False
+    if payload.robot_supervisor_listen_host is not None:
+        settings.robot_supervisor_listen_host = payload.robot_supervisor_listen_host or "0.0.0.0"
+        settings.robot_supervisor_activation_verified = False
+        settings.robot_supervisor_enabled = False
+        supervisor_listener_changed = True
+    if payload.robot_supervisor_port is not None:
+        settings.robot_supervisor_port = payload.robot_supervisor_port
+        settings.robot_supervisor_activation_verified = False
+        settings.robot_supervisor_enabled = False
+        supervisor_listener_changed = True
+    if payload.robot_supervisor_heartbeat_seconds is not None:
+        settings.robot_supervisor_heartbeat_seconds = payload.robot_supervisor_heartbeat_seconds
+        supervisor_listener_changed = True
+    if payload.robot_supervisor_telemetry_hz is not None:
+        settings.robot_supervisor_telemetry_hz = payload.robot_supervisor_telemetry_hz
+        supervisor_listener_changed = True
+    if payload.robot_supervisor_reconnect_limit_seconds is not None:
+        settings.robot_supervisor_reconnect_limit_seconds = payload.robot_supervisor_reconnect_limit_seconds
+    if payload.robot_supervisor_pre_dispatch_fallback is not None:
+        settings.robot_supervisor_pre_dispatch_fallback = payload.robot_supervisor_pre_dispatch_fallback
     if payload.debug_program_button_count is not None:
         settings.debug_program_button_count = payload.debug_program_button_count
     if payload.debug_mill_program_button_count is not None:
@@ -2735,6 +4967,14 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.mill_programs_filter_enabled = payload.mill_programs_filter_enabled
     if payload.mill_editor_command is not None:
         settings.mill_editor_command = payload.mill_editor_command
+    if payload.mill_results_archiving_enabled is not None:
+        settings.mill_results_archiving_enabled = payload.mill_results_archiving_enabled
+    if payload.mill_results_source_path is not None:
+        settings.mill_results_source_path = payload.mill_results_source_path
+    if payload.mill_results_archive_directory is not None:
+        settings.mill_results_archive_directory = payload.mill_results_archive_directory
+    if settings.mill_results_archiving_enabled:
+        _mill_results_paths(settings)
     if payload.fusion_tool_library_path is not None:
         settings.fusion_tool_library_path = payload.fusion_tool_library_path
     if payload.workholding_library is not None:
@@ -2748,20 +4988,38 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         slots = [item["slot"] for item in mappings]
         if len(slots) != len(set(slots)):
             raise problem(422, "Each pool position can have only one pallet-motion program mapping.")
-        if any(slot > payload.pool_slot_count for slot in slots):
+        if any(slot > (payload.pool_slot_count or settings.pool_slot_count) for slot in slots):
             raise problem(422, "A pallet-motion mapping is outside the configured pool capacity.")
         settings.pallet_motion_programs = json.dumps(mappings, separators=(",", ":"))
     if payload.pallet_motion_generation is not None:
         generation = payload.pallet_motion_generation.model_dump()
-        waypoint_names = [item["name"].casefold() for item in generation["travel_waypoints"]]
-        if len(waypoint_names) != len(set(waypoint_names)):
-            raise problem(422, "Travel waypoint names must be unique.")
+        intermediate_names = [item["name"].casefold() for item in generation["intermediate_safe_poses"]]
+        if len(intermediate_names) != len(set(intermediate_names)):
+            raise problem(422, "Intermediate safe-pose names must be unique.")
+        pool_capacity = payload.pool_slot_count or settings.pool_slot_count
+        if any(slot > pool_capacity for item in generation["intermediate_safe_poses"] for slot in item["pool_slots"]):
+            raise problem(422, "An intermediate safe pose is assigned outside the configured pool capacity.")
         settings.pallet_motion_generation = json.dumps(generation, separators=(",", ":"))
-    if not payload.debug_menu_enabled:
+    if payload.debug_menu_enabled is False:
         settings.machine_state = "idle"
-    cleared = reconcile_programs(session, settings)
+    if supervisor_script_changed:
+        settings.robot_supervisor_activation_verified = False
+        settings.robot_supervisor_enabled = False
+    # Settings like robot poses, display units, or I/O labels must never erase
+    # pallet program assignments just because a network program folder is slow
+    # or temporarily unavailable. Reconcile only when the catalog itself changes;
+    # the explicit refresh endpoint remains available for an operator-led scan.
+    cleared = reconcile_programs(session, settings) if program_catalog_changed else []
     bump(settings)
     commit_or_conflict(session)
+    if supervisor_listener_changed:
+        robot_supervisor().start(
+            settings.robot_supervisor_listen_host,
+            settings.robot_supervisor_port,
+            settings.robot_supervisor_heartbeat_seconds,
+            settings.robot_supervisor_telemetry_hz,
+        )
+    _clear_telemetry_caches()
     return cleared
 
 
@@ -2817,21 +5075,87 @@ def configure_debug_mill_program(session: Session, payload: ConfigureDebugMillPr
     commit_or_conflict(session)
 
 
-def run_debug_program(session: Session, payload: RunDebugProgram) -> None:
+def run_debug_program(session: Session, payload: RunDebugProgram) -> bool:
+    _assert_reliability_inactive(session)
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
         raise problem(409, "Running controller programs requires a configured physical robot.")
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before starting a manual controller program.")
+    if _locked_motion(session):
+        raise problem(409, "Resolve or wait for the active robot pallet movement before starting a manual program.")
     buttons = _load_debug_program_buttons(settings)
     if payload.index >= len(buttons):
         raise problem(422, "That program button is not enabled in Settings.")
     filename = buttons[payload.index]["filename"]
     if not filename:
         raise problem(422, "Configure a controller filename for this program button first.")
+    restore_supervisor = False
+    if settings.robot_supervisor_enabled and not settings.robot_supervisor_maintenance_mode:
+        command = _new_supervisor_command(
+            session,
+            motion=None,
+            operation="enter_maintenance",
+            opcode=OP_ENTER_MAINTENANCE,
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            command,
+            max(5.0, settings.robot_timeout_seconds * 4),
+            allow_pre_dispatch_fallback=False,
+        )
+        if outcome != "completed":
+            raise problem(409, f"Could not enter supervisor Maintenance Mode: {detail}")
+        settings = get_settings(session)
+        settings.robot_supervisor_maintenance_mode = True
+        bump(settings)
+        commit_or_conflict(session)
+        restore_supervisor = True
     try:
         run_robot_program(settings.robot_host.strip(), filename, settings.robot_timeout_seconds)
     except RobotDashboardError as exc:
+        if restore_supervisor:
+            try:
+                bootstrap_robot_supervisor(session)
+            except HTTPException:
+                pass
         raise problem(502, str(exc)) from exc
+    return restore_supervisor
+
+
+def restore_supervisor_after_arbitrary_program(session_factory) -> None:
+    """Wait for a Maintenance Mode program to finish, then restore the persistent supervisor."""
+    observed_running = False
+    stopped_polls = 0
+    deadline = time.monotonic() + 24 * 60 * 60
+    while time.monotonic() < deadline:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not settings.robot_supervisor_maintenance_mode:
+                return
+            host = settings.robot_host.strip()
+            timeout_seconds = settings.robot_timeout_seconds
+        try:
+            running = robot_program_running(host, timeout_seconds)
+        except RobotDashboardError:
+            time.sleep(2)
+            continue
+        if running:
+            observed_running = True
+            stopped_polls = 0
+        else:
+            stopped_polls += 1
+            if stopped_polls >= (2 if observed_running else 4):
+                break
+        time.sleep(0.5)
+    with session_factory() as session:
+        try:
+            bootstrap_robot_supervisor(session)
+        except HTTPException:
+            # Maintenance Mode remains visible and operator-recoverable when
+            # the controller or network does not return after the program.
+            session.rollback()
 
 
 def mill_program_files(session: Session) -> list[str]:
@@ -2850,7 +5174,52 @@ def mill_program_files(session: Session) -> list[str]:
         raise problem(502, str(exc)) from exc
 
 
+def pallet_program_files(session: Session) -> list[str]:
+    """List assignable mill programs from the same SFTP root as Mill Programs."""
+    settings = get_settings(session)
+    extensions = set(json.loads(settings.mill_program_extensions))
+    remote_configured = bool(
+        settings.mill_programs_page_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    )
+    if remote_configured:
+        root = PurePosixPath(settings.mill_file_directory)
+        key = (
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            str(root), tuple(sorted(extensions)),
+        )
+        now = time.monotonic()
+        with _PALLET_PROGRAM_REMOTE_LOCK:
+            cached = _PALLET_PROGRAM_REMOTE_CACHE.get(key)
+            if cached and now - cached[0] < 10.0:
+                return list(cached[1])
+        try:
+            files = list_robot_program_files(
+                host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
+                username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
+                directory=str(root), extensions=extensions,
+                timeout_seconds=settings.cnc_timeout_seconds,
+            )
+            relative_files = [str(PurePosixPath(path).relative_to(root)) for path in files]
+            with _PALLET_PROGRAM_REMOTE_LOCK:
+                _PALLET_PROGRAM_REMOTE_CACHE[key] = (time.monotonic(), list(relative_files))
+            return relative_files
+        except RobotFileAccessError:
+            # A brief PathPilot outage should not invalidate a selection the UI
+            # loaded moments earlier. Keep a bounded last-known-good file list.
+            with _PALLET_PROGRAM_REMOTE_LOCK:
+                cached = _PALLET_PROGRAM_REMOTE_CACHE.get(key)
+                if cached and now - cached[0] < 300.0:
+                    return list(cached[1])
+
+    local_programs, _ = available_programs(settings)
+    return local_programs
+
+
 def run_debug_mill_program(session: Session, payload: RunDebugMillProgram) -> None:
+    _assert_reliability_inactive(session)
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     if not settings.cnc_telemetry_enabled or not settings.cnc_host.strip() or not settings.cnc_ssh_username:
@@ -2872,10 +5241,15 @@ def run_debug_mill_program(session: Session, payload: RunDebugMillProgram) -> No
 
 
 def toggle_debug_io(session: Session, payload: ToggleDebugIo) -> None:
+    _assert_reliability_inactive(session)
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     if not settings.manual_io_control_enabled:
         raise problem(403, "Manual I/O control is locked in Settings.")
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before manually changing robot I/O.")
+    if _locked_motion(session):
+        raise problem(409, "Resolve or wait for the active robot pallet movement before manually changing I/O.")
 
     if payload.bank == "tool" and payload.index > 1:
         raise problem(422, "Tool I/O indices only allow 0 or 1.")
@@ -2885,6 +5259,35 @@ def toggle_debug_io(session: Session, payload: ToggleDebugIo) -> None:
             raise problem(409, "Physical robot inputs are read-only.")
         if not settings.robot_host.strip():
             raise problem(409, "Physical robot mode requires a configured robot host.")
+        if settings.robot_supervisor_enabled:
+            status = robot_supervisor().status()
+            telemetry = status.get("telemetry") or {}
+            mask = telemetry.get(f"{payload.bank}_outputs")
+            if not isinstance(mask, int):
+                raise problem(409, f"Supervisor telemetry does not currently expose {payload.bank} output state.")
+            opcodes = {
+                "standard": OP_SET_STANDARD_OUTPUT,
+                "configurable": OP_SET_CONFIGURABLE_OUTPUT,
+                "tool": OP_SET_TOOL_OUTPUT,
+            }
+            command = _new_supervisor_command(
+                session,
+                motion=None,
+                operation=f"set_{payload.bank}_output",
+                opcode=opcodes[payload.bank],
+                argument=payload.index,
+                value=0 if mask & (1 << payload.index) else 1,
+            )
+            outcome, detail = _dispatch_supervisor_command(
+                session,
+                command,
+                max(5.0, settings.robot_timeout_seconds * 4),
+                allow_pre_dispatch_fallback=settings.robot_supervisor_pre_dispatch_fallback,
+            )
+            if outcome == "completed":
+                return
+            if outcome != "fallback":
+                raise problem(409, detail)
         try:
             toggle_robot_digital_output(
                 settings.robot_host.strip(),
@@ -2930,7 +5333,7 @@ def rename_debug_io(session: Session, payload: RenameDebugIo) -> None:
 def refresh_programs(session: Session, expected_revision: int) -> list[str]:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    cleared = reconcile_programs(session, settings)
+    cleared = reconcile_programs(session, settings, force_scan=True)
     if cleared:
         bump(settings)
         commit_or_conflict(session)

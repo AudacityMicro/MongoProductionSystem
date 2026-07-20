@@ -12,6 +12,7 @@ htmlcov/
 .env
 .tmp/
 logs/
+data/
 runtime/
 dist/
 build/

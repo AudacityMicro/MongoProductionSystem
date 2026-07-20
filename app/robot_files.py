@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 from pathlib import PurePosixPath
+import socket
 import stat
+from threading import RLock
 from typing import BinaryIO, Iterator
 
 import paramiko
@@ -17,6 +20,16 @@ class RobotFileConflict(RobotFileAccessError):
     def __init__(self, destination: PurePosixPath):
         self.destination = str(destination)
         super().__init__(f"A file or folder named '{destination.name}' already exists.")
+
+
+_SFTP_LOCKS_GUARD = RLock()
+_SFTP_OPERATION_LOCKS: dict[tuple[str, int, str], RLock] = {}
+
+
+def _sftp_operation_lock(host: str, port: int, username: str) -> RLock:
+    key = (host, port, username)
+    with _SFTP_LOCKS_GUARD:
+        return _SFTP_OPERATION_LOCKS.setdefault(key, RLock())
 
 
 def _root_path(directory: str) -> PurePosixPath:
@@ -45,21 +58,32 @@ def robot_sftp_client(
 ) -> Iterator[paramiko.SFTPClient]:
     if not username or not password:
         raise RobotFileAccessError("Enter an SFTP username and password in Settings first.")
+    connection: socket.socket | None = None
     transport: paramiko.Transport | None = None
     sftp: paramiko.SFTPClient | None = None
+    operation_lock = _sftp_operation_lock(host, port, username)
+    operation_lock.acquire()
     try:
-        transport = paramiko.Transport((host, port))
+        connection = socket.create_connection((host, port), timeout=timeout_seconds)
+        connection.settimeout(timeout_seconds)
+        transport = paramiko.Transport(connection)
         transport.banner_timeout = timeout_seconds
+        transport.auth_timeout = timeout_seconds
         transport.connect(username=username, password=password)
         sftp = paramiko.SFTPClient.from_transport(transport)
         yield sftp
     except (OSError, paramiko.SSHException) as exc:
         raise RobotFileAccessError(f"Could not access controller files: {exc}") from exc
     finally:
-        if sftp is not None:
-            sftp.close()
-        if transport is not None:
-            transport.close()
+        try:
+            if sftp is not None:
+                sftp.close()
+            if transport is not None:
+                transport.close()
+            elif connection is not None:
+                connection.close()
+        finally:
+            operation_lock.release()
 
 
 def list_robot_program_files(
@@ -235,6 +259,91 @@ def copy_robot_file(
             return str(destination)
     except RobotFileAccessError:
         raise
+
+
+def remote_file_signature(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    directory: str,
+    path: str,
+    timeout_seconds: float,
+) -> dict[str, int | str] | None:
+    """Return enough metadata to prove that a controller file changed."""
+    root = _root_path(directory)
+    target = _safe_path(root, path)
+    with robot_sftp_client(host, port, username, password, timeout_seconds) as sftp:
+        try:
+            attributes = sftp.stat(str(target))
+        except OSError as exc:
+            if getattr(exc, "errno", None) == 2:
+                return None
+            raise
+        if not stat.S_ISREG(attributes.st_mode):
+            raise RobotFileAccessError(f"Controller path is not a regular file: {target}")
+        digest = hashlib.sha256()
+        with sftp.open(str(target), "rb") as source_file:
+            while chunk := source_file.read(65536):
+                digest.update(chunk)
+        return {
+            "size": int(attributes.st_size),
+            "mtime": int(attributes.st_mtime),
+            "sha256": digest.hexdigest(),
+        }
+
+
+def _ensure_remote_directory(
+    sftp: paramiko.SFTPClient,
+    root: PurePosixPath,
+    directory: PurePosixPath,
+) -> None:
+    current = root
+    for part in directory.parts[len(root.parts):]:
+        current /= part
+        try:
+            attributes = sftp.stat(str(current))
+        except OSError as exc:
+            if getattr(exc, "errno", None) != 2:
+                raise
+            sftp.mkdir(str(current))
+            continue
+        if not stat.S_ISDIR(attributes.st_mode):
+            raise RobotFileAccessError(f"Controller archive path is not a directory: {current}")
+
+
+def copy_remote_file_as(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    directory: str,
+    source: str,
+    destination_directory: str,
+    destination_name: str,
+    timeout_seconds: float,
+) -> str:
+    """Copy a controller file to a new, explicitly named archive file."""
+    root = _root_path(directory)
+    source_path = _safe_path(root, source)
+    destination_root = _safe_path(root, destination_directory)
+    clean_name = PurePosixPath(destination_name).name
+    if not clean_name or clean_name in {".", ".."} or clean_name != destination_name:
+        raise RobotFileAccessError("Choose a valid archive filename without path separators.")
+    destination = _safe_path(root, str(destination_root / clean_name))
+    with robot_sftp_client(host, port, username, password, timeout_seconds) as sftp:
+        _ensure_remote_directory(sftp, root, destination_root)
+        try:
+            sftp.stat(str(destination))
+        except OSError as exc:
+            if getattr(exc, "errno", None) != 2:
+                raise
+        else:
+            raise RobotFileConflict(destination)
+        with sftp.open(str(source_path), "rb") as source_file, sftp.open(str(destination), "wb") as destination_file:
+            while chunk := source_file.read(65536):
+                destination_file.write(chunk)
+    return str(destination)
 
 
 def move_robot_file(

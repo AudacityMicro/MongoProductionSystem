@@ -5,12 +5,22 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+from threading import RLock
+from time import monotonic
 
 import paramiko
 
 
 class CncTelemetryError(RuntimeError):
     """Raised when the controller cannot provide a valid telemetry snapshot."""
+
+
+_SSH_LOCK = RLock()
+_SSH_CLIENT: paramiko.SSHClient | None = None
+_SSH_KEY: tuple[str, int, str, str, float] | None = None
+_SSH_RETRY_AFTER = 0.0
+_SSH_FAILURE_COUNT = 0
+_SSH_SUSPENDED = False
 
 
 # This runs on the controller and intentionally creates only a linuxcnc.stat()
@@ -315,6 +325,20 @@ print("MONGO_CNC_LABELS=" + json.dumps(labels, allow_nan=False))
 '''
 
 
+_REMOTE_CYCLE_STATE_SCRIPT = r'''import json
+import linuxcnc
+
+s = linuxcnc.stat()
+s.poll()
+print("MONGO_CNC_CYCLE=" + json.dumps({
+    "interp_state": getattr(s, "interp_state", None),
+    "estop": getattr(s, "estop", None),
+    "enabled": getattr(s, "enabled", None),
+    "program": getattr(s, "file", "") or "",
+}, allow_nan=False))
+'''
+
+
 def _remote_command(remote_script: str) -> str:
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     # PathPilot's ordinary SSH shell does not include its LinuxCNC module or
@@ -345,6 +369,69 @@ def _read_remote_payload(
     remote_script: str,
     marker: str,
 ) -> dict:
+    with _SSH_LOCK:
+        client = _persistent_ssh_client(host, port, username, password, timeout)
+        try:
+            _, stdout, stderr = client.exec_command(_remote_command(remote_script), timeout=timeout, get_pty=False)
+            output = stdout.read().decode("utf-8", errors="replace")
+            error_output = stderr.read().decode("utf-8", errors="replace").strip()
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            _close_ssh_client()
+            _record_ssh_failure()
+            raise CncTelemetryError(str(exc)) from exc
+
+    for line in reversed(output.splitlines()):
+        if line.startswith(marker):
+            try:
+                return json.loads(line.removeprefix(marker))
+            except json.JSONDecodeError as exc:
+                raise CncTelemetryError("Controller returned invalid LinuxCNC telemetry JSON.") from exc
+    detail = error_output or output.strip() or "No telemetry response received."
+    raise CncTelemetryError(detail)
+
+
+def _record_ssh_failure() -> None:
+    global _SSH_FAILURE_COUNT, _SSH_RETRY_AFTER
+    _SSH_FAILURE_COUNT += 1
+    delay = min(60.0, 5.0 * (2 ** min(_SSH_FAILURE_COUNT - 1, 4)))
+    _SSH_RETRY_AFTER = monotonic() + delay
+
+
+def _close_ssh_client() -> None:
+    global _SSH_CLIENT, _SSH_KEY
+    client = _SSH_CLIENT
+    _SSH_CLIENT = None
+    _SSH_KEY = None
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _persistent_ssh_client(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+) -> paramiko.SSHClient:
+    global _SSH_CLIENT, _SSH_KEY, _SSH_FAILURE_COUNT, _SSH_RETRY_AFTER
+    if _SSH_SUSPENDED:
+        raise CncTelemetryError("CNC communication is suspended while the backend is shutting down.")
+
+    key = (host, port, username, password, timeout)
+    if _SSH_CLIENT is not None and _SSH_KEY == key:
+        transport = _SSH_CLIENT.get_transport()
+        if transport is not None and transport.is_active():
+            return _SSH_CLIENT
+        _close_ssh_client()
+
+    if monotonic() < _SSH_RETRY_AFTER:
+        remaining = max(1, int(_SSH_RETRY_AFTER - monotonic() + 0.999))
+        raise CncTelemetryError(f"CNC SSH reconnect is cooling down after a connection failure; retry in {remaining} seconds.")
+
+    _close_ssh_client()
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -359,26 +446,46 @@ def _read_remote_payload(
             allow_agent=False,
             look_for_keys=False,
         )
-        _, stdout, stderr = client.exec_command(_remote_command(remote_script), timeout=timeout, get_pty=False)
-        output = stdout.read().decode("utf-8", errors="replace")
-        error_output = stderr.read().decode("utf-8", errors="replace").strip()
-    except (paramiko.SSHException, OSError) as exc:
-        raise CncTelemetryError(str(exc)) from exc
-    finally:
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(15)
+    except (paramiko.SSHException, EOFError, OSError) as exc:
         client.close()
+        _record_ssh_failure()
+        raise CncTelemetryError(str(exc)) from exc
 
-    for line in reversed(output.splitlines()):
-        if line.startswith(marker):
-            try:
-                return json.loads(line.removeprefix(marker))
-            except json.JSONDecodeError as exc:
-                raise CncTelemetryError("Controller returned invalid LinuxCNC telemetry JSON.") from exc
-    detail = error_output or output.strip() or "No telemetry response received."
-    raise CncTelemetryError(detail)
+    _SSH_CLIENT = client
+    _SSH_KEY = key
+    _SSH_FAILURE_COUNT = 0
+    _SSH_RETRY_AFTER = 0.0
+    return client
+
+
+def suspend_cnc_connections() -> None:
+    """Close controller sockets before backend shutdown or relaunch."""
+    global _SSH_SUSPENDED
+    with _SSH_LOCK:
+        _SSH_SUSPENDED = True
+        _close_ssh_client()
+
+
+def resume_cnc_connections() -> None:
+    """Allow controller connections after application startup."""
+    global _SSH_SUSPENDED, _SSH_FAILURE_COUNT, _SSH_RETRY_AFTER
+    with _SSH_LOCK:
+        _close_ssh_client()
+        _SSH_SUSPENDED = False
+        _SSH_FAILURE_COUNT = 0
+        _SSH_RETRY_AFTER = 0.0
 
 
 def read_linuxcnc_snapshot(host: str, port: int, username: str, password: str, timeout: float) -> dict:
     return _read_remote_payload(host, port, username, password, timeout, _REMOTE_STATUS_SCRIPT, "MONGO_CNC=")
+
+
+def read_linuxcnc_cycle_state(host: str, port: int, username: str, password: str, timeout: float) -> dict:
+    """Read only the fields needed while monitoring a running program."""
+    return _read_remote_payload(host, port, username, password, timeout, _REMOTE_CYCLE_STATE_SCRIPT, "MONGO_CNC_CYCLE=")
 
 
 def read_linuxcnc_io_labels(host: str, port: int, username: str, password: str, timeout: float) -> dict:

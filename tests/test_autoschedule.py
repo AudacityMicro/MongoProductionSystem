@@ -37,9 +37,10 @@ def test_autoschedule_preview_and_apply_use_live_atc(
     monkeypatch,
 ) -> None:
     program_dir = tmp_path / "programs"
-    program_dir.mkdir()
-    (program_dir / "a.nc").write_text("a", encoding="utf-8")
-    (program_dir / "b.nc").write_text("b", encoding="utf-8")
+    gcode_dir = program_dir / "Gcode"
+    gcode_dir.mkdir(parents=True)
+    (gcode_dir / "a.nc").write_text("a", encoding="utf-8")
+    (gcode_dir / "b.nc").write_text("b", encoding="utf-8")
     board = client.get("/api/board").json()
     board = client.put(
         "/api/settings",
