@@ -42,6 +42,8 @@ class FakeRealtimeConnection:
     def __init__(self, data: bytes) -> None:
         self.data = bytearray(data)
         self.timeout = 1.0
+        self.shutdown_calls: list[int] = []
+        self.closed = False
 
     def settimeout(self, timeout: float) -> None:
         self.timeout = timeout
@@ -56,7 +58,10 @@ class FakeRealtimeConnection:
         return result
 
     def close(self) -> None:
-        return None
+        self.closed = True
+
+    def shutdown(self, how: int) -> None:
+        self.shutdown_calls.append(how)
 
 
 def realtime_packet(timestamp: float) -> bytes:
@@ -65,6 +70,46 @@ def realtime_packet(timestamp: float) -> bytes:
     struct.pack_into(">d", packet, 4, timestamp)
     struct.pack_into(">d", packet, 4 + ((132 - 1) * 8), 1.0)
     return bytes(packet)
+
+
+def primary_state_packet() -> bytes:
+    robot_mode = struct.pack(
+        ">Q???????BBddd",
+        2_500_000,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        7,
+        0,
+        1.0,
+        0.75,
+        1.0,
+    )
+    joints = b"".join(
+        struct.pack(">dddffffB", index + 0.1, index + 0.2, index + 0.3, index + 0.4, 48.0, 30.0 + index, 31.0 + index, 253)
+        for index in range(6)
+    )
+    masterboard = bytearray(69)
+    struct.pack_into(">II", masterboard, 0, 0x201, 0x402)
+    masterboard[8:10] = bytes((1, 0))
+    struct.pack_into(">dd", masterboard, 10, 1.25, 2.5)
+    masterboard[26:28] = bytes((0, 1))
+    struct.pack_into(">dd", masterboard, 28, 0.4, 0.8)
+    masterboard[60] = 1
+    tool = bytearray(32)
+    tool[0:2] = bytes((0, 1))
+    struct.pack_into(">dd", tool, 2, 3.25, 4.5)
+    cartesian = struct.pack(">12d", 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, *([0.0] * 6))
+
+    def package(package_type: int, payload: bytes) -> bytes:
+        return struct.pack(">IB", len(payload) + 5, package_type) + payload
+
+    payload = b"".join((package(0, robot_mode), package(1, joints), package(2, tool), package(3, masterboard), package(4, cartesian)))
+    return struct.pack(">IB", len(payload) + 5, 16) + payload
 
 
 def test_legacy_io_uses_one_modbus_connection(monkeypatch) -> None:
@@ -108,6 +153,46 @@ def test_background_realtime_reader_continuously_drains_to_latest_packet(monkeyp
     robot_rtde.resume_robot_connections()
     with robot_rtde._LIVE_CONNECTION_LOCK:
         robot_rtde._disconnect_legacy_realtime()
+
+
+def test_primary_state_parser_exposes_motion_and_io_data() -> None:
+    sample = robot_rtde._parse_primary_state(primary_state_packet())
+
+    assert sample.timestamp == 2.5
+    assert sample.actual_q == pytest.approx([0.1, 1.1, 2.1, 3.1, 4.1, 5.1])
+    assert sample.actual_qd == pytest.approx([0.3, 1.3, 2.3, 3.3, 4.3, 5.3])
+    assert sample.actual_current == pytest.approx([0.4, 1.4, 2.4, 3.4, 4.4, 5.4])
+    assert sample.actual_TCP_pose == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert sample.actual_digital_input_bits == 0x201
+    assert sample.actual_digital_output_bits == 0x402
+    assert sample.standard_analog_input0 == pytest.approx(1.25)
+    assert sample.standard_analog_output1 == pytest.approx(0.8)
+    assert sample.tool_analog_input1 == pytest.approx(4.5)
+    assert sample.robot_mode == 7
+    assert sample.safety_mode == 1
+    assert sample.runtime_state == "stopped"
+    assert sample.speed_scaling == 0.75
+
+
+def test_primary_reader_connects_to_primary_interface(monkeypatch) -> None:
+    robot_rtde.resume_robot_connections()
+    with robot_rtde._LIVE_CONNECTION_LOCK:
+        robot_rtde._disconnect_legacy_realtime()
+    connection = FakeRealtimeConnection(primary_state_packet())
+    targets = []
+
+    def fake_connect(target, **_kwargs):
+        targets.append(target)
+        return connection
+
+    monkeypatch.setattr(robot_rtde.socket, "create_connection", fake_connect)
+
+    sample = robot_rtde._read_legacy_realtime_sample("192.0.2.41", 0.5)
+
+    assert targets == [("192.0.2.41", 30001)]
+    assert sample.actual_digital_input_bits == 0x201
+    with robot_rtde._LIVE_CONNECTION_LOCK:
+        robot_rtde._disconnect_legacy_realtime()
     connection = FakeRealtimeConnection(
         realtime_packet(20.0) + realtime_packet(21.0) + realtime_packet(22.0)
     )
@@ -119,6 +204,45 @@ def test_background_realtime_reader_continuously_drains_to_latest_packet(monkeyp
     assert connection.data == bytearray()
     with robot_rtde._LIVE_CONNECTION_LOCK:
         robot_rtde._disconnect_legacy_realtime()
+
+
+def test_realtime_disconnect_interrupts_reader_before_closing_socket() -> None:
+    connection = FakeRealtimeConnection(b"")
+    with robot_rtde._LIVE_CONNECTION_LOCK:
+        robot_rtde._REALTIME_CONNECTION = connection
+        robot_rtde._REALTIME_CONNECTION_HOST = "192.0.2.42"
+        robot_rtde._REALTIME_READER_STARTED_AT = 10.0
+        robot_rtde._disconnect_legacy_realtime()
+
+    assert connection.shutdown_calls == [robot_rtde.socket.SHUT_RDWR]
+    assert connection.closed is True
+    assert robot_rtde._REALTIME_CONNECTION is None
+    assert robot_rtde._REALTIME_READER_STARTED_AT == 0.0
+
+
+def test_new_reader_without_first_sample_is_not_immediately_replaced(monkeypatch) -> None:
+    class AliveReader:
+        def is_alive(self) -> bool:
+            return True
+
+    starts = []
+    robot_rtde._REALTIME_CONNECTION_HOST = "192.0.2.43"
+    robot_rtde._REALTIME_READER = AliveReader()
+    robot_rtde._REALTIME_READER_STARTED_AT = 95.0
+    robot_rtde._REALTIME_LATEST_AT = 0.0
+    robot_rtde._REALTIME_LATEST_PACKET = None
+    robot_rtde._REALTIME_READER_ERROR = "waiting"
+    monkeypatch.setattr(robot_rtde, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(robot_rtde, "_start_legacy_realtime_reader", lambda *args: starts.append(args))
+    monkeypatch.setattr(robot_rtde._REALTIME_SAMPLE_EVENT, "wait", lambda *_args: False)
+
+    with pytest.raises(robot_rtde.RobotTelemetryError, match="waiting"):
+        robot_rtde._read_legacy_realtime_sample("192.0.2.43", 0.5)
+
+    assert starts == []
+    robot_rtde._REALTIME_READER = None
+    robot_rtde._REALTIME_CONNECTION_HOST = None
+    robot_rtde._REALTIME_READER_STARTED_AT = 0.0
 
 
 def test_realtime_snapshot_does_not_poll_modbus_automatically(monkeypatch) -> None:
@@ -215,7 +339,7 @@ def test_telemetry_retries_after_cooldown_and_clears_backoff_on_success(monkeypa
     assert key not in robot_rtde._TELEMETRY_RETRY_AFTER
 
 
-def test_stale_legacy_reader_is_replaced_before_its_socket_timeout(monkeypatch) -> None:
+def test_stale_legacy_reader_is_replaced_after_independent_stall_window(monkeypatch) -> None:
     class StaleReader:
         def is_alive(self) -> bool:
             return True
@@ -228,7 +352,12 @@ def test_stale_legacy_reader_is_replaced_before_its_socket_timeout(monkeypatch) 
         robot_rtde._REALTIME_READER = StaleReader()
         robot_rtde._REALTIME_LATEST_PACKET = b"stale"
         robot_rtde._REALTIME_LATEST_AT = 0.0
-    monkeypatch.setattr(robot_rtde, "monotonic", lambda: 10.0)
+        robot_rtde._REALTIME_READER_STARTED_AT = 0.0
+    monkeypatch.setattr(
+        robot_rtde,
+        "monotonic",
+        lambda: robot_rtde._REALTIME_READER_STALL_SECONDS + 1.0,
+    )
     monkeypatch.setattr(
         robot_rtde,
         "_start_legacy_realtime_reader",

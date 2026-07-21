@@ -22,7 +22,10 @@ _DASHBOARD_HEALTH_MAX_AGE_SECONDS = 30.0
 class _DashboardSession:
     def __init__(self, host: str, timeout_seconds: float):
         self.host = host
-        self.timeout_seconds = timeout_seconds
+        # Dashboard is low-rate and command-oriented. A short user setting is
+        # useful for sample freshness, but too aggressive for a fresh TCP/banner
+        # exchange on the shop network.
+        self.timeout_seconds = max(5.0, timeout_seconds)
         self.connection: socket.socket | None = None
         self.buffer = bytearray()
 
@@ -185,6 +188,29 @@ def robot_program_running(host: str, timeout_seconds: float) -> bool:
     if normalized.endswith("false"):
         return False
     raise RobotDashboardError(f"Dashboard returned an unrecognized running state: {response}")
+
+
+def robot_program_status(host: str, timeout_seconds: float) -> dict[str, object]:
+    """Read run state and loaded program together for conservative idle confirmation."""
+    with robot_command_lock(host):
+        with _DashboardSession(host, timeout_seconds) as dashboard:
+            running_response = dashboard.command("running")
+            normalized = running_response.strip().casefold()
+            if normalized.endswith("true"):
+                running = True
+            elif normalized.endswith("false"):
+                running = False
+            else:
+                raise RobotDashboardError(f"Dashboard returned an unrecognized running state: {running_response}")
+            loaded_response = dashboard.command("get loaded program")
+            if loaded_response.startswith("Loaded program:"):
+                loaded_program = loaded_response.removeprefix("Loaded program:").strip() or None
+            elif "No program loaded" in loaded_response:
+                loaded_program = None
+            else:
+                raise RobotDashboardError(f"Dashboard returned an unrecognized loaded-program state: {loaded_response}")
+    _record_dashboard_reachable(host, running_response)
+    return {"running": running, "loaded_program": loaded_program}
 
 
 def clear_robot_fault(host: str, timeout_seconds: float) -> dict:

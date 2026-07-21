@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+
 import pytest
 
 from app.robot_supervisor import (
@@ -41,6 +43,28 @@ def test_corrupt_checksum_is_rejected() -> None:
         decode_frame(bytes(frame))
 
 
+def test_frame_buffer_resynchronizes_after_aligned_garbage() -> None:
+    first = event_frame(1, EVENT_COMPLETED)
+    second = event_frame(2, EVENT_COMPLETED)
+    buffer = FrameBuffer()
+
+    frames = buffer.feed(first + struct.pack("!i", 400) + second)
+
+    assert [decode_frame(frame)[3] for frame in frames] == [1, 2]
+    assert buffer.resynchronizations == 1
+
+
+def test_frame_buffer_skips_truncated_frame_and_recovers_next_checksum() -> None:
+    damaged = event_frame(1, EVENT_COMPLETED)[:-4]
+    valid = event_frame(2, EVENT_COMPLETED)
+    buffer = FrameBuffer()
+
+    frames = buffer.feed(damaged + valid)
+
+    assert [decode_frame(frame)[3] for frame in frames] == [2]
+    assert buffer.resynchronizations >= 1
+
+
 def test_event_ordering_rejects_regression_but_allows_duplicate() -> None:
     manager = RobotSupervisorManager()
     manager._handle_frame(decode_frame(event_frame(4, EVENT_ACCEPTED)))
@@ -61,6 +85,23 @@ def test_unvalidated_socket_is_not_reported_as_connected() -> None:
     manager = RobotSupervisorManager()
     manager._connections.add(object())  # type: ignore[arg-type]
     assert manager.status()["connected"] is False
+
+
+def test_connection_generation_advances_when_same_robot_session_reconnects() -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    manager = RobotSupervisorManager()
+    hello = [1, 10, 9001, 4, EVENT_COMPLETED, 0, 1, 0]
+    manager._activate_connection(Connection(), "robot:50010", hello)  # type: ignore[arg-type]
+    first_generation = manager.status()["connection_generation"]
+
+    manager._activate_connection(Connection(), "robot:50011", hello)  # type: ignore[arg-type]
+
+    assert manager.status()["robot_session"] == 9001
+    assert manager.status()["connection_generation"] == first_generation + 1
+    assert manager.wait_for_connection_generation(first_generation, 0.01) is True
 
 
 def test_event_retention_is_bounded() -> None:

@@ -16,6 +16,10 @@ _PALLET_PAYLOAD_ASSIGNMENT_PREFIX = "global mongo_pallet_payload_kg = "
 _SUPERVISOR_SEQUENCE_PREFIX = "global mongo_last_sequence = "
 
 
+class RobotScriptTransferUncertain(RobotFileAccessError):
+    """The command socket failed after transmission may have started."""
+
+
 def generated_script_directory(project_root: Path) -> Path:
     return project_root / "runtime" / "generated-robot-programs"
 
@@ -484,9 +488,11 @@ def build_robot_supervisor_script(
             invoke=False,
         )))
 
-    telemetry_period = 1.0 / max(0.25, min(float(telemetry_hz), 10.0))
     heartbeat_timeout = max(3.0, float(heartbeat_seconds) * 4.0)
+    # PolyScope 3.2 socket reads have a fixed two-second timeout and no clock API.
+    heartbeat_miss_limit = max(2, int(math.ceil(heartbeat_timeout / 2.0)))
     reconnect_limit = max(1.0, min(float(reconnect_limit_seconds), 60.0))
+    robot_session = int(time.time_ns() % 1_999_999_999) + 1
     dispatcher: list[str] = []
     for pool in pool_locations:
         slot = int(pool["slot"])
@@ -530,7 +536,7 @@ def build_robot_supervisor_script(
         "global mongo_latched = False",
         "global mongo_motion_active = False",
         "global mongo_maintenance_requested = False",
-        "global mongo_robot_session = floor(get_robot_time() * 1000) + 1",
+        f"global mongo_robot_session = {robot_session}",
         "global mongo_last_sequence = 0",
         "global mongo_last_event = 6",
         "global mongo_last_fault = 0",
@@ -544,7 +550,7 @@ def build_robot_supervisor_script(
         "global mongo_pending_fault_code = 0",
         "global mongo_sent_event_sequence = 0",
         "global mongo_sent_event_code = 0",
-        "global mongo_last_backend_heartbeat = get_robot_time()",
+        "global mongo_missed_heartbeats = 0",
         "",
         *functions,
         "",
@@ -593,9 +599,9 @@ def build_robot_supervisor_script(
         "  local tout = read_port_register(22)",
         "  local robot_mode = read_port_register(258)",
         "  local safety_mode = read_port_register(266)",
-        "  local runtime_state = 2",
-        "  if is_steady():",
-        "    runtime_state = 1",
+        "  local runtime_state = 1",
+        "  if mongo_motion_active:",
+        "    runtime_state = 2",
         "  end",
         "  local i = 0",
         "  local bit_value = 1",
@@ -682,13 +688,12 @@ def build_robot_supervisor_script(
         "",
         "thread mongo_communication_thread():",
         "  local reconnect_delay = 1.0",
-        "  local last_telemetry = 0.0",
         "  while not mongo_maintenance_requested:",
         "    if not mongo_connected:",
         f"      mongo_connected = socket_open(\"{backend_hostname.strip()}\", {int(backend_port)}, \"mongo\")",
         "      if mongo_connected:",
         "        reconnect_delay = 1.0",
-        "        mongo_last_backend_heartbeat = get_robot_time()",
+        "        mongo_missed_heartbeats = 0",
         "        local latch_value = 0",
         "        if mongo_latched:",
         "          latch_value = 1",
@@ -707,7 +712,7 @@ def build_robot_supervisor_script(
         "      if incoming[0] == 9:",
         "        local expected = mongo_checksum(incoming[1],incoming[2],incoming[3],incoming[4],incoming[5],incoming[6],incoming[7],incoming[8])",
         "        if (incoming[1] == 1) and (incoming[9] == expected):",
-        "          mongo_last_backend_heartbeat = get_robot_time()",
+        "          mongo_missed_heartbeats = 0",
         "          if incoming[2] == 10:",
         "            if mongo_motion_active or (mongo_command_sequence > 0):",
         "              if incoming[4] == mongo_last_sequence:",
@@ -736,17 +741,16 @@ def build_robot_supervisor_script(
         "          mongo_latched = True",
         "          mongo_last_fault = 101",
         "        end",
-        "      end",
-        "      if (mongo_pending_event_sequence != mongo_sent_event_sequence) or (mongo_pending_event_code != mongo_sent_event_code):",
-        "        mongo_send_values(1,21,mongo_robot_session,mongo_pending_event_sequence,mongo_pending_event_code,mongo_pending_fault_code,1,mongo_last_sequence)",
-        "        mongo_sent_event_sequence = mongo_pending_event_sequence",
-        "        mongo_sent_event_code = mongo_pending_event_code",
-        "      end",
-        f"      if get_robot_time() - last_telemetry >= {telemetry_period:.3f}:",
+        "        if (mongo_pending_event_sequence != mongo_sent_event_sequence) or (mongo_pending_event_code != mongo_sent_event_code):",
+        "          mongo_send_values(1,21,mongo_robot_session,mongo_pending_event_sequence,mongo_pending_event_code,mongo_pending_fault_code,1,mongo_last_sequence)",
+        "          mongo_sent_event_sequence = mongo_pending_event_sequence",
+        "          mongo_sent_event_code = mongo_pending_event_code",
+        "        end",
         "        mongo_send_telemetry()",
-        "        last_telemetry = get_robot_time()",
+        "      else:",
+        "        mongo_missed_heartbeats = mongo_missed_heartbeats + 1",
         "      end",
-        f"      if get_robot_time() - mongo_last_backend_heartbeat > {heartbeat_timeout:.3f}:",
+        f"      if mongo_missed_heartbeats >= {heartbeat_miss_limit}:",
         "        mongo_link_lost = True",
         "        mongo_connected = False",
         "        socket_close(\"mongo\")",
@@ -803,6 +807,7 @@ def build_robot_supervisor_script(
         "      mongo_pallet_payload_kg = mongo_command_payload_g / 1000.0",
         "      local command_failed = False",
         *dispatcher,
+        "      end",
         "      mongo_motion_active = False",
         "      if command_failed:",
         "        mongo_last_event = 4",
@@ -903,24 +908,35 @@ def run_robot_script(host: str, content: str, timeout_seconds: float) -> None:
         raise RobotFileAccessError("URControl script transport only accepts ASCII text.") from exc
     try:
         with robot_command_lock(host):
-            with socket.create_connection((host, 30002), timeout=timeout_seconds) as connection:
-                connection.settimeout(min(max(timeout_seconds, 0.25), 0.5))
-                connection.sendall(payload)
-                # URControl documents that at least 79 response bytes must be read before
-                # close; otherwise Windows may reset the socket and discard the script.
-                received = 0
-                deadline = time.monotonic() + max(0.5, min(timeout_seconds, 2.0))
-                while received < 79 and time.monotonic() < deadline:
-                    try:
-                        chunk = connection.recv(4096)
-                    except socket.timeout:
-                        continue
-                    if not chunk:
-                        break
-                    received += len(chunk)
-                if received < 79:
-                    raise RobotFileAccessError(
-                        "URControl did not return enough response data to confirm an orderly script transfer."
-                    )
+            with socket.create_connection((host, 30002), timeout=max(5.0, timeout_seconds)) as connection:
+                try:
+                    # Secondary streams state immediately. Drain before and after
+                    # transmission so an old CB controller never retains a blocked
+                    # command socket with an expanding send queue.
+                    connection.settimeout(0.1)
+                    drain_deadline = time.monotonic() + 0.25
+                    while time.monotonic() < drain_deadline:
+                        try:
+                            if not connection.recv(65536):
+                                break
+                        except socket.timeout:
+                            continue
+                    connection.sendall(payload)
+                    connection.shutdown(socket.SHUT_WR)
+                    drain_deadline = time.monotonic() + 0.75
+                    while time.monotonic() < drain_deadline:
+                        try:
+                            if not connection.recv(65536):
+                                break
+                        except socket.timeout:
+                            continue
+                except RobotScriptTransferUncertain:
+                    raise
+                except OSError as exc:
+                    raise RobotScriptTransferUncertain(
+                        "The URScript connection failed during or after transmission. The command was not retried because execution is uncertain."
+                    ) from exc
+    except RobotFileAccessError:
+        raise
     except OSError as exc:
         raise RobotFileAccessError(f"Could not send generated URScript to the robot: {exc}") from exc

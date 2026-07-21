@@ -14,13 +14,13 @@ The application currently contains:
 - a graphical Pool, Queue, Machine, and Storage scheduling board;
 - pallet creation, editing, duplication, deletion, and program assignment;
 - automatic unique pallet names selected from a curated artist catalog;
-- program discovery from a configurable server-side source folder;
+- program discovery plus automatic Fusion-posted tool and cycle-time metadata;
 - configurable numbered pool positions and weight display units;
 - configurable simulated/physical robot mode, controller file access, and robot-originated supervisor transport;
 - transactional APIs with optimistic revision conflict detection;
 - an automated API and persistence test suite.
 
-Authentication and program-header parsing remain future work. Physical robot
+Authentication remains future work. Physical robot
 and mill actions must be commissioned with the cell empty before Run Mode is used.
 
 ## Run locally
@@ -65,10 +65,39 @@ Pool position until it moves into the Machine. Moving a pallet into Machine or
 Storage removes it from the Queue. Cards can be dragged with a mouse or operated
 with explicit controls for touch and keyboard use.
 
+When a pallet is Robot-held or in the Mill, its intended return position remains
+reserved and appears as a translucent ghost in the Pool. **Put away pallet**
+returns it to that position automatically. If the reservation is unavailable,
+the scheduler chooses the nearest numbered empty position that is not reserved
+for another pallet; operators can still choose a destination explicitly.
+
 Use the Settings page to choose the server-side program source folder, allowed
 file extensions, display weight unit, and Pool position count. Program scans
 are recursive. If a previously assigned program disappears, refreshing the
 program list clears that assignment and reports the affected pallet.
+
+### Program tool and cycle metadata
+
+`Tormach_Inspection.cps` writes a small versioned metadata block near the top
+of every newly posted program:
+
+```text
+(MPS-METADATA-V1)
+(MPS-TOOLS:1,20,105)
+(MPS-CYCLE-SECONDS:91.2)
+(MPS-CYCLE-BASIS:FUSION-CUTTING-ESTIMATE)
+```
+
+When a program is assigned to a pallet, the application reads only the first
+64 KiB from the configured PathPilot `gcode` directory and stores its tools and
+estimated cycle time with the pallet. **Refresh programs** rescans that same
+PathPilot directory and updates metadata for all existing assignments. If the
+controller cannot be reached, refresh fails without clearing any assignments.
+
+Existing NC files must be reposted with the updated post processor before they
+contain this header. Fusion's section cycle-time estimate covers cutting moves
+and excludes rapid traversal, so the displayed time is an estimate rather than
+measured elapsed machine time.
 
 Settings can also enable a fixed debug simulator on the Schedule page and
 choose between a simulated robot and a physical robot connection. In simulated
@@ -145,20 +174,73 @@ For each pallet, the controller sequence is:
 2. Run the pool-pick script followed by `load_mill.script` on Mongo.
 3. Run the pallet's assigned PathPilot program and wait for Idle.
 4. If `RESULTS.TXT` changed during the cycle, archive it with the program name
-   and a UTC timestamp. Missing or unchanged results produce an operator alert
-   but do not stop the remaining pallet workflow.
+   and a UTC timestamp. An unchanged file is skipped normally; missing results
+   or archive failures alert the operator without stopping the pallet workflow.
 5. Run `mongo_mill_load_position.nc` again and wait for Idle.
 6. Run `unload_mill.script` followed by the original pool-position put script.
 7. Mark the pallet complete, return it to its pool position, and advance.
+
+PathPilot program monitoring does not treat Idle alone as success. An E-stop,
+disabled control, LinuxCNC execution/interpreter error, or alarm/error message
+pauses the queue before the pallet is moved or marked complete. The operator is
+prompted to clear and inspect the mill and either retry that same program or
+stop Run Mode with the pallet left in its current physical position.
 
 The RESULTS.TXT source and archive directory are configured under Mill Programs
 in Settings. Both paths must remain inside the configured PathPilot program
 directory; the archive directory is created automatically.
 
 When action confirmation is enabled, the operator must approve loading,
-machining, and unloading. Stopping run mode prevents the next workflow step; it
-does not abort a controller program that has already been dispatched. Use the
-machine or robot safety controls when an immediate stop is required.
+machining, and unloading. Stopping Run Mode prevents the next workflow step;
+it does not abort a controller program that has already been dispatched. Use
+the machine or robot safety controls when an immediate stop is required.
+
+### Long-running production
+
+The scheduler is designed to monitor machining cycles for up to 30 days. A
+successful PathPilot start is recorded before monitoring begins. If SSH or
+telemetry drops while that program is already running, the scheduler does not
+retry the G-code, unload the pallet, or send another controller action. It
+backs off read-only telemetry attempts from one second up to 30 seconds and
+continues monitoring when the controller reconnects. The active run status and
+diagnostic timeline record the outage and recovery.
+
+Before Run Mode starts, and before an individual robot transfer has been
+dispatched, transient robot or PathPilot telemetry failures are retried
+automatically with bounded backoff. Each retry confirms that Run Mode remains
+enabled before it does anything. An E-stop, machine alarm, invalid setup, robot
+safety fault, motion timeout, or any missing response after a controller
+command may have been sent remains latched for operator reconciliation; these
+are intentionally not retried because doing so could duplicate physical work.
+
+Run the backend from a Windows account that remains logged in, with the PC set
+not to sleep or hibernate. Keep the database, `runtime/`, and `data/` folders
+on a local SSD rather than a mapped/network drive. SQLite runs in WAL mode with
+a 30-second writer wait; do not sync or back up the live database file by
+copying it while the app is running. Use a SQLite-aware backup or stop the app
+cleanly first.
+
+The application deliberately does not resume motion automatically after a
+backend restart, power failure, or uncertain robot command. It records an
+interrupted state so an operator can reconcile the physical cell before
+continuing. This prevents a recovered process from duplicating an in-progress
+move.
+
+For unattended backend availability, `run_backend_watchdog.ps1` checks the
+local health endpoint every 30 seconds and calls the existing safe launcher
+only when the backend is not reachable. The launcher refuses to replace a
+reachable backend that has an active or uncertain production workflow. To run
+the watchdog after the next user logon, open an elevated PowerShell in the
+project folder and run:
+
+```powershell
+.\install_backend_watchdog.ps1
+```
+
+This preserves the fail-safe rule: a crash can restore the web service, but it
+cannot silently resume robot or mill motion. Configure Windows power settings
+so the host does not sleep, and use a UPS for the host, network gear, robot,
+and mill controller where practical.
 
 ## Lessons retained from the proof of concept
 

@@ -39,8 +39,14 @@ def test_autoschedule_preview_and_apply_use_live_atc(
     program_dir = tmp_path / "programs"
     gcode_dir = program_dir / "Gcode"
     gcode_dir.mkdir(parents=True)
-    (gcode_dir / "a.nc").write_text("a", encoding="utf-8")
-    (gcode_dir / "b.nc").write_text("b", encoding="utf-8")
+    (gcode_dir / "a.nc").write_text(
+        "%\n(MPS-METADATA-V1)\n(MPS-TOOLS:1,3)\n(MPS-CYCLE-SECONDS:60)\nM30\n",
+        encoding="utf-8",
+    )
+    (gcode_dir / "b.nc").write_text(
+        "%\n(MPS-METADATA-V1)\n(MPS-TOOLS:1,2)\n(MPS-CYCLE-SECONDS:60)\nM30\n",
+        encoding="utf-8",
+    )
     board = client.get("/api/board").json()
     board = client.put(
         "/api/settings",
@@ -53,11 +59,6 @@ def test_autoschedule_preview_and_apply_use_live_atc(
         },
     ).json()["board"]
 
-    metadata = {
-        "a.nc": {"program_tools": ["T1", "T3"], "expected_cycle_seconds": 60},
-        "b.nc": {"program_tools": ["T1", "T2"], "expected_cycle_seconds": 60},
-    }
-    monkeypatch.setattr("app.service.program_metadata", lambda path, status: metadata.get(path, {"program_tools": [], "expected_cycle_seconds": None}))
     monkeypatch.setattr(
         "app.service._configured_cnc_telemetry",
         lambda settings: (

@@ -33,9 +33,9 @@ class DiagnosticRecorder:
         self,
         path: Path,
         *,
-        memory_limit: int = 1000,
-        file_limit_bytes: int = 2_000_000,
-        backup_count: int = 3,
+        memory_limit: int = 5000,
+        file_limit_bytes: int = 10_000_000,
+        backup_count: int = 14,
     ) -> None:
         self.path = path
         self.memory_limit = memory_limit

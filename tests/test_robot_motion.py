@@ -272,6 +272,7 @@ def test_simulated_mill_transfer_moves_pool_pallet_to_machine_then_back(client: 
     moved = next(item for item in loaded["pallets"] if item["id"] == pallet["id"])
     assert moved["location"] == "machine"
     assert moved["pool_slot_number"] is None
+    assert moved["return_pool_slot_number"] == 1
 
     with client.app.state.session_factory() as session:
         motion_id = service.start_mill_pallet_transfer(
@@ -283,6 +284,33 @@ def test_simulated_mill_transfer_moves_pool_pallet_to_machine_then_back(client: 
     moved = next(item for item in unloaded["pallets"] if item["id"] == pallet["id"])
     assert moved["location"] == "pool"
     assert moved["pool_slot_number"] == 1
+    assert moved["return_pool_slot_number"] is None
+
+
+def test_automatic_put_away_returns_machine_pallet_to_original_position(client: TestClient) -> None:
+    board = _create_pallet(client, 0)
+    pallet = board["pallets"][0]
+    loaded = client.post(
+        "/api/robot-motions/mill-transfer",
+        json={
+            "expected_revision": board["revision"],
+            "operation": "load",
+            "pallet_id": pallet["id"],
+        },
+    ).json()
+    in_machine = next(item for item in loaded["pallets"] if item["id"] == pallet["id"])
+    assert in_machine["return_pool_slot_number"] == 1
+
+    response = client.post(
+        f"/api/pallets/{pallet['id']}/put-away",
+        json={"expected_revision": loaded["revision"]},
+    )
+
+    assert response.status_code == 202
+    returned = next(item for item in response.json()["pallets"] if item["id"] == pallet["id"])
+    assert returned["location"] == "pool"
+    assert returned["pool_slot_number"] == 1
+    assert returned["return_pool_slot_number"] is None
 
 
 def test_simulated_mill_transfer_loads_a_robot_held_pallet(client: TestClient) -> None:
@@ -421,6 +449,18 @@ def test_rebuild_generates_and_syncs_pool_scripts(client: TestClient, monkeypatc
         assert "socket_open(\"DESKTOP-KF5I73N.lan\", 50010" in supervisor
         assert "socket_read_binary_integer(9, \"mongo\")" in supervisor
         assert "socket_send_int(" in supervisor
+        assert "get_robot_time()" not in supervisor
+        assert "global mongo_robot_session = " in supervisor
+        assert "global mongo_missed_heartbeats = 0" in supervisor
+        block_depth = 0
+        for script_line in supervisor.splitlines():
+            stripped = script_line.strip()
+            if stripped.startswith(("def ", "thread ", "if ", "while ")) and stripped.endswith(":"):
+                block_depth += 1
+            elif stripped == "end":
+                block_depth -= 1
+                assert block_depth >= 0
+        assert block_depth == 0
         assert "socket_read_ascii_float" not in supervisor
         assert "to_str(" not in supervisor
         assert " if mongo_latched else " not in supervisor

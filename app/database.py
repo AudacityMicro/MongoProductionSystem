@@ -11,9 +11,14 @@ def _configure_sqlite(connection, _record) -> None:
     cursor = connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # Board polling, diagnostics, and background control workers share one
+        # SQLite database. A longer wait avoids turning a brief WAL writer
+        # overlap into an operator-visible controller failure.
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA wal_autocheckpoint=1000")
+        cursor.execute("PRAGMA journal_size_limit=67108864")
     finally:
         cursor.close()
 
@@ -21,7 +26,7 @@ def _configure_sqlite(connection, _record) -> None:
 def create_database_engine(database_url: str) -> Engine:
     engine = create_engine(
         database_url,
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False, "timeout": 30}
         if database_url.startswith("sqlite")
         else {},
     )

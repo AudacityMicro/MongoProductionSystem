@@ -6,9 +6,11 @@ import math
 import socket
 import struct
 from threading import Event, RLock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 from types import SimpleNamespace
+
+from app.diagnostics import diagnostics
 
 try:
     import rtde.rtde as rtde_client
@@ -145,6 +147,7 @@ _REALTIME_CONNECTION_HOST: str | None = None
 _REALTIME_BUFFER = bytearray()
 _REALTIME_READER: Thread | None = None
 _REALTIME_READER_GENERATION = 0
+_REALTIME_READER_STARTED_AT = 0.0
 _REALTIME_LATEST_PACKET: bytes | None = None
 _REALTIME_LATEST_AT = 0.0
 _REALTIME_READER_ERROR: str | None = None
@@ -164,6 +167,14 @@ _TELEMETRY_LAST_ERROR: dict[tuple[str, int], str] = {}
 # recovering fast enough that an in-progress robot motion is not misclassified.
 _TELEMETRY_RETRY_BASE_SECONDS = 2
 _TELEMETRY_RETRY_MAX_SECONDS = 12
+# The configured timeout remains the maximum age accepted for a live motion
+# sample. Establishing a new CB-series stream is slower on a lossy network and
+# needs a separate window so a healthy controller is not rejected at startup.
+_REALTIME_CONNECT_TIMEOUT_SECONDS = 8.0
+_REALTIME_INITIAL_SAMPLE_TIMEOUT_SECONDS = 8.0
+_REALTIME_READER_STALL_SECONDS = 20.0
+_PRIMARY_INTERFACE_PORT = 30001
+_RECORDED_REALTIME_PACKET_SIZES = {812, 1044, 1060, 1108, 1116, 1140, 1220}
 _CONNECTIONS_SUSPENDED = False
 
 
@@ -698,26 +709,175 @@ def _realtime_vector(packet: bytes, first_column: int, count: int = 6) -> list[f
     return values if all(value is not None for value in values) else None
 
 
+def _primary_subpackages(packet: bytes) -> dict[int, bytes]:
+    """Decode one Primary-interface RobotState message by subpackage type."""
+    if len(packet) < 5 or packet[4] != 16:
+        raise RobotTelemetryError("The robot returned a non-state Primary-interface packet.")
+    packages: dict[int, bytes] = {}
+    offset = 5
+    while offset + 5 <= len(packet):
+        package_size = struct.unpack_from(">I", packet, offset)[0]
+        if package_size < 5 or offset + package_size > len(packet):
+            raise RobotTelemetryError("The robot returned a malformed Primary-interface state package.")
+        packages[packet[offset + 4]] = packet[offset + 5:offset + package_size]
+        offset += package_size
+    if offset != len(packet):
+        raise RobotTelemetryError("The robot returned a truncated Primary-interface state package.")
+    return packages
+
+
+def _parse_primary_state(packet: bytes) -> Any:
+    """Map the CB-series Primary stream to the existing telemetry sample contract."""
+    packages = _primary_subpackages(packet)
+    robot_mode_data = packages.get(0)
+    joint_data = packages.get(1)
+    masterboard_data = packages.get(3)
+    cartesian_data = packages.get(4)
+    tool_data = packages.get(2)
+    if not robot_mode_data or len(robot_mode_data) < 41:
+        raise RobotTelemetryError("Primary telemetry omitted robot mode data.")
+    if not joint_data or len(joint_data) < 41 * 6:
+        raise RobotTelemetryError("Primary telemetry omitted joint data.")
+    if not masterboard_data or len(masterboard_data) < 62:
+        raise RobotTelemetryError("Primary telemetry omitted masterboard I/O data.")
+    if not cartesian_data or len(cartesian_data) < 48:
+        raise RobotTelemetryError("Primary telemetry omitted the TCP pose.")
+
+    (
+        timestamp,
+        _robot_connected,
+        _real_robot_enabled,
+        _robot_power_on,
+        _emergency_stopped,
+        _protective_stopped,
+        program_running,
+        program_paused,
+        robot_mode,
+        _control_mode,
+        _target_speed_fraction,
+        speed_scaling,
+        _target_speed_limit,
+    ) = struct.unpack_from(">Q???????BBddd", robot_mode_data)
+
+    actual_q: list[float] = []
+    actual_qd: list[float] = []
+    actual_current: list[float] = []
+    joint_temperatures: list[float] = []
+    for index in range(6):
+        offset = index * 41
+        actual_q.append(struct.unpack_from(">d", joint_data, offset)[0])
+        actual_qd.append(struct.unpack_from(">d", joint_data, offset + 16)[0])
+        actual_current.append(struct.unpack_from(">f", joint_data, offset + 24)[0])
+        joint_temperatures.append(struct.unpack_from(">f", joint_data, offset + 32)[0])
+
+    digital_inputs, digital_outputs = struct.unpack_from(">II", masterboard_data)
+    analog_input_range0 = masterboard_data[8]
+    analog_input_range1 = masterboard_data[9]
+    standard_analog_input0 = struct.unpack_from(">d", masterboard_data, 10)[0]
+    standard_analog_input1 = struct.unpack_from(">d", masterboard_data, 18)[0]
+    analog_output_domain0 = masterboard_data[26]
+    analog_output_domain1 = masterboard_data[27]
+    standard_analog_output0 = struct.unpack_from(">d", masterboard_data, 28)[0]
+    standard_analog_output1 = struct.unpack_from(">d", masterboard_data, 36)[0]
+    analog_io_types = (
+        analog_input_range0
+        | (analog_input_range1 << 1)
+        | (analog_output_domain0 << 2)
+        | (analog_output_domain1 << 3)
+    )
+    tool_analog_input0 = None
+    tool_analog_input1 = None
+    tool_analog_input_types = None
+    if tool_data and len(tool_data) >= 18:
+        tool_analog_input_types = tool_data[0] | (tool_data[1] << 1)
+        tool_analog_input0 = struct.unpack_from(">d", tool_data, 2)[0]
+        tool_analog_input1 = struct.unpack_from(">d", tool_data, 10)[0]
+    # Safety mode follows the four masterboard float values in all CB3 state
+    # package revisions. Ignore optional Euromap fields after this byte.
+    safety_mode = masterboard_data[60]
+    actual_tcp_pose = list(struct.unpack_from(">6d", cartesian_data))
+    if program_paused:
+        runtime_state = "paused"
+        program_state = 4.0
+    elif program_running:
+        runtime_state = "playing"
+        program_state = 2.0
+    else:
+        runtime_state = "stopped"
+        program_state = 1.0
+
+    return SimpleNamespace(
+        timestamp=float(timestamp) / 1_000_000.0,
+        actual_q=actual_q,
+        actual_qd=actual_qd,
+        actual_current=actual_current,
+        joint_temperatures=joint_temperatures,
+        actual_TCP_pose=actual_tcp_pose,
+        # Primary RobotState does not expose TCP speed on this PolyScope build.
+        actual_TCP_speed=None,
+        actual_digital_input_bits=digital_inputs,
+        actual_digital_output_bits=digital_outputs,
+        standard_analog_input0=standard_analog_input0,
+        standard_analog_input1=standard_analog_input1,
+        standard_analog_output0=standard_analog_output0,
+        standard_analog_output1=standard_analog_output1,
+        tool_analog_input0=tool_analog_input0,
+        tool_analog_input1=tool_analog_input1,
+        analog_io_types=analog_io_types,
+        tool_analog_input_types=tool_analog_input_types,
+        robot_mode=float(robot_mode),
+        safety_mode=float(safety_mode),
+        speed_scaling=speed_scaling,
+        runtime_state=runtime_state,
+        program_state=program_state,
+    )
+
+
 def _disconnect_legacy_realtime() -> None:
     global _REALTIME_CONNECTION, _REALTIME_CONNECTION_HOST, _REALTIME_READER
-    global _REALTIME_READER_GENERATION, _REALTIME_LATEST_PACKET, _REALTIME_LATEST_AT
+    global _REALTIME_READER_GENERATION, _REALTIME_READER_STARTED_AT
+    global _REALTIME_LATEST_PACKET, _REALTIME_LATEST_AT
     global _REALTIME_READER_ERROR, _REALTIME_READER_ERROR_REPORTED
 
     _REALTIME_READER_GENERATION += 1
-    if _REALTIME_CONNECTION is not None:
-        try:
-            _REALTIME_CONNECTION.close()
-        except OSError:
-            pass
+    connection = _REALTIME_CONNECTION
+    # Clear ownership before interrupting recv(). The superseded reader can
+    # then finish without clearing or reporting an error against its successor.
     _REALTIME_CONNECTION = None
     _REALTIME_CONNECTION_HOST = None
     _REALTIME_READER = None
+    _REALTIME_READER_STARTED_AT = 0.0
+    if connection is not None:
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
     _REALTIME_LATEST_PACKET = None
     _REALTIME_LATEST_AT = 0.0
     _REALTIME_READER_ERROR = None
     _REALTIME_READER_ERROR_REPORTED = False
     _REALTIME_SAMPLE_EVENT.clear()
     _REALTIME_BUFFER.clear()
+
+
+def robot_telemetry_transport_status() -> dict[str, Any]:
+    """Expose enough transport state to diagnose failures without opening another robot socket."""
+    with _LIVE_CONNECTION_LOCK:
+        age = monotonic() - _REALTIME_LATEST_AT if _REALTIME_LATEST_AT else None
+        return {
+            "transport": "primary_interface",
+            "host": _REALTIME_CONNECTION_HOST,
+            "port": _PRIMARY_INTERFACE_PORT,
+            "reader_alive": bool(_REALTIME_READER and _REALTIME_READER.is_alive()),
+            "sample_age_seconds": round(age, 3) if age is not None else None,
+            "generation": _REALTIME_READER_GENERATION,
+            "last_error": _REALTIME_READER_ERROR,
+            "connections_suspended": _CONNECTIONS_SUSPENDED,
+        }
 
 
 def _configure_realtime_socket(connection: socket.socket) -> None:
@@ -738,17 +898,18 @@ def _configure_realtime_socket(connection: socket.socket) -> None:
 
 
 def _legacy_realtime_reader(connection: socket.socket, generation: int, timeout_seconds: float) -> None:
-    """Continuously drain port 30003 so an older controller's send buffer never blocks."""
+    """Continuously drain the CB Primary stream so URControl never accumulates output."""
     global _REALTIME_CONNECTION, _REALTIME_CONNECTION_HOST, _REALTIME_READER
     global _REALTIME_LATEST_PACKET, _REALTIME_LATEST_AT
     global _REALTIME_READER_ERROR, _REALTIME_READER_ERROR_REPORTED
 
+    reader_host = _REALTIME_CONNECTION_HOST
     buffer = bytearray()
     error: str | None = None
     try:
         # Keep the single persistent CB-series stream through brief network stalls.
         # Callers still enforce their own short freshness timeout for motion safety.
-        connection.settimeout(max(10.0, timeout_seconds * 5.0))
+        connection.settimeout(max(_REALTIME_READER_STALL_SECONDS, timeout_seconds * 5.0))
         while True:
             chunk = connection.recv(65536)
             if not chunk:
@@ -757,12 +918,17 @@ def _legacy_realtime_reader(connection: socket.socket, generation: int, timeout_
             latest: bytes | None = None
             while len(buffer) >= 4:
                 packet_size = struct.unpack_from(">I", buffer)[0]
-                if not 812 <= packet_size <= 2048:
-                    raise RobotTelemetryError("The robot returned an invalid realtime telemetry packet.")
+                if not 5 <= packet_size <= 1_000_000:
+                    raise RobotTelemetryError("The robot returned an invalid Primary-interface packet.")
                 if len(buffer) < packet_size:
                     break
-                latest = bytes(buffer[:packet_size])
+                packet = bytes(buffer[:packet_size])
                 del buffer[:packet_size]
+                if (
+                    len(packet) >= 5
+                    and (packet[4] == 16 or packet_size in _RECORDED_REALTIME_PACKET_SIZES)
+                ):
+                    latest = packet
             if latest is None:
                 continue
             with _LIVE_CONNECTION_LOCK:
@@ -781,22 +947,44 @@ def _legacy_realtime_reader(connection: socket.socket, generation: int, timeout_
         except OSError:
             pass
         with _LIVE_CONNECTION_LOCK:
-            if generation == _REALTIME_READER_GENERATION and connection is _REALTIME_CONNECTION:
+            owns_connection = (
+                generation == _REALTIME_READER_GENERATION
+                and connection is _REALTIME_CONNECTION
+            )
+            if owns_connection:
                 _REALTIME_CONNECTION = None
                 _REALTIME_CONNECTION_HOST = None
                 _REALTIME_READER = None
                 _REALTIME_READER_ERROR = error or "The realtime telemetry reader stopped."
                 _REALTIME_READER_ERROR_REPORTED = False
                 _REALTIME_SAMPLE_EVENT.set()
+        if owns_connection:
+            diagnostics().record(
+                "robot_telemetry",
+                "primary_reader_stopped",
+                "The robot Primary-interface telemetry reader stopped.",
+                severity="warning",
+                details={"host": reader_host, "generation": generation, "error": error},
+            )
 
 
 def _start_legacy_realtime_reader(host: str, timeout_seconds: float) -> None:
     global _REALTIME_CONNECTION, _REALTIME_CONNECTION_HOST, _REALTIME_READER
-    global _REALTIME_READER_GENERATION, _REALTIME_READER_ERROR, _REALTIME_READER_ERROR_REPORTED
+    global _REALTIME_READER_GENERATION, _REALTIME_READER_STARTED_AT
+    global _REALTIME_READER_ERROR, _REALTIME_READER_ERROR_REPORTED
 
+    replacing_connection = _REALTIME_CONNECTION is not None
     _disconnect_legacy_realtime()
+    if replacing_connection:
+        # Give URControl and Windows enough time to retire the old Primary
+        # session before opening its replacement. This avoids accumulating
+        # accepted-but-silent sockets after a network stall.
+        sleep(0.2)
     try:
-        connection = socket.create_connection((host, 30003), timeout=timeout_seconds)
+        connection = socket.create_connection(
+            (host, _PRIMARY_INTERFACE_PORT),
+            timeout=max(timeout_seconds, _REALTIME_CONNECT_TIMEOUT_SECONDS),
+        )
         _configure_realtime_socket(connection)
     except OSError as exc:
         _REALTIME_READER_ERROR = str(exc)
@@ -807,6 +995,7 @@ def _start_legacy_realtime_reader(host: str, timeout_seconds: float) -> None:
     _REALTIME_READER_ERROR = None
     _REALTIME_READER_ERROR_REPORTED = False
     generation = _REALTIME_READER_GENERATION
+    _REALTIME_READER_STARTED_AT = monotonic()
     _REALTIME_READER = Thread(
         target=_legacy_realtime_reader,
         args=(connection, generation, timeout_seconds),
@@ -814,6 +1003,12 @@ def _start_legacy_realtime_reader(host: str, timeout_seconds: float) -> None:
         name="robot-realtime-reader",
     )
     _REALTIME_READER.start()
+    diagnostics().record(
+        "robot_telemetry",
+        "primary_reader_started",
+        "The robot Primary-interface telemetry reader started.",
+        details={"host": host, "port": _PRIMARY_INTERFACE_PORT, "generation": generation},
+    )
 
 
 def _latest_buffered_realtime_packet() -> bytes | None:
@@ -865,7 +1060,7 @@ def _receive_latest_realtime_packet(connection: socket.socket, timeout_seconds: 
 
 
 def _read_legacy_realtime_sample(host: str, timeout_seconds: float) -> Any:
-    """Read one controller realtime packet when an older robot does not stream RTDE."""
+    """Read one controller state packet when an older robot does not stream RTDE."""
     global _REALTIME_READER_ERROR_REPORTED
 
     # Some older controllers permit only one realtime client. A dedicated reader
@@ -878,14 +1073,16 @@ def _read_legacy_realtime_sample(host: str, timeout_seconds: float) -> Any:
         reader_stale = (
             _REALTIME_READER is not None
             and _REALTIME_READER.is_alive()
-            and monotonic() - _REALTIME_LATEST_AT > max(1.0, timeout_seconds)
+            and monotonic() - (_REALTIME_LATEST_AT or _REALTIME_READER_STARTED_AT)
+            > _REALTIME_READER_STALL_SECONDS
         )
         if not packet_fresh and (
             _REALTIME_READER is None or not _REALTIME_READER.is_alive() or reader_stale
         ):
-            # A reader can remain blocked in recv after a network drop. Once its
-            # newest packet is stale, replace it when the outer circuit breaker
-            # permits a retry instead of waiting for the socket timeout.
+            # A reader can remain blocked in recv after a network drop. Do not
+            # replace it for an ordinary stale sample: opening overlapping
+            # Primary sessions can leave older UR controllers silent. Replace
+            # only after the reader's independent stall window expires.
             _start_legacy_realtime_reader(host, timeout_seconds)
         elif _REALTIME_CONNECTION_HOST != host:
             _start_legacy_realtime_reader(host, timeout_seconds)
@@ -895,7 +1092,7 @@ def _read_legacy_realtime_sample(host: str, timeout_seconds: float) -> Any:
             _REALTIME_SAMPLE_EVENT.clear()
 
     if not packet_fresh:
-        _REALTIME_SAMPLE_EVENT.wait(timeout_seconds)
+        _REALTIME_SAMPLE_EVENT.wait(max(timeout_seconds, _REALTIME_INITIAL_SAMPLE_TIMEOUT_SECONDS))
         with _LIVE_CONNECTION_LOCK:
             if (
                 _REALTIME_LATEST_PACKET is not None
@@ -911,6 +1108,11 @@ def _read_legacy_realtime_sample(host: str, timeout_seconds: float) -> Any:
     if packet is None:  # Defensive narrowing for static type checkers.
         raise RobotTelemetryError("No realtime telemetry packet was received before timeout.")
 
+    if len(packet) >= 5 and packet[4] == 16:
+        return _parse_primary_state(packet)
+
+    # Retain decoding support for recorded legacy realtime packets used by tests
+    # and diagnostics, but production connections use the safer Primary stream.
     program_state = _realtime_value(packet, 132)
     runtime_states = {
         0: "stopping",
@@ -943,14 +1145,15 @@ def _legacy_realtime_snapshot(host: str, timeout_seconds: float) -> dict[str, An
     digital_outputs = sample.actual_digital_output_bits
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": "robot_realtime",
+        "source": "robot_primary",
         "connected": True,
-        "connection_label": "Live realtime fallback",
+        "transport_health": robot_telemetry_transport_status(),
+        "connection_label": "Live Primary-interface telemetry",
         "robot": {
             "host": host,
-            "port": 30003,
+            "port": _PRIMARY_INTERFACE_PORT,
             "controller_version": "",
-            "recipe_fields": ["legacy_realtime"],
+            "recipe_fields": ["primary_robot_state"],
             "sample_time_seconds": sample.timestamp,
         },
         "digital_input_groups": [
@@ -963,8 +1166,16 @@ def _legacy_realtime_snapshot(host: str, timeout_seconds: float) -> dict[str, An
             {"title": "Configurable outputs", "rows": _bit_rows(digital_outputs, "CO", 8, 8, direction="output", bank="configurable")},
             {"title": "Tool outputs", "rows": _bit_rows(digital_outputs, "TO", 2, 16, direction="output", bank="tool")},
         ],
-        "analog_inputs": [],
-        "analog_outputs": [],
+        "analog_inputs": [
+            _analog_row("AI0", "Standard analog input 0", _read_attr(sample, "standard_analog_input0"), _read_attr(sample, "analog_io_types"), 0),
+            _analog_row("AI1", "Standard analog input 1", _read_attr(sample, "standard_analog_input1"), _read_attr(sample, "analog_io_types"), 1),
+            _analog_row("TAI0", "Tool analog input 0", _read_attr(sample, "tool_analog_input0"), _read_attr(sample, "tool_analog_input_types"), 0),
+            _analog_row("TAI1", "Tool analog input 1", _read_attr(sample, "tool_analog_input1"), _read_attr(sample, "tool_analog_input_types"), 1),
+        ],
+        "analog_outputs": [
+            _analog_row("AO0", "Standard analog output 0", _read_attr(sample, "standard_analog_output0"), _read_attr(sample, "analog_io_types"), 2),
+            _analog_row("AO1", "Standard analog output 1", _read_attr(sample, "standard_analog_output1"), _read_attr(sample, "analog_io_types"), 3),
+        ],
         "state_rows": [
             {"label": "Robot mode", "value": sample.robot_mode},
             {"label": "Safety mode", "value": sample.safety_mode},
@@ -979,8 +1190,8 @@ def _legacy_realtime_snapshot(host: str, timeout_seconds: float) -> dict[str, An
         "joint_detail_rows": _joint_detail_rows(sample),
         "extra_actual_rows": [],
         "notes": (
-            "RTDE did not provide a sample, so this controller is being read through its live realtime interface on port 30003. "
-            "I/O is decoded from the same realtime packet; automatic Modbus polling is disabled to protect this controller."
+            "This CB-series controller is read through one continuously drained Primary-interface connection on port 30001. "
+            "I/O and motion state come from the same RobotState packet; automatic Modbus polling is disabled to protect this controller."
         ),
     }
 
@@ -991,9 +1202,8 @@ def _read_robot_snapshot_once(host: str, port: int, poll_hz: int, timeout_second
         if port in {30001, 30002, 30003}:
             _LEGACY_REALTIME_KEYS.add(key)
         # CB-series controllers can accept TCP 30004 while never emitting RTDE
-        # packets. Once the real controller stream on 30003 is confirmed, keep
-        # using that persistent stream instead of renegotiating a silent port on
-        # every browser poll.
+        # packets. Once the Primary fallback is confirmed, keep using its single
+        # persistent stream instead of renegotiating a silent port on every poll.
         if key in _LEGACY_REALTIME_KEYS:
             return _legacy_realtime_snapshot(host, timeout_seconds)
         try:

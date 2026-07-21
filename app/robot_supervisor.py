@@ -98,6 +98,21 @@ class FrameBuffer:
     def __init__(self, maximum_bytes: int = 32768):
         self._buffer = bytearray()
         self.maximum_bytes = maximum_bytes
+        self.resynchronizations = 0
+
+    def _discard_until_header(self) -> bool:
+        """Discard aligned garbage while retaining a possible partial frame header."""
+        for offset in range(4, len(self._buffer) - 7, 4):
+            version, kind = struct.unpack("!2i", self._buffer[offset : offset + 8])
+            if version == PROTOCOL_VERSION and kind in self._FRAME_INTS:
+                del self._buffer[:offset]
+                self.resynchronizations += 1
+                return True
+        keep = self._buffer[-4:] if len(self._buffer) >= 4 and struct.unpack("!i", self._buffer[-4:])[0] == PROTOCOL_VERSION else b""
+        self._buffer.clear()
+        self._buffer.extend(keep)
+        self.resynchronizations += 1
+        return False
 
     def feed(self, chunk: bytes) -> list[bytes]:
         self._buffer.extend(chunk)
@@ -109,17 +124,23 @@ class FrameBuffer:
             if len(self._buffer) < 8:
                 break
             version, kind = struct.unpack("!2i", self._buffer[:8])
-            if version != PROTOCOL_VERSION:
-                self._buffer.clear()
-                raise SupervisorProtocolError(f"Unsupported supervisor protocol version {version}.")
             frame_ints = self._FRAME_INTS.get(kind)
-            if frame_ints is None:
-                self._buffer.clear()
-                raise SupervisorProtocolError(f"Unexpected supervisor frame kind {kind}.")
+            if version != PROTOCOL_VERSION or frame_ints is None:
+                if not self._discard_until_header():
+                    break
+                continue
             frame_bytes = frame_ints * 4
             if len(self._buffer) < frame_bytes:
                 break
-            frames.append(bytes(self._buffer[:frame_bytes]))
+            candidate = bytes(self._buffer[:frame_bytes])
+            values = struct.unpack(f"!{frame_ints}i", candidate)
+            if frame_checksum(values[:-1]) != values[-1]:
+                # An interrupted sequence of socket_send_int calls can leave one
+                # malformed frame in an otherwise healthy old-controller stream.
+                del self._buffer[:4]
+                self.resynchronizations += 1
+                continue
+            frames.append(candidate)
             del self._buffer[:frame_bytes]
         return frames
 
@@ -165,6 +186,7 @@ class RobotSupervisorManager:
         self._heartbeat_seconds = 1.0
         self._app_session = secrets.randbelow(1_999_999_999) + 1
         self._connected_at: float | None = None
+        self._connection_generation = 0
         self._last_seen_at: float | None = None
         self._last_disconnect_at: float | None = None
         self._last_disconnect_detail = ""
@@ -177,6 +199,7 @@ class RobotSupervisorManager:
         self._telemetry: dict[str, object] = {}
         self._telemetry_at: float | None = None
         self._protocol_errors = 0
+        self._protocol_resynchronizations = 0
         self._rejected_connections = 0
         self._maximum_retained_sequences = 512
 
@@ -305,7 +328,20 @@ class RobotSupervisorManager:
                     continue
                 if not chunk:
                     break
-                for frame in buffer.feed(chunk):
+                previous_resynchronizations = buffer.resynchronizations
+                frames = buffer.feed(chunk)
+                if buffer.resynchronizations > previous_resynchronizations:
+                    recovered = buffer.resynchronizations - previous_resynchronizations
+                    with self._lock:
+                        self._protocol_resynchronizations += recovered
+                    diagnostics().record(
+                        "robot_supervisor",
+                        "stream_resynchronized",
+                        "Discarded a malformed supervisor frame and resumed on the next valid frame.",
+                        severity="warning",
+                        details={"peer": peer, "discarded_segments": recovered},
+                    )
+                for frame in frames:
                     values = decode_frame(frame)
                     if not validated:
                         if values[1] != KIND_HELLO:
@@ -360,6 +396,7 @@ class RobotSupervisorManager:
             old = self._connection
             previous_session = self._robot_session
             self._connection = connection
+            self._connection_generation += 1
             now = time.monotonic()
             self._connected_at = now
             self._last_seen_at = now
@@ -606,6 +643,17 @@ class RobotSupervisorManager:
                 self._condition.wait(min(remaining, 0.25))
             return True
 
+    def wait_for_connection_generation(self, previous_generation: int, timeout_seconds: float) -> bool:
+        """Wait for a newly validated socket even when old controllers reuse a generated session ID."""
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while not self._connection or self._connection_generation <= previous_generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(min(remaining, 0.25))
+            return True
+
     def events_for(self, sequence: int) -> list[SupervisorEvent]:
         with self._lock:
             return list(self._event_history.get(sequence, ()))
@@ -622,6 +670,7 @@ class RobotSupervisorManager:
                 "connected": connected,
                 "peer": self._peer,
                 "connection_age_seconds": round(now - self._connected_at, 3) if connected and self._connected_at else None,
+                "connection_generation": self._connection_generation,
                 "heartbeat_age_seconds": round(now - self._last_seen_at, 3) if self._last_seen_at else None,
                 "telemetry_age_seconds": round(now - self._telemetry_at, 3) if self._telemetry_at else None,
                 "disconnect_age_seconds": round(now - self._last_disconnect_at, 3) if self._last_disconnect_at else None,
@@ -632,6 +681,7 @@ class RobotSupervisorManager:
                 "latched": self._robot_latched,
                 "last_disconnect_detail": self._last_disconnect_detail or None,
                 "protocol_errors": self._protocol_errors,
+                "protocol_resynchronizations": self._protocol_resynchronizations,
                 "rejected_connections": self._rejected_connections,
                 "retained_event_sequences": len(self._events),
                 "telemetry": dict(self._telemetry),

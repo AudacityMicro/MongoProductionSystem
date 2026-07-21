@@ -27,7 +27,9 @@ from app.schemas import (
     ClearRobotFault,
     CncTelemetryConnectionTest,
     MovePallet,
+    ManualReturnPallet,
     RecoverPalletMotion,
+    RecoverRunMode,
     ConfigureDebugProgram,
     ConfigureDebugMillProgram,
     ConfirmRunModeAction,
@@ -67,6 +69,7 @@ from app.service import (
     delete_pallet,
     duplicate_pallet,
     move_pallet,
+    manually_return_mill_pallet_to_pool,
     execute_pallet_motion,
     queue_pallet,
     refresh_programs,
@@ -97,6 +100,7 @@ from app.service import (
     update_settings,
     start_pallet_motion,
     start_mill_pallet_transfer,
+    start_automatic_put_away,
     recover_pallet_motion,
     assert_robot_file_mutation_ready,
     assert_system_relaunch_ready,
@@ -110,6 +114,8 @@ from app.service import (
     confirm_run_mode_action,
     dismiss_run_mode_alert,
     clear_stale_run_mode_status,
+    start_run_mode_recovery,
+    execute_run_mode_recovery,
     rebuild_pallet_motion_scripts,
     rebuild_mill_load_position_program,
     bootstrap_robot_supervisor,
@@ -197,13 +203,14 @@ def resolve_editor_command(command: str) -> list[str]:
     raise OSError(f"Editor command was not found: {parts[0]}")
 
 
-def create_app(database_url: str | None = None) -> FastAPI:
+def create_app(database_url: str | None = None, *, external_services: bool = True) -> FastAPI:
     url = database_url or settings.database_url
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        resume_cnc_connections()
-        resume_robot_connections()
+        if external_services:
+            resume_cnc_connections()
+            resume_robot_connections()
         run_migrations(url)
         engine = create_database_engine(url)
         application.state.engine = engine
@@ -212,7 +219,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
             interrupt_active_pallet_motion(session)
             interrupt_robot_reliability_test(session)
             interrupt_run_mode(session)
-            start_robot_supervisor_listener(session)
+            if external_services:
+                start_robot_supervisor_listener(session)
         diagnostics().record(
             "application",
             "started",
@@ -228,6 +236,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "Mongo Production System backend is stopping.",
                 details={"process_id": os.getpid()},
             )
+            # Tests do not start external services, but individual test cases can
+            # still create cached clients. Always tear those resources down.
             stop_robot_supervisor_listener()
             suspend_cnc_connections()
             suspend_robot_connections()
@@ -320,12 +330,19 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return FileResponse(STATIC_DIR / "mill-programs.html")
 
     @application.get("/api/health")
-    def health() -> dict:
+    def health(session: Session = Depends(get_session)) -> dict:
+        # A listening web process is not healthy if it cannot read its durable
+        # scheduler state. Keep this endpoint controller-free so launchers and
+        # watchdogs never create robot or mill traffic merely by checking it.
+        application_settings = get_settings(session)
         return {
             "status": "ok",
             "version": __version__,
             "process_id": os.getpid(),
             "started_at": STARTED_AT,
+            "database": "ok",
+            "run_mode_enabled": application_settings.run_mode_enabled,
+            "run_mode_state": application_settings.run_mode_state,
         }
 
     @application.post("/api/system/supervisor-firewall", status_code=status.HTTP_202_ACCEPTED)
@@ -348,13 +365,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
         request: Request,
         session: Session = Depends(get_session),
     ) -> dict:
-        start_run_mode(session, payload)
-        threading.Thread(
-            target=execute_run_mode,
-            args=(request.app.state.session_factory,),
-            daemon=True,
-            name="production-run-mode",
-        ).start()
+        run_token = start_run_mode(session, payload)
+        if run_token:
+            threading.Thread(
+                target=execute_run_mode,
+                args=(request.app.state.session_factory, run_token),
+                daemon=True,
+                name="production-run-mode",
+            ).start()
         return board_snapshot(session)
 
     @application.post("/api/run-mode/stop")
@@ -392,6 +410,21 @@ def create_app(database_url: str | None = None) -> FastAPI:
         session: Session = Depends(get_session),
     ) -> dict:
         clear_stale_run_mode_status(session, payload.expected_revision)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/recover", status_code=status.HTTP_202_ACCEPTED)
+    def recover_production_run_mode(
+        payload: RecoverRunMode,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        run_token = start_run_mode_recovery(session, payload)
+        threading.Thread(
+            target=execute_run_mode_recovery,
+            args=(request.app.state.session_factory, run_token, payload.strategy),
+            daemon=True,
+            name="production-run-recovery",
+        ).start()
         return board_snapshot(session)
 
     @application.get("/api/dashboard")
@@ -518,6 +551,15 @@ def create_app(database_url: str | None = None) -> FastAPI:
         move_pallet(session, pallet_id, payload)
         return board_snapshot(session)
 
+    @application.post("/api/pallets/{pallet_id}/manual-return-to-pool")
+    def manually_return_mill_pallet(
+        pallet_id: str,
+        payload: ManualReturnPallet,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        manually_return_mill_pallet_to_pool(session, pallet_id, payload)
+        return board_snapshot(session)
+
     @application.post("/api/robot-motions", status_code=status.HTTP_202_ACCEPTED)
     def start_robot_pallet_motion(
         payload: StartPalletMotion,
@@ -547,6 +589,25 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 args=(request.app.state.session_factory, motion_id),
                 daemon=True,
                 name=f"mill-transfer-{motion_id[:8]}",
+            ).start()
+        return board_snapshot(session)
+
+    @application.post("/api/pallets/{pallet_id}/put-away", status_code=status.HTTP_202_ACCEPTED)
+    def automatically_put_away_pallet(
+        pallet_id: str,
+        payload: RevisionRequest,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        motion_id, _ = start_automatic_put_away(
+            session, pallet_id, payload.expected_revision,
+        )
+        if motion_id:
+            threading.Thread(
+                target=execute_pallet_motion,
+                args=(request.app.state.session_factory, motion_id),
+                daemon=True,
+                name=f"automatic-put-away-{motion_id[:8]}",
             ).start()
         return board_snapshot(session)
 
@@ -625,8 +686,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
         payload: RevisionRequest,
         session: Session = Depends(get_session),
     ) -> dict:
-        cleared = refresh_programs(session, payload.expected_revision)
-        return {"board": board_snapshot(session), "cleared_assignments": cleared}
+        result = refresh_programs(session, payload.expected_revision)
+        return {"board": board_snapshot(session), **result}
 
     @application.post("/api/debug/signals/{signal}")
     def send_debug_signal(

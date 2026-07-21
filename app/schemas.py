@@ -114,6 +114,10 @@ class MovePallet(RevisionRequest):
     pool_slot_number: int | None = Field(default=None, ge=1)
 
 
+class ManualReturnPallet(RevisionRequest):
+    """Reconcile a pallet physically returned from the mill without automation."""
+
+
 class QueuePallet(RevisionRequest):
     queue_index: int | None = Field(default=None, ge=0)
 
@@ -284,6 +288,7 @@ class ClearRobotFault(RevisionRequest):
 
 class StartRunMode(RevisionRequest):
     safety_confirm: bool | None = None
+    request_id: str = Field(default="", max_length=36)
 
 
 class SetRunModeSafety(RevisionRequest):
@@ -293,6 +298,10 @@ class SetRunModeSafety(RevisionRequest):
 class ConfirmRunModeAction(RevisionRequest):
     token: str = Field(min_length=36, max_length=36)
     approved: bool
+
+
+class RecoverRunMode(RevisionRequest):
+    strategy: Literal["retry_robot_only", "reposition_and_retry"]
 
 
 class SettingsUpdate(RevisionRequest):

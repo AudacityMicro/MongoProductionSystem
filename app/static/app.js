@@ -56,6 +56,21 @@ let renderedBoardKey = null;
 let boardLoadPromise = null;
 let dismissedProgramWarning = null;
 let dismissedMotionKey = null;
+let runModeStartPending = false;
+let runModeStopQueued = false;
+let pendingRunModeRequestId = null;
+
+function newRunModeRequestId() {
+  // Some older tablet/webview browsers lack crypto.randomUUID(). The server
+  // only needs a short, unique idempotency key for one start request.
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  const random = globalThis.crypto?.getRandomValues
+    ? globalThis.crypto.getRandomValues(new Uint32Array(2))
+    : [Math.floor(Math.random() * 0x100000000), Math.floor(Math.random() * 0x100000000)];
+  return `${Date.now().toString(36)}-${random[0].toString(36)}${random[1].toString(36)}`.slice(0, 36);
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -163,6 +178,16 @@ function emptyState(label) {
   return `<div class="zone-empty"><span>+</span><p>${escapeHtml(label)}</p></div>`;
 }
 
+function palletReturnGhost(pallet) {
+  const source = pallet.location === "machine" ? "Mill" : "Robot-held";
+  return `
+    <article class="pool-return-ghost" aria-label="${escapeHtml(pallet.name)} is reserved to return here">
+      <span class="ghost-label">Reserved return</span>
+      <strong>${escapeHtml(pallet.name)}</strong>
+      <small>Currently ${source}</small>
+    </article>`;
+}
+
 function palletCard(pallet, position = null) {
   const program = pallet.program_path || "No program";
   const runLocked = Boolean(board.run_mode?.enabled);
@@ -177,17 +202,27 @@ function palletCard(pallet, position = null) {
   const pickAction = pallet.location === "pool" && !motionLocked
     ? `<button class="text-button" data-action="pick">Pick</button>`
     : "";
+  const automaticPutAwayAction = board.capabilities?.automatic_put_away
+    && ["machine", "robot_held"].includes(pallet.location) && !motionLocked
+    ? `<button class="text-button" data-action="automatic-put-away">Put away pallet</button>`
+    : "";
   const millPutAwayAction = pallet.location === "machine" && !motionLocked
-    ? `<button class="text-button" data-action="mongo-unload">Put away with Mongo</button>`
+    ? `<button class="text-button" data-action="mongo-unload">Choose return position</button>`
+    : "";
+  const manualReturnAction = pallet.location === "machine" && !motionLocked
+    ? `<button class="text-button danger-text" data-action="manual-return-to-pool">Record return to pool</button>`
     : "";
   const queueBadge = pallet.queue_position !== null && position === null
     ? `<span class="queue-chip">Queued #${pallet.queue_position + 1}</span>`
     : "";
   const cardContext = position === null ? "physical" : "queue";
-  const programDetails = pallet.program_tools?.length && pallet.expected_cycle_seconds
-    ? `<div><dt>Tools</dt><dd>${escapeHtml(pallet.program_tools.join(", "))}</dd></div>
-       <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
-    : "";
+  const showProgramDetails = pallet.program_path && !["complete_parts", "defective_parts"].includes(pallet.content_status);
+  const programDetails = !showProgramDetails
+    ? ""
+    : pallet.program_metadata_state === "parsed"
+      ? `<div><dt>Tools</dt><dd>${escapeHtml(pallet.program_tools.join(", ") || "None")}</dd></div>
+         <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
+      : `<div><dt>Metadata</dt><dd title="${escapeHtml(pallet.program_metadata_detail || "Program metadata unavailable")}">Unavailable</dd></div>`;
   return `
     <article class="pallet-card content-${pallet.content_status}" draggable="${canManage && pallet.location !== "robot_held" ? "true" : "false"}"
       data-pallet-id="${pallet.id}" data-card-context="${cardContext}" tabindex="0">
@@ -206,7 +241,9 @@ function palletCard(pallet, position = null) {
         ${queueAction}
         ${dequeueAction}
         ${pickAction}
+        ${automaticPutAwayAction}
         ${millPutAwayAction}
+        ${manualReturnAction}
         ${canManage ? `<button class="text-button" data-action="edit">Edit</button>
         <button class="text-button" data-action="duplicate">Duplicate</button>
         <button class="text-button danger-text" data-action="delete">Delete</button>` : ""}
@@ -226,6 +263,9 @@ function renderBoard() {
   const onDeck = pallets.find(item => item.location === "on_deck");
   const dripping = pallets.find(item => item.location === "dripping");
   const robotHeld = pallets.find(item => item.location === "robot_held");
+  const returnGhosts = pallets.filter(item =>
+    ["machine", "robot_held"].includes(item.location) && item.return_pool_slot_number !== null,
+  );
   const stored = pallets.filter(item => item.location === "storage")
     .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -237,10 +277,11 @@ function renderBoard() {
     (_, index) => {
       const number = index + 1;
       const occupant = pool.find(item => item.pool_slot_number === number);
-      return `<div class="pool-position drop-target ${occupant ? "occupied" : ""}"
+      const ghost = returnGhosts.find(item => item.return_pool_slot_number === number);
+      return `<div class="pool-position drop-target ${occupant ? "occupied" : ghost ? "reserved" : ""}"
         data-destination="pool" data-pool-slot="${number}">
         <header><span>${String(number).padStart(2, "0")}</span><small>Pool position</small></header>
-        ${occupant ? palletCard(occupant) : (robotHeld && !board.robot_motion?.active ? `<button class="button secondary pool-put-action" type="button" data-put-slot="${number}">Put Robot-held pallet here</button>` : emptyState("Available"))}
+        ${occupant ? palletCard(occupant) : ghost ? palletReturnGhost(ghost) : (robotHeld && !board.robot_motion?.active ? `<button class="button secondary pool-put-action" type="button" data-put-slot="${number}">Put Robot-held pallet here</button>` : emptyState("Available"))}
       </div>`;
     },
   ).join("");
@@ -267,7 +308,7 @@ function renderBoard() {
   document.querySelector("#autoschedule-queue").disabled = queue.filter(item => item.program_tools?.length).length < 2;
   document.querySelector("#create-pallet").disabled = false;
   if (board.run_mode?.enabled) document.querySelector("#autoschedule-queue").disabled = true;
-  document.querySelector("#pool-count").textContent = `${pool.length} pallet${pool.length === 1 ? "" : "s"}`;
+  document.querySelector("#pool-count").textContent = `${pool.length} pallet${pool.length === 1 ? "" : "s"}${returnGhosts.length ? ` · ${returnGhosts.length} reserved` : ""}`;
   document.querySelector("#storage-count").textContent = `${stored.length} pallet${stored.length === 1 ? "" : "s"}`;
   document.querySelector("#weight-unit-label").textContent = `(${board.settings.weight_unit})`;
   // Program choices are read from PathPilot when the pallet dialog opens.
@@ -387,21 +428,56 @@ ui.robotMotionDismiss.addEventListener("click", () => {
 
 function renderRunMode() {
   const run = board.run_mode || {};
-  ui.runModeToggle.textContent = run.enabled ? "Stop run mode" : "Start run mode";
+  const pendingStart = runModeStartPending && !run.enabled;
+  ui.runModeToggle.textContent = pendingStart
+    ? (runModeStopQueued ? "Cancelling run start..." : "Cancel pending start")
+    : run.enabled ? (run.state === "start_requested" ? "Cancel run start" : "Stop run mode")
+      : run.state === "stopping" ? "Stopping run mode..." : "Start run mode";
+  ui.runModeToggle.disabled = run.state === "stopping" || (pendingStart && runModeStopQueued);
   ui.runModeToggle.classList.toggle("active", Boolean(run.enabled));
   ui.runModeStatus.className = `run-mode-status ${escapeHtml(run.state || "idle")}`;
   const pallet = run.current_pallet_name ? ` · ${escapeHtml(run.current_pallet_name)}` : "";
-  const showDetail = !run.enabled && ["faulted", "interrupted"].includes(run.state);
+  const showDetail = (
+    !run.enabled && ["faulted", "interrupted"].includes(run.state)
+  ) || [
+    "telemetry_unavailable",
+    "telemetry_restored",
+    "recovering_startup_telemetry",
+    "recovering_cnc_telemetry",
+    "recovering_robot_telemetry",
+  ].includes(run.state);
   const detail = showDetail ? `<span>${escapeHtml(run.detail || "Run Mode needs operator attention.")}</span>` : "";
+  const machinePallet = board.pallets.find(item => item.location === "machine");
+  const recoveryActions = showDetail && machinePallet?.return_pool_slot_number
+    ? `<div class="run-mode-recovery-actions">
+        <button class="button secondary" type="button" data-recover-run-mode="retry_robot_only">Retry robot unload only</button>
+        <button class="button ghost" type="button" data-recover-run-mode="reposition_and_retry">Reposition mill, then retry</button>
+      </div>`
+    : "";
   const clearStatus = !run.enabled && ["faulted", "interrupted"].includes(run.state)
     ? '<button class="notice-dismiss run-mode-clear" type="button" data-clear-run-mode-status>Clear warning</button>'
     : "";
-  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div>${detail}${clearStatus}`;
+  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div>${detail}${recoveryActions}${clearStatus}`;
 
   if (run.confirmation_token && run.pending_action && shownRunConfirmationToken !== run.confirmation_token) {
     shownRunConfirmationToken = run.confirmation_token;
-    document.querySelector("#run-confirm-title").textContent = `Approve ${run.pending_action.replaceAll("_", " ")}`;
+    const cncFault = run.pending_action === "retry_cnc_program";
+    const cncPreflight = run.pending_action === "retry_cnc_preflight";
+    const robotRetry = run.pending_action === "retry_robot_transfer";
+    document.querySelector("#run-confirm-title").textContent = cncFault
+      ? "Mill program stopped"
+      : cncPreflight ? "PathPilot connection unavailable"
+      : robotRetry ? "Robot connection interrupted"
+      : `Approve ${run.pending_action.replaceAll("_", " ")}`;
     document.querySelector("#run-confirm-message").textContent = run.detail;
+    document.querySelector("#run-confirm-stop").textContent = cncFault || cncPreflight || robotRetry
+      ? "Stop and leave pallet"
+      : "Stop run mode";
+    document.querySelector("#run-confirm-approve").textContent = cncFault
+      ? "Retry same program"
+      : cncPreflight ? "Retry connection check"
+      : robotRetry ? "Reconnect and retry robot only"
+      : "Approve action";
     if (!ui.runConfirmDialog.open) ui.runConfirmDialog.showModal();
   }
   if (!run.confirmation_token) {
@@ -411,6 +487,28 @@ function renderRunMode() {
 }
 
 ui.runModeStatus.addEventListener("click", async event => {
+  const recoveryButton = event.target.closest("[data-recover-run-mode]");
+  if (recoveryButton && board) {
+    const strategy = recoveryButton.dataset.recoverRunMode;
+    const prompt = strategy === "retry_robot_only"
+      ? "Confirm the mill is still at its loading position. Retry only the robot unload?"
+      : "Move the mill to its loading position again, then retry the robot unload?";
+    if (!window.confirm(prompt)) return;
+    document.querySelectorAll("[data-recover-run-mode]").forEach(item => { item.disabled = true; });
+    recoveryButton.textContent = "Starting recovery...";
+    try {
+      board = await api("/api/run-mode/recover", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: board.revision, strategy}),
+      });
+      renderBoard();
+      showToast("Run Mode recovery started.");
+    } catch (error) {
+      showToast(`Could not start recovery: ${error.message}`, "error");
+      await loadBoard();
+    }
+    return;
+  }
   const button = event.target.closest("[data-clear-run-mode-status]");
   if (!button || !board) return;
   button.disabled = true;
@@ -505,7 +603,14 @@ async function savePallet(event) {
     });
     ui.palletDialog.close();
     renderBoard();
-    showToast(id ? "Pallet updated." : "Pallet created.");
+    const savedPallet = id
+      ? board.pallets.find(pallet => pallet.id === id)
+      : board.pallets.find(pallet => pallet.program_path === program && pallet.workholding === payload.workholding);
+    if (program && savedPallet?.program_metadata_state !== "parsed") {
+      showToast(`${id ? "Pallet updated" : "Pallet created"}, but program metadata is unavailable: ${savedPallet?.program_metadata_detail || "repost with the updated Fusion post"}`, "error");
+    } else {
+      showToast(id ? "Pallet updated." : "Pallet created.");
+    }
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -608,6 +713,11 @@ document.querySelector("#create-pallet").addEventListener("click", () => openPal
 document.querySelector("#autoschedule-queue").addEventListener("click", previewAutoschedule);
 
 ui.runModeToggle.addEventListener("click", () => {
+  if (runModeStartPending && !board.run_mode?.enabled) {
+    runModeStopQueued = true;
+    renderRunMode();
+    return;
+  }
   if (board.run_mode?.enabled) {
     askConfirmation("Stop run mode", "Stop after the current controller command finishes? No next automated step will start.", async () => {
       await mutate("/api/run-mode/stop", {
@@ -619,16 +729,44 @@ ui.runModeToggle.addEventListener("click", () => {
   }
   const queued = board.pallets.filter(item => item.queue_position !== null).length;
   askConfirmation("Start run mode", `Run all ${queued} queued pallet${queued === 1 ? "" : "s"} in order?`, async () => {
+    runModeStartPending = true;
+    runModeStopQueued = false;
+    pendingRunModeRequestId = newRunModeRequestId();
+    renderRunMode();
     try {
       board = await api("/api/run-mode/start", {
         method: "POST",
-        body: JSON.stringify({expected_revision: board.revision}),
+        body: JSON.stringify({expected_revision: board.revision, request_id: pendingRunModeRequestId}),
       });
       renderBoard();
-      showToast("Run mode started.");
+      if (runModeStopQueued) {
+        board = await api("/api/run-mode/stop", {
+          method: "POST",
+          body: JSON.stringify({expected_revision: board.revision}),
+        });
+        renderBoard();
+        showToast("Run Mode start cancelled.");
+      } else {
+        showToast("Run mode start requested. Controller checks are running.");
+      }
     } catch (error) {
       showToast(error.message, "error");
+      try {
+        board = await api("/api/board");
+        renderBoard();
+        if (!board.run_mode?.enabled) {
+          showToast("The start request may still be in transit. The control remains locked until the connection is restored or the page is reloaded.", "error");
+          return;
+        }
+      } catch (_refreshError) {
+        showToast("Run Mode start status is unknown. The control remains locked until the connection is restored.", "error");
+        return;
+      }
     }
+    runModeStartPending = false;
+    runModeStopQueued = false;
+    pendingRunModeRequestId = null;
+    renderRunMode();
   });
 });
 
@@ -676,7 +814,37 @@ document.addEventListener("click", async event => {
     );
   }
   if (action === "pick") startRobotMotion("pick", pallet.pool_slot_number, pallet.id);
+  if (action === "automatic-put-away") {
+    const preferred = pallet.return_pool_slot_number
+      ? `Pool ${String(pallet.return_pool_slot_number).padStart(2, "0")}`
+      : "the best available pool position";
+    askConfirmation(
+      "Put away pallet",
+      `Use Mongo to return ${pallet.name} to ${preferred}? If that position is unavailable, the nearest unreserved position will be used.`,
+      async () => {
+        await mutate(`/api/pallets/${pallet.id}/put-away`, {
+          method: "POST",
+          body: JSON.stringify({expected_revision: board.revision}),
+        }, `Mongo is putting away ${pallet.name}.`);
+      },
+    );
+  }
   if (action === "mongo-unload") openMillPutAwayDialog(pallet);
+  if (action === "manual-return-to-pool") {
+    const preferred = pallet.return_pool_slot_number
+      ? `Pool ${String(pallet.return_pool_slot_number).padStart(2, "0")}`
+      : "the first available pool position";
+    askConfirmation(
+      "Record manual return to pool",
+      `Confirm that ${pallet.name} is physically out of the mill and already back in the pallet pool. The schedule will place it in ${preferred}. This sends no robot or mill command.`,
+      async () => {
+        await mutate(`/api/pallets/${pallet.id}/manual-return-to-pool`, {
+          method: "POST",
+          body: JSON.stringify({expected_revision: board.revision}),
+        }, `${pallet.name} was recorded back in the pallet pool. No controller command was sent.`);
+      },
+    );
+  }
   if (action === "duplicate") {
     askConfirmation("Duplicate pallet", `Create a pool copy of ${pallet.name}?`, async () => {
       await mutate(`/api/pallets/${pallet.id}/duplicate`, {
@@ -714,7 +882,10 @@ async function startRobotMotion(operation, poolSlotNumber, palletId = null) {
 
 function openMillPutAwayDialog(pallet) {
   const openSlots = Array.from({length: board.settings.pool_slot_count}, (_, index) => index + 1)
-    .filter(slot => !board.pallets.some(item => item.location === "pool" && item.pool_slot_number === slot));
+    .filter(slot => !board.pallets.some(item =>
+      (item.location === "pool" && item.pool_slot_number === slot)
+      || (item.id !== pallet.id && ["machine", "robot_held"].includes(item.location) && item.return_pool_slot_number === slot),
+    ));
   if (!openSlots.length) {
     showToast("No empty pallet-pool positions are available.", "error");
     return;
@@ -909,7 +1080,7 @@ document.querySelector("#refresh-programs").addEventListener("click", async () =
     board = result.board;
     renderBoard();
     if (ui.palletDialog.open) {
-      palletDialogPrograms = [...(board.programs || [])];
+      palletDialogPrograms = [...(result.programs || board.programs || [])];
       renderProgramOptions(document.querySelector("#pallet-program").value, palletDialogPrograms);
     }
     if (board.program_warning) {
@@ -919,7 +1090,12 @@ document.querySelector("#refresh-programs").addEventListener("click", async () =
     const suffix = result.cleared_assignments.length
       ? ` Cleared assignments from: ${result.cleared_assignments.join(", ")}.`
       : "";
-    showToast(`Program list refreshed.${suffix}`);
+    const refreshedPrograms = result.programs || board.programs || [];
+    const metadataCount = result.metadata_refreshed
+      ?? board.pallets.filter(pallet => pallet.program_path).length;
+    showToast(
+      `Refreshed ${refreshedPrograms.length} programs and metadata for ${metadataCount} assigned programs.${suffix}`,
+    );
   } catch (error) {
     showToast(error.message, "error");
   }

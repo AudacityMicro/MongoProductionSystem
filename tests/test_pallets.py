@@ -79,6 +79,7 @@ def test_simulated_robot_pick_and_put_away_preserves_queue(client: TestClient) -
     held = next(item for item in board["pallets"] if item["id"] == pallet["id"])
     assert held["location"] == "robot_held"
     assert held["pool_slot_number"] is None
+    assert held["return_pool_slot_number"] == 1
     assert held["queue_position"] == 0
     assert board["robot_motion"]["history"][0]["status"] == "succeeded"
 
@@ -95,7 +96,54 @@ def test_simulated_robot_pick_and_put_away_preserves_queue(client: TestClient) -
     returned = next(item for item in put.json()["pallets"] if item["id"] == pallet["id"])
     assert returned["location"] == "pool"
     assert returned["pool_slot_number"] == 4
+    assert returned["return_pool_slot_number"] is None
     assert returned["queue_position"] == 0
+
+
+def test_reserved_return_position_is_not_assigned_to_a_new_pallet(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    first = board["pallets"][0]
+    held = client.post(
+        "/api/robot-motions",
+        json={
+            "expected_revision": board["revision"],
+            "operation": "pick",
+            "pool_slot_number": 1,
+            "pallet_id": first["id"],
+        },
+    ).json()
+
+    created = create_pallet(client, held["revision"])
+    by_id = {item["id"]: item for item in created["pallets"]}
+
+    assert by_id[first["id"]]["return_pool_slot_number"] == 1
+    second = next(item for item in created["pallets"] if item["id"] != first["id"])
+    assert second["pool_slot_number"] == 2
+
+
+def test_automatic_put_away_returns_robot_held_pallet_to_reserved_position(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    pallet = board["pallets"][0]
+    held = client.post(
+        "/api/robot-motions",
+        json={
+            "expected_revision": board["revision"],
+            "operation": "pick",
+            "pool_slot_number": 1,
+            "pallet_id": pallet["id"],
+        },
+    ).json()
+
+    response = client.post(
+        f"/api/pallets/{pallet['id']}/put-away",
+        json={"expected_revision": held["revision"]},
+    )
+
+    assert response.status_code == 202
+    returned = next(item for item in response.json()["pallets"] if item["id"] == pallet["id"])
+    assert returned["location"] == "pool"
+    assert returned["pool_slot_number"] == 1
+    assert returned["return_pool_slot_number"] is None
 
 
 def test_removing_a_pallet_from_queue_keeps_its_pool_location(client: TestClient) -> None:

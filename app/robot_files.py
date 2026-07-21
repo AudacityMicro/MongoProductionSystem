@@ -164,6 +164,35 @@ def read_robot_file(
         raise
 
 
+def read_robot_file_prefix(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    directory: str,
+    path: str,
+    timeout_seconds: float,
+    limit: int = 64 * 1024,
+) -> dict:
+    """Read only the beginning of a regular controller file for cheap header inspection."""
+    root = _root_path(directory)
+    target = _safe_path(root, path)
+    try:
+        with robot_sftp_client(host, port, username, password, timeout_seconds) as sftp:
+            attributes = sftp.stat(str(target))
+            if not stat.S_ISREG(attributes.st_mode):
+                raise RobotFileAccessError(f"Controller path is not a regular file: {target}")
+            with sftp.open(str(target), "rb") as remote:
+                data = remote.read(limit)
+            return {
+                "path": str(target),
+                "size": int(attributes.st_size),
+                "text": data.decode("utf-8", errors="replace"),
+            }
+    except RobotFileAccessError:
+        raise
+
+
 def download_robot_file(
     host: str, port: int, username: str, password: str, directory: str, path: str, timeout_seconds: float, limit: int = 100_000_000
 ) -> tuple[str, bytes]:

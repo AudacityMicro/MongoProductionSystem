@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 from pathlib import PurePosixPath
 
+from app import service
+
 
 def create_pallet(client: TestClient, revision: int) -> dict:
     response = client.post(
@@ -120,26 +122,23 @@ def test_debug_completion_rejects_full_pool(client: TestClient) -> None:
         },
     ).json()
     board = create_pallet(client, board["revision"])
-    board = client.put(
-        "/api/settings",
-        json={
-            "expected_revision": board["revision"],
-            "source_folder": "",
-            "program_extensions": [".nc"],
-            "weight_unit": "lb",
-            "pool_slot_count": 1,
-            "debug_menu_enabled": True,
-            "robot_connection_mode": "simulated",
-            "robot_host": "",
-            "robot_port": 30004,
-            "robot_poll_hz": 10,
-            "robot_timeout_seconds": 1.0,
-        },
-    ).json()["board"]
+    second_id = next(item["id"] for item in board["pallets"] if item["id"] != first_id)
+    # Simulate legacy data without a return reservation so the only configured
+    # pool position can genuinely be occupied by another pallet.
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        machine = session.get(service.Pallet, first_id)
+        second = session.get(service.Pallet, second_id)
+        machine.return_pool_slot_number = None
+        second.pool_slot_number = 1
+        settings.pool_slot_count = 1
+        service.bump(settings)
+        session.commit()
+        revision = settings.revision
 
     response = client.post(
         "/api/debug/signals/complete",
-        json={"expected_revision": board["revision"]},
+        json={"expected_revision": revision},
     )
 
     assert response.status_code == 409

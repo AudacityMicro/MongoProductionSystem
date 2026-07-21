@@ -15,6 +15,10 @@ class CncTelemetryError(RuntimeError):
     """Raised when the controller cannot provide a valid telemetry snapshot."""
 
 
+class CncProgramFault(RuntimeError):
+    """Raised when PathPilot reports a program failure or active machine alarm."""
+
+
 _SSH_LOCK = RLock()
 _SSH_CLIENT: paramiko.SSHClient | None = None
 _SSH_KEY: tuple[str, int, str, str, float] | None = None
@@ -208,6 +212,10 @@ payload = {
     "health": {
         "estop": value("estop"),
         "enabled": value("enabled"),
+        "jog_lockout_configured": value("cfg_jog_lockout_after_unexpected"),
+        "jog_locked_out": value("jog_locked_out"),
+        "motion_stop_lockout_configured": value("cfg_motion_stop_jog_lockout_after_unexpected"),
+        "motion_stop_locked_out": value("motion_stop_jog_locked_out"),
         "in_position": value("inpos"),
         "homed": homed,
         "limits": limits,
@@ -330,16 +338,52 @@ import linuxcnc
 
 s = linuxcnc.stat()
 s.poll()
+messages = []
+try:
+    channel = linuxcnc.error_channel()
+    error_kinds = set(filter(lambda value: value is not None, (
+        getattr(linuxcnc, "NML_ERROR", None),
+        getattr(linuxcnc, "OPERATOR_ERROR", None),
+    )))
+    for _ in range(20):
+        message = channel.poll()
+        if not message:
+            break
+        kind, text = message
+        if not isinstance(text, str):
+            text = text.decode("utf-8", "replace")
+        messages.append({"kind": kind, "text": text, "is_error": kind in error_kinds})
+except Exception:
+    pass
+
+status_state = getattr(s, "state", None)
+exec_state = getattr(s, "exec_state", None)
 print("MONGO_CNC_CYCLE=" + json.dumps({
     "interp_state": getattr(s, "interp_state", None),
     "estop": getattr(s, "estop", None),
     "enabled": getattr(s, "enabled", None),
     "program": getattr(s, "file", "") or "",
+    "motion_line": getattr(s, "motion_line", None),
+    "current_line": getattr(s, "current_line", None),
+    "read_line": getattr(s, "read_line", None),
+    "paused": getattr(s, "paused", None),
+    "queue": getattr(s, "queue", None),
+    "task_state": getattr(s, "task_state", None),
+    "jog_lockout_configured": getattr(s, "cfg_jog_lockout_after_unexpected", None),
+    "jog_locked_out": getattr(s, "jog_locked_out", None),
+    "motion_stop_lockout_configured": getattr(s, "cfg_motion_stop_jog_lockout_after_unexpected", None),
+    "motion_stop_locked_out": getattr(s, "motion_stop_jog_locked_out", None),
+    "status_state": status_state,
+    "exec_state": exec_state,
+    "interpreter_error": getattr(s, "interpreter_errcode", None),
+    "rcs_error": status_state == getattr(linuxcnc, "RCS_ERROR", -999999),
+    "exec_error": exec_state == getattr(linuxcnc, "EXEC_ERROR", -999999),
+    "error_messages": messages,
 }, allow_nan=False))
 '''
 
 
-def _remote_command(remote_script: str) -> str:
+def _remote_command(remote_script: str, timeout_seconds: float) -> str:
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     # PathPilot's ordinary SSH shell does not include its LinuxCNC module or
     # NML_FILE. Source either spelling and directory used by PathPilot builds.
@@ -357,7 +401,11 @@ def _remote_command(remote_script: str) -> str:
         "done; "
         f"exec python -c \"import base64;exec(base64.b64decode('{encoded}'))\""
     )
-    return f"bash -lc {shlex.quote(script)}"
+    # Bound the process on PathPilot itself. Closing an SSH channel does not
+    # reliably terminate its remote child, which can otherwise leave a stale
+    # telemetry or command process behind after a network timeout.
+    remote_limit = max(2, int(float(timeout_seconds) + 0.999))
+    return f"timeout --signal=TERM {remote_limit}s bash -lc {shlex.quote(script)}"
 
 
 def _read_remote_payload(
@@ -372,7 +420,9 @@ def _read_remote_payload(
     with _SSH_LOCK:
         client = _persistent_ssh_client(host, port, username, password, timeout)
         try:
-            _, stdout, stderr = client.exec_command(_remote_command(remote_script), timeout=timeout, get_pty=False)
+            _, stdout, stderr = client.exec_command(
+                _remote_command(remote_script, timeout), timeout=timeout, get_pty=False,
+            )
             output = stdout.read().decode("utf-8", errors="replace")
             error_output = stderr.read().decode("utf-8", errors="replace").strip()
         except (paramiko.SSHException, EOFError, OSError) as exc:
@@ -505,15 +555,85 @@ def run_linuxcnc_program(
     """Load and start one preconfigured absolute G-code file through LinuxCNC."""
     remote_script = f'''import json
 import linuxcnc
+import os
+import shutil
+import subprocess
+import time
 
 filename = {filename!r}
 require_a_axis_homed = {require_a_axis_homed!r}
+pathpilot_program = "/tmp/very-unlikely-pathpilot-gcode.file"
 status = linuxcnc.stat()
+errors = linuxcnc.error_channel()
+
+def read_errors():
+    messages = []
+    for _ in range(50):
+        item = errors.poll()
+        if not item:
+            break
+        kind, text = item
+        if not isinstance(text, str):
+            text = text.decode("utf-8", "replace")
+        messages.append({{"kind": kind, "text": text}})
+    return messages
+
+def wait_for_mode(command, expected_mode, label):
+    status.poll()
+    if getattr(status, "task_mode", None) != expected_mode:
+        result = command.mode(expected_mode)
+        if result == getattr(linuxcnc, "RCS_ERROR", -1):
+            raise RuntimeError("PathPilot rejected the change to " + label + " mode.")
+        command.wait_complete()
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        status.poll()
+        if getattr(status, "task_mode", None) == expected_mode:
+            return
+        time.sleep(0.05)
+    raise RuntimeError(
+        "PathPilot did not enter " + label + " mode. Current task_mode="
+        + str(getattr(status, "task_mode", None))
+    )
+
+def set_hal_pin(name, enabled):
+    subprocess.check_call([
+        "/home/operator/tmc/bin/halcmd", "setp", name,
+        "TRUE" if enabled else "FALSE",
+    ])
+
+def read_hal_pin(name):
+    raw = subprocess.check_output([
+        "/home/operator/tmc/bin/halcmd", "getp", name,
+    ]).strip().upper()
+    return raw == "TRUE"
+
+def motion_lockout_active():
+    return bool(
+        (
+            getattr(status, "cfg_jog_lockout_after_unexpected", False)
+            and getattr(status, "jog_locked_out", False)
+        )
+        or (
+            getattr(status, "cfg_motion_stop_jog_lockout_after_unexpected", False)
+            and getattr(status, "motion_stop_jog_locked_out", False)
+        )
+    )
+
+def raise_if_motion_locked_out():
+    status.poll()
+    if motion_lockout_active():
+        raise RuntimeError(
+            "PathPilot motion is locked out after a probe or unexpected-stop event. "
+            "Restore the probe and press Reset on PathPilot to re-enable operation."
+        )
+
 status.poll()
 if getattr(status, "estop", False):
     raise RuntimeError("PathPilot is in E-stop.")
 if not getattr(status, "enabled", False):
     raise RuntimeError("PathPilot is not enabled.")
+raise_if_motion_locked_out()
 if getattr(status, "interp_state", linuxcnc.INTERP_IDLE) != linuxcnc.INTERP_IDLE:
     raise RuntimeError("PathPilot is already running or paused. Stop the current program before starting another.")
 homed = list(getattr(status, "homed", []))
@@ -530,17 +650,145 @@ if homed and (len(homed) < required_axes or not all(bool(value) for value in hom
     raise RuntimeError(axis_label + " must be homed before starting a program.")
 
 command = linuxcnc.command()
-command.mode(linuxcnc.MODE_AUTO)
+# Match PathPilot's own loader. Switching through MDI clears the interpreter's
+# file pointer without program_close(), which PathPilot avoids because it also
+# resets modal interpreter state. LinuxCNC runs a private immutable copy while
+# resolving relative paths from the selected program's original directory.
+wait_for_mode(command, linuxcnc.MODE_MDI, "MDI")
+wait_for_mode(command, linuxcnc.MODE_AUTO, "Auto")
+shutil.copy2(filename, pathpilot_program)
+command.program_open(pathpilot_program, os.path.dirname(filename))
 command.wait_complete()
-# PathPilot keeps the currently selected file open until explicitly released.
-command.program_close()
-command.wait_complete()
-command.program_open(filename)
-command.wait_complete()
-# Match the active PathPilot UI's cycle-start call exactly. Its LinuxCNC
-# binding requires the PathPilot-specific preparation and single-step values.
-command.auto(linuxcnc.AUTO_RUN, 1, linuxcnc.PREP_NONE, True, False)
-command.wait_complete()
-print("MONGO_CNC_RUN=" + json.dumps({{"accepted": True, "filename": filename}}))
+# PathPilot may acknowledge program_open() before status reports the private
+# working copy as selected.
+load_deadline = time.time() + 5.0
+while time.time() < load_deadline:
+    status.poll()
+    if (getattr(status, "file", "") or "") == pathpilot_program:
+        break
+    time.sleep(0.05)
+status.poll()
+loaded_program = getattr(status, "file", "") or ""
+if loaded_program != pathpilot_program:
+    raise RuntimeError(
+        "PathPilot did not finish loading the requested program. "
+        "Requested: " + filename + "; controller selected: " + (loaded_program or "none")
+    )
+# Loading can cause an asynchronous mode transition. Reconfirm Auto and Idle
+# before Cycle Start rather than assuming wait_complete() synchronized status.
+wait_for_mode(command, linuxcnc.MODE_AUTO, "Auto")
+status.poll()
+if getattr(status, "interp_state", linuxcnc.INTERP_IDLE) != linuxcnc.INTERP_IDLE:
+    raise RuntimeError("PathPilot left Idle while loading the requested program.")
+# Discard stale messages so any diagnostics below belong to this launch.
+read_errors()
+# Use LinuxCNC's supported HALUI remote-start path. PathPilot's UI owns the
+# interpreter state and can force Manual while an external command object is
+# loading a file; HALUI requests Auto and Run together without competing with
+# that UI state machine. Always release both momentary inputs afterward.
+set_hal_pin("halui.program.run", False)
+set_hal_pin("halui.mode.auto", False)
+try:
+    set_hal_pin("halui.mode.auto", True)
+    auto_deadline = time.time() + 5.0
+    while time.time() < auto_deadline:
+        status.poll()
+        if (
+            read_hal_pin("halui.mode.is-auto")
+            and getattr(status, "task_mode", None) == linuxcnc.MODE_AUTO
+        ):
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("PathPilot did not acknowledge the HALUI Auto-mode request.")
+    set_hal_pin("halui.program.run", True)
+    time.sleep(0.1)
+finally:
+    set_hal_pin("halui.program.run", False)
+    set_hal_pin("halui.mode.auto", False)
+# Accepting Cycle Start does not prove that execution began. Confirm a real
+# non-Idle transition before the scheduler is allowed to monitor completion.
+started = False
+start_deadline = time.time() + 5.0
+last_interp_state = None
+launch_messages = []
+while time.time() < start_deadline:
+    status.poll()
+    launch_messages.extend(read_errors())
+    raise_if_motion_locked_out()
+    last_interp_state = getattr(status, "interp_state", None)
+    if last_interp_state != linuxcnc.INTERP_IDLE:
+        started = True
+        break
+    if getattr(status, "estop", False):
+        raise RuntimeError("PathPilot entered E-stop before the program started.")
+    if not getattr(status, "enabled", False):
+        raise RuntimeError("PathPilot became disabled before the program started.")
+    time.sleep(0.05)
+if not started:
+    state_detail = (
+        "task_mode=" + str(getattr(status, "task_mode", None))
+        + ", interp_state=" + str(last_interp_state)
+        + ", task_state=" + str(getattr(status, "task_state", None))
+        + ", exec_state=" + str(getattr(status, "exec_state", None))
+        + ", paused=" + str(getattr(status, "paused", None))
+        + ", queue=" + str(getattr(status, "queue", None))
+    )
+    error_detail = " | ".join(item["text"] for item in launch_messages)
+    raise RuntimeError(
+        "PathPilot accepted the HALUI Run request, but the interpreter never left Idle ("
+        + state_detail + ")."
+        + ((" Controller: " + error_detail) if error_detail else "")
+    )
+print("MONGO_CNC_RUN=" + json.dumps({{
+    "accepted": True,
+    "started": True,
+    "filename": filename,
+    "loaded_program": loaded_program,
+    "interp_state": last_interp_state,
+    "task_mode": getattr(status, "task_mode", None),
+    "controller_messages": launch_messages,
+}}))
 '''
-    return _read_remote_payload(host, port, username, password, timeout, remote_script, "MONGO_CNC_RUN=")
+    # Mode switching, copying, loading, and start confirmation can legitimately
+    # take longer than a short telemetry timeout on PathPilot.
+    command_timeout = max(float(timeout), 20.0)
+    return _read_remote_payload(host, port, username, password, command_timeout, remote_script, "MONGO_CNC_RUN=")
+
+
+def abort_linuxcnc_program(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+) -> dict:
+    """Abort queued or active LinuxCNC execution and confirm the interpreter is Idle."""
+    remote_script = r'''import json
+import linuxcnc
+import time
+
+command = linuxcnc.command()
+command.abort()
+command.wait_complete()
+status = linuxcnc.stat()
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    status.poll()
+    if getattr(status, "interp_state", None) == linuxcnc.INTERP_IDLE:
+        break
+    time.sleep(0.05)
+status.poll()
+interp_state = getattr(status, "interp_state", None)
+if interp_state != linuxcnc.INTERP_IDLE:
+    raise RuntimeError("LinuxCNC did not return to Idle after the abort command.")
+print("MONGO_CNC_ABORT=" + json.dumps({
+    "aborted": True,
+    "interp_state": interp_state,
+    "program": getattr(status, "file", "") or "",
+}))
+'''
+    return _read_remote_payload(
+        host, port, username, password, timeout,
+        remote_script, "MONGO_CNC_ABORT=",
+    )

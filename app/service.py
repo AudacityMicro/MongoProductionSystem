@@ -22,9 +22,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.diagnostics import diagnostics
+from app.program_metadata import parse_program_metadata, unavailable_program_metadata, PROGRAM_METADATA_PREFIX_BYTES
 from app.models import AppSettings, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
 from app.cnc_linuxcnc import (
+    CncProgramFault,
     CncTelemetryError,
     read_linuxcnc_cycle_state,
     read_linuxcnc_io_labels,
@@ -35,6 +37,7 @@ from app.robot_dashboard import (
     RobotDashboardError,
     clear_robot_fault,
     robot_dashboard_health,
+    robot_program_status,
     robot_program_running,
     run_robot_program,
 )
@@ -43,6 +46,7 @@ from app.robot_files import (
     copy_remote_file_as,
     list_robot_program_files,
     read_robot_file,
+    read_robot_file_prefix,
     remote_file_signature,
     upload_robot_file,
 )
@@ -54,6 +58,7 @@ from app.robot_scripts import (
     build_reliability_motion_script,
     build_robot_supervisor_script,
     generated_script_directory,
+    RobotScriptTransferUncertain,
     run_robot_script,
     sync_generated_scripts,
     with_pallet_payload,
@@ -88,6 +93,7 @@ from app.schemas import (
     ClearRobotFault,
     CreatePallet,
     MovePallet,
+    ManualReturnPallet,
     QueuePallet,
     RecoverPalletMotion,
     ConfirmRunModeAction,
@@ -107,6 +113,38 @@ from app.schemas import (
     RunDebugPalletMotion,
     UpdatePallet,
 )
+
+
+# Long machining cycles are observed over an unreliable network. The monitor
+# must never equate one lost SSH response with a stopped or failed program.
+_CNC_LONG_CYCLE_MAXIMUM_SECONDS = 30 * 24 * 60 * 60
+_CNC_RUNNING_POLL_SECONDS = 2.0
+_CNC_TELEMETRY_RETRY_MAX_SECONDS = 30.0
+_CNC_TELEMETRY_STATUS_INTERVAL_SECONDS = 30.0
+_RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS = 8
+_RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS = 30.0
+
+
+class CncPreDispatchTelemetryError(CncTelemetryError):
+    """A PathPilot telemetry failure observed before a program was sent."""
+
+
+def _is_transient_robot_pre_dispatch_detail(detail: str) -> bool:
+    normalized = detail.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "live robot telemetry",
+            "robot telemetry",
+            "realtime telemetry",
+            "no realtime telemetry packet",
+            "supervisor is not connected",
+            "supervisor connection",
+            "connection reset",
+            "network is unreachable",
+            "timed out",
+        )
+    )
 
 
 def problem(status: int, message: str) -> HTTPException:
@@ -405,15 +443,83 @@ def validate_program(program_path: str | None, programs: set[str]) -> str | None
     return normalized
 
 
-def program_metadata(program_path: str | None, content_status: str) -> dict:
-    if not program_path or content_status in {"complete_parts", "defective_parts"}:
-        return {"program_tools": [], "expected_cycle_seconds": None}
-    # Placeholder metadata until program headers are parsed. It is stable per file path.
-    digest = hashlib.sha256(program_path.casefold().encode("utf-8")).digest()
-    tool_count = 2 + digest[0] % 4
-    tools = sorted({1 + int.from_bytes(digest[index:index + 2], "big") % 999 for index in range(1, tool_count + 5)})[:tool_count]
-    cycle_seconds = 180 + int.from_bytes(digest[8:10], "big") % 2101
-    return {"program_tools": [f"T{tool}" for tool in tools], "expected_cycle_seconds": cycle_seconds}
+def program_metadata(
+    program_path: str | None,
+    content_status: str,
+    tools: list[str] | None = None,
+    expected_cycle_seconds: int | None = None,
+    state: str = "unavailable",
+    detail: str = "",
+    cycle_basis: str | None = None,
+) -> dict:
+    hidden = not program_path or content_status in {"complete_parts", "defective_parts"}
+    return {
+        "program_tools": [] if hidden else list(tools or []),
+        "expected_cycle_seconds": None if hidden else expected_cycle_seconds,
+        "program_metadata_state": state,
+        "program_metadata_detail": detail,
+        "program_cycle_basis": cycle_basis,
+    }
+
+
+def _local_program_path(settings: AppSettings, program_path: str) -> Path | None:
+    if not settings.source_folder.strip():
+        return None
+    root = Path(settings.source_folder).expanduser()
+    try:
+        root = root.resolve(strict=True)
+        program_root = root if root.name.casefold() == "gcode" else next(
+            (child for child in root.iterdir() if child.is_dir() and child.name.casefold() == "gcode"),
+            None,
+        )
+        if program_root is None:
+            return None
+        target = (program_root / program_path).resolve(strict=True)
+        return target if target.is_file() and target.is_relative_to(program_root.resolve()) else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def read_assigned_program_metadata(settings: AppSettings, program_path: str) -> dict[str, object]:
+    remote_configured = bool(
+        settings.mill_programs_page_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    )
+    if remote_configured:
+        try:
+            prefix = read_robot_file_prefix(
+                host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
+                username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
+                directory=settings.mill_file_directory, path=program_path,
+                timeout_seconds=settings.cnc_timeout_seconds,
+                limit=PROGRAM_METADATA_PREFIX_BYTES,
+            )
+            return parse_program_metadata(str(prefix["text"]))
+        except RobotFileAccessError as exc:
+            return unavailable_program_metadata(f"Could not read the assigned PathPilot program header: {exc}")
+
+    local_path = _local_program_path(settings, program_path)
+    if local_path is None:
+        return unavailable_program_metadata("The assigned program file is unavailable for metadata inspection.")
+    try:
+        with local_path.open("r", encoding="utf-8", errors="replace") as source:
+            return parse_program_metadata(source.read(PROGRAM_METADATA_PREFIX_BYTES))
+    except OSError as exc:
+        return unavailable_program_metadata(f"Could not read the assigned program header: {exc}")
+
+
+def _store_pallet_program_metadata(pallet: Pallet, metadata: dict[str, object]) -> None:
+    pallet.program_tools_json = json.dumps(metadata.get("program_tools") or [], separators=(",", ":"))
+    pallet.expected_cycle_seconds = metadata.get("expected_cycle_seconds")
+    pallet.program_metadata_state = str(metadata.get("program_metadata_state") or "unavailable")
+    pallet.program_metadata_detail = str(metadata.get("program_metadata_detail") or "")[:500]
+    pallet.program_cycle_basis = str(metadata["program_cycle_basis"])[:100] if metadata.get("program_cycle_basis") else None
+
+
+def _clear_pallet_program_metadata(pallet: Pallet) -> None:
+    _store_pallet_program_metadata(pallet, unavailable_program_metadata("No program is assigned."))
 
 
 def _nested_value(item: dict, *paths: tuple[str, ...]) -> object | None:
@@ -676,14 +782,14 @@ def _archive_mill_results(
     settings: AppSettings,
     program_path: str,
     previous_signature: dict[str, int | str] | None,
-) -> str:
+) -> tuple[bool, str | None]:
     source, archive_directory = _mill_results_paths(settings)
     connection = _mill_results_file_connection(settings)
     current_signature = remote_file_signature(path=source, **connection)
     if current_signature is None:
         raise problem(409, f"PathPilot did not create {source} for {program_path}.")
     if current_signature == previous_signature:
-        raise problem(409, f"PathPilot's {PurePosixPath(source).name} did not change during {program_path}; the old result was not archived.")
+        return None
 
     program_name = re.sub(r"[^A-Za-z0-9._-]+", "_", PurePosixPath(program_path).stem).strip("._-") or "program"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
@@ -757,6 +863,10 @@ def fusion_tool_libraries(paths: list[str]) -> tuple[list[dict], list[str]]:
 
 
 def serialize_pallet(pallet: Pallet) -> dict:
+    try:
+        tools = json.loads(pallet.program_tools_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        tools = []
     return {
         "id": pallet.id,
         "name": pallet.name,
@@ -767,7 +877,16 @@ def serialize_pallet(pallet: Pallet) -> dict:
         "location": pallet.location,
         "queue_position": pallet.queue_position,
         "pool_slot_number": pallet.pool_slot_number,
-        **program_metadata(pallet.program_path, pallet.content_status),
+        "return_pool_slot_number": pallet.return_pool_slot_number,
+        **program_metadata(
+            pallet.program_path,
+            pallet.content_status,
+            tools,
+            pallet.expected_cycle_seconds,
+            pallet.program_metadata_state,
+            pallet.program_metadata_detail,
+            pallet.program_cycle_basis,
+        ),
     }
 
 
@@ -911,6 +1030,7 @@ def board_snapshot(session: Session) -> dict:
     current_run_pallet = session.get(Pallet, settings.run_mode_current_pallet_id) if settings.run_mode_current_pallet_id else None
     return {
         "revision": settings.revision,
+        "capabilities": {"automatic_put_away": True, "pool_return_ghosts": True},
         "pallets": [serialize_pallet(item) for item in pallets],
         "settings": {
             "source_folder": settings.source_folder,
@@ -1838,8 +1958,8 @@ _ROBOT_TELEMETRY_CACHE: dict[
 ] = {}
 _ROBOT_TELEMETRY_REFRESHING: set[tuple[object, ...]] = set()
 _ROBOT_TELEMETRY_LOCK = RLock()
-_ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 30.0
-_MOTION_TELEMETRY_READ_RETRY_SECONDS = 6.0
+_ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 60.0
+_MOTION_TELEMETRY_READ_RETRY_SECONDS = 20.0
 # A temporary loss of RTDE must not mark a dispatched robot program as failed.
 # The reconnect circuit remains bounded, while the motion monitor waits long
 # enough for a lossy local network to recover before requiring reconciliation.
@@ -2219,10 +2339,59 @@ def first_open_pool_slot(
             )
         ).all()
     )
+    occupied.update(
+        session.scalars(
+            select(Pallet.return_pool_slot_number).where(
+                Pallet.location.in_(("machine", "robot_held")),
+                Pallet.return_pool_slot_number.is_not(None),
+                Pallet.id != exclude_id,
+            )
+        ).all()
+    )
     for number in range(1, settings.pool_slot_count + 1):
         if number not in occupied:
             return number
     raise problem(409, "The pallet pool is full.")
+
+
+def _pool_slot_reservation_owner(
+    session: Session,
+    pool_slot_number: int,
+    *,
+    exclude_id: str | None = None,
+) -> Pallet | None:
+    return session.scalar(
+        select(Pallet).where(
+            Pallet.location.in_(("machine", "robot_held")),
+            Pallet.return_pool_slot_number == pool_slot_number,
+            Pallet.id != exclude_id,
+        )
+    )
+
+
+def best_pool_return_slot(session: Session, settings: AppSettings, pallet: Pallet) -> int:
+    occupied = set(session.scalars(
+        select(Pallet.pool_slot_number).where(Pallet.location == "pool", Pallet.id != pallet.id)
+    ).all())
+    reserved = set(session.scalars(
+        select(Pallet.return_pool_slot_number).where(
+            Pallet.location.in_(("machine", "robot_held")),
+            Pallet.return_pool_slot_number.is_not(None),
+            Pallet.id != pallet.id,
+        )
+    ).all())
+    available = [
+        slot for slot in range(1, settings.pool_slot_count + 1)
+        if slot not in occupied and slot not in reserved
+    ]
+    if not available:
+        raise problem(409, "No unoccupied, unreserved pallet-pool position is available.")
+    preferred = pallet.return_pool_slot_number
+    if preferred in available:
+        return preferred
+    if preferred is not None:
+        return min(available, key=lambda slot: (abs(slot - preferred), slot))
+    return available[0]
 
 
 def next_pallet_name(session: Session) -> str:
@@ -2252,6 +2421,10 @@ def create_pallet(session: Session, payload: CreatePallet) -> None:
         **payload.model_dump(exclude={"expected_revision", "program_path"}),
         program_path=program_path,
     )
+    if program_path:
+        _store_pallet_program_metadata(pallet, read_assigned_program_metadata(settings, program_path))
+    else:
+        _clear_pallet_program_metadata(pallet)
     session.add(pallet)
     bump(settings)
     commit_or_conflict(session)
@@ -2273,6 +2446,10 @@ def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> No
     for key, value in values.items():
         setattr(pallet, key, value)
     pallet.program_path = program_path
+    if program_path:
+        _store_pallet_program_metadata(pallet, read_assigned_program_metadata(settings, program_path))
+    else:
+        _clear_pallet_program_metadata(pallet)
     bump(settings)
     commit_or_conflict(session)
 
@@ -2292,6 +2469,11 @@ def duplicate_pallet(session: Session, pallet_id: str, expected_revision: int) -
             weight_kg=source.weight_kg,
             content_status=source.content_status,
             program_path=source.program_path,
+            program_tools_json=source.program_tools_json,
+            expected_cycle_seconds=source.expected_cycle_seconds,
+            program_metadata_state=source.program_metadata_state,
+            program_metadata_detail=source.program_metadata_detail,
+            program_cycle_basis=source.program_cycle_basis,
             location="pool",
             pool_slot_number=first_open_pool_slot(session, settings),
         )
@@ -2357,6 +2539,9 @@ def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
         )
         if occupant:
             raise problem(409, f"Pool position {pool_slot} is occupied by {occupant.name}.")
+        reserved_by = _pool_slot_reservation_owner(session, pool_slot, exclude_id=pallet_id)
+        if reserved_by:
+            raise problem(409, f"Pool position {pool_slot} is reserved for {reserved_by.name}.")
     elif payload.pool_slot_number is not None:
         raise problem(422, "Pool position is only valid for a pool destination.")
 
@@ -2366,13 +2551,64 @@ def move_pallet(session: Session, pallet_id: str, payload: MovePallet) -> None:
         session.flush()
         compact_queue(session, pallet.id)
 
-    if pallet.location == "machine" and payload.destination != "machine":
+    previous_location = pallet.location
+    previous_pool_slot = pallet.pool_slot_number
+    if previous_location == "machine" and payload.destination != "machine":
         settings.machine_state = "idle"
     pallet.location = payload.destination
     pallet.pool_slot_number = pool_slot if payload.destination == "pool" else None
+    if payload.destination == "machine":
+        pallet.return_pool_slot_number = previous_pool_slot or pallet.return_pool_slot_number
+    elif payload.destination == "pool" or previous_location in {"machine", "robot_held"}:
+        pallet.return_pool_slot_number = None
 
     bump(settings)
     commit_or_conflict(session)
+
+
+def manually_return_mill_pallet_to_pool(
+    session: Session,
+    pallet_id: str,
+    payload: ManualReturnPallet,
+) -> int:
+    """Reconcile a mill record after an operator physically returned the pallet.
+
+    This deliberately changes only the database. It must remain independent of
+    robot telemetry, Dashboard, supervisor, and CNC communications so it is
+    usable after a controller or network fault.
+    """
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    _assert_no_locked_motion(session)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before manually reconciling a pallet from the mill.")
+    pallet = session.get(Pallet, pallet_id)
+    if not pallet:
+        raise problem(404, "Pallet not found.")
+    if pallet.location != "machine":
+        raise problem(409, "Only a pallet currently recorded in the mill can be manually returned to the Pool.")
+
+    pool_slot = best_pool_return_slot(session, settings, pallet)
+    previous_return_slot = pallet.return_pool_slot_number
+    pallet.location = "pool"
+    pallet.pool_slot_number = pool_slot
+    pallet.return_pool_slot_number = None
+    settings.machine_state = "idle"
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record(
+        "pallet_reconciliation",
+        "manual_mill_return",
+        "Operator manually reconciled a pallet from the mill to the pallet pool; no controller command was sent.",
+        severity="warning",
+        details={
+            "pallet_id": pallet.id,
+            "pallet_name": pallet.name,
+            "pool_slot": pool_slot,
+            "reserved_return_slot": previous_return_slot,
+        },
+    )
+    return pool_slot
 
 
 def _robot_motion_activity(session: Session) -> tuple[bool, dict[str, object]]:
@@ -2447,6 +2683,19 @@ def _motion_runtime_is_idle(state: dict[str, object]) -> bool:
     return runtime_state is None or runtime_state in {1, "stopped", "idle", "STOPPED", "IDLE"}
 
 
+def _legacy_paused_runtime_is_empty(settings: AppSettings, state: dict[str, object]) -> bool:
+    """Accept CB realtime's stale paused state only when Dashboard proves no program exists."""
+    if str(state.get("Runtime state", "")).casefold() != "paused":
+        return False
+    if state.get("Safety mode") not in {1, "normal", "NORMAL"}:
+        return False
+    try:
+        dashboard = robot_program_status(settings.robot_host.strip(), settings.robot_timeout_seconds)
+    except RobotDashboardError:
+        return False
+    return dashboard.get("running") is False and dashboard.get("loaded_program") is None
+
+
 def _motion_final_pose_error(
     state: dict[str, object],
     settings: AppSettings,
@@ -2505,6 +2754,7 @@ def _mark_pick_as_held_after_lift(
         return False
     pallet.location = "robot_held"
     pallet.pool_slot_number = None
+    pallet.return_pool_slot_number = motion.source_slot
     bump(settings)
     commit_or_conflict(session)
     return True
@@ -2561,9 +2811,6 @@ def _assert_motion_ready(session: Session, settings: AppSettings) -> None:
             raise problem(409, f"Robot safety mode is not normal ({telemetry.get('safety_mode')!s}).")
         if telemetry.get("runtime_state") != 1:
             raise problem(409, f"Robot runtime is not idle ({telemetry.get('runtime_state')!s}).")
-        tcp_speed = telemetry.get("tcp_speed") or []
-        if any(abs(float(value)) > 0.002 for value in tcp_speed[:3]):
-            raise problem(409, "Robot TCP is moving. Wait until the robot is stationary before starting a pallet movement.")
         return
     moving, state = _robot_motion_activity(session)
     if moving:
@@ -2572,7 +2819,7 @@ def _assert_motion_ready(session: Session, settings: AppSettings) -> None:
     runtime_state = state.get("Runtime state")
     if safety_mode not in {1, "normal", "NORMAL"}:
         raise problem(409, f"Robot safety mode is not normal ({safety_mode!s}).")
-    if runtime_state not in {1, "stopped", "idle", "STOPPED", "IDLE"}:
+    if runtime_state not in {1, "stopped", "idle", "STOPPED", "IDLE"} and not _legacy_paused_runtime_is_empty(settings, state):
         raise problem(409, f"Robot runtime is not idle ({runtime_state!s}).")
 
 
@@ -2611,10 +2858,12 @@ def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail:
     elif success and motion.operation == "pick":
         pallet.location = "robot_held"
         pallet.pool_slot_number = None
+        pallet.return_pool_slot_number = motion.source_slot
         motion.status = "succeeded"
     elif success and motion.operation == "put":
         pallet.location = "pool"
         pallet.pool_slot_number = motion.destination_slot
+        pallet.return_pool_slot_number = None
         motion.status = "succeeded"
     elif success and motion.operation == "load_mill":
         # Queue membership is virtual; a pallet leaves its run position only once it is in the mill.
@@ -2624,11 +2873,13 @@ def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail:
             compact_queue(session, pallet.id)
         pallet.location = "machine"
         pallet.pool_slot_number = None
+        pallet.return_pool_slot_number = motion.source_slot or pallet.return_pool_slot_number
         get_settings(session).machine_state = "running"
         motion.status = "succeeded"
     elif success and motion.operation == "unload_mill":
         pallet.location = "pool"
         pallet.pool_slot_number = motion.destination_slot
+        pallet.return_pool_slot_number = None
         get_settings(session).machine_state = "idle"
         motion.status = "succeeded"
     else:
@@ -2781,7 +3032,7 @@ def bootstrap_robot_supervisor(session: Session) -> dict[str, object]:
     listener = robot_supervisor().status()
     if not listener.get("listening"):
         raise problem(409, str(listener.get("last_disconnect_detail") or "Supervisor listener did not start."))
-    previous_session = listener.get("robot_session") if listener.get("connected") else None
+    previous_generation = int(listener.get("connection_generation") or 0)
     if listener.get("connected"):
         if listener.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
             raise problem(409, "The connected supervisor sequence does not match the backend. Reconcile it before restarting the supervisor.")
@@ -2813,11 +3064,7 @@ def bootstrap_robot_supervisor(session: Session) -> dict[str, object]:
     except RobotFileAccessError as exc:
         raise problem(502, f"Supervisor bootstrap could not reach Mongo: {exc}") from exc
     wait_seconds = max(10.0, settings.robot_timeout_seconds * 4)
-    connected = (
-        robot_supervisor().wait_for_robot_session_change(previous_session, wait_seconds)
-        if previous_session is not None
-        else robot_supervisor().wait_until_connected(wait_seconds)
-    )
+    connected = robot_supervisor().wait_for_connection_generation(previous_generation, wait_seconds)
     if not connected:
         raise problem(
             504,
@@ -3135,6 +3382,7 @@ def start_pallet_motion(session: Session, payload: StartPalletMotion, automated:
         if not pallet or pallet.location != "pool" or pallet.pool_slot_number != payload.pool_slot_number:
             raise problem(409, "That pallet is no longer in the selected pool position.")
         source_slot, destination_slot = payload.pool_slot_number, None
+        pallet.return_pool_slot_number = source_slot
     else:
         pallet = session.scalar(select(Pallet).where(Pallet.location == "robot_held"))
         if not pallet:
@@ -3146,7 +3394,13 @@ def start_pallet_motion(session: Session, payload: StartPalletMotion, automated:
         )
         if occupied:
             raise problem(409, f"Pool position {payload.pool_slot_number:02d} is occupied by {occupied.name}.")
+        reserved_by = _pool_slot_reservation_owner(
+            session, payload.pool_slot_number, exclude_id=pallet.id,
+        )
+        if reserved_by:
+            raise problem(409, f"Pool position {payload.pool_slot_number:02d} is reserved for {reserved_by.name}.")
         source_slot, destination_slot = None, payload.pool_slot_number
+        pallet.return_pool_slot_number = destination_slot
 
     motion = RobotMotion(
         id=str(uuid4()),
@@ -3188,6 +3442,8 @@ def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfe
         if session.scalar(select(Pallet).where(Pallet.location == "machine")):
             raise problem(409, "The mill already contains a pallet.")
         source_slot = pallet.pool_slot_number if pallet.location == "pool" else None
+        if source_slot:
+            pallet.return_pool_slot_number = source_slot
         destination_slot = None
         operation = "load_mill"
         if settings.robot_connection_mode == "physical":
@@ -3215,7 +3471,13 @@ def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfe
         ))
         if occupant:
             raise problem(409, f"Pool position {payload.pool_slot_number:02d} is occupied by {occupant.name}.")
+        reserved_by = _pool_slot_reservation_owner(
+            session, payload.pool_slot_number, exclude_id=pallet.id,
+        )
+        if reserved_by:
+            raise problem(409, f"Pool position {payload.pool_slot_number:02d} is reserved for {reserved_by.name}.")
         source_slot, destination_slot = None, payload.pool_slot_number
+        pallet.return_pool_slot_number = destination_slot
         operation = "unload_mill"
         if settings.robot_connection_mode == "physical":
             _assert_pool_motion_position_configured(settings, destination_slot)
@@ -3239,6 +3501,43 @@ def start_mill_pallet_transfer(session: Session, payload: StartMillPalletTransfe
         _finish_motion(session, motion, True)
         return None
     return motion.id
+
+
+def start_automatic_put_away(
+    session: Session,
+    pallet_id: str,
+    expected_revision: int,
+) -> tuple[str | None, int]:
+    """Return a held or loaded pallet to its reserved or nearest available pool position."""
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    pallet = session.get(Pallet, pallet_id)
+    if not pallet:
+        raise problem(404, "Pallet not found.")
+    if pallet.location not in {"robot_held", "machine"}:
+        raise problem(409, "Only a Robot-held pallet or the pallet in the mill can be put away automatically.")
+    destination_slot = best_pool_return_slot(session, settings, pallet)
+    if pallet.location == "robot_held":
+        motion_id = start_pallet_motion(
+            session,
+            StartPalletMotion(
+                expected_revision=expected_revision,
+                operation="put",
+                pool_slot_number=destination_slot,
+                pallet_id=pallet.id,
+            ),
+        )
+    else:
+        motion_id = start_mill_pallet_transfer(
+            session,
+            StartMillPalletTransfer(
+                expected_revision=expected_revision,
+                operation="unload",
+                pallet_id=pallet.id,
+                pool_slot_number=destination_slot,
+            ),
+        )
+    return motion_id, destination_slot
 
 
 def run_debug_pallet_motion(session: Session, payload: RunDebugPalletMotion) -> dict[str, object]:
@@ -3724,6 +4023,10 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                         motion.retry_count += attempt
                         commit_or_conflict(session)
                         break
+                    except RobotScriptTransferUncertain as exc:
+                        motion.retry_count += 1
+                        _finish_motion(session, motion, False, f"Robot program transfer became uncertain and was not retried: {exc}")
+                        return False
                     except (RobotDashboardError, RobotFileAccessError) as exc:
                         motion.retry_count += 1
                         if attempt or not allow_retry:
@@ -3824,6 +4127,10 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                     commit_or_conflict(session)
                     started = True
                     break
+                except RobotScriptTransferUncertain as exc:
+                    motion.retry_count = attempt + 1
+                    _finish_motion(session, motion, False, f"Generated script transfer became uncertain and was not retried: {exc}")
+                    return
                 except RobotDashboardError as exc:
                     motion.retry_count = attempt + 1
                     if attempt == 1:
@@ -3908,15 +4215,18 @@ def _set_run_mode_status(
     commit_or_conflict(session)
 
 
-def _finish_run_mode(session_factory, state: str, detail: str) -> None:
+def _finish_run_mode(session_factory, state: str, detail: str, run_token: str | None = None) -> None:
     with session_factory() as session:
         settings = get_settings(session)
+        if run_token is not None and settings.run_mode_start_request_id != run_token:
+            return
         settings.run_mode_enabled = False
         settings.run_mode_state = state
         settings.run_mode_detail = detail
         settings.run_mode_pending_action = ""
         settings.run_mode_confirmation_token = ""
         settings.run_mode_confirmation_granted = False
+        settings.run_mode_start_request_id = ""
         settings.run_mode_current_pallet_id = None
         settings.run_mode_return_slot = None
         bump(settings)
@@ -3932,7 +4242,7 @@ def _finish_run_mode(session_factory, state: str, detail: str) -> None:
 def interrupt_run_mode(session: Session) -> None:
     """Never resume production commands implicitly after a backend restart."""
     settings = get_settings(session)
-    if not settings.run_mode_enabled:
+    if not settings.run_mode_enabled and settings.run_mode_state != "stopping":
         return
     settings.run_mode_enabled = False
     settings.run_mode_state = "interrupted"
@@ -3940,6 +4250,7 @@ def interrupt_run_mode(session: Session) -> None:
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
+    settings.run_mode_start_request_id = ""
     bump(settings)
     commit_or_conflict(session)
 
@@ -4021,11 +4332,20 @@ def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> 
         raise problem(409, "Queued programs are missing from PathPilot: " + "; ".join(missing_programs))
 
 
-def start_run_mode(session: Session, payload: StartRunMode) -> None:
+def _run_mode_token_is_active(settings: AppSettings, run_token: str | None) -> bool:
+    return settings.run_mode_enabled and (run_token is None or settings.run_mode_start_request_id == run_token)
+
+
+def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     settings = get_settings(session)
+    request_id = payload.request_id or str(uuid4())
     check_revision(settings, payload.expected_revision)
     if settings.run_mode_enabled:
+        if settings.run_mode_start_request_id == request_id:
+            return None
         raise problem(409, "Run mode is already active.")
+    if settings.run_mode_state == "stopping":
+        raise problem(409, "Run Mode is still stopping. Wait for the active worker to acknowledge the stop request.")
     _assert_reliability_inactive(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before starting run mode.")
@@ -4043,38 +4363,21 @@ def start_run_mode(session: Session, payload: StartRunMode) -> None:
             raise problem(409, f"Assign a mill program to {pallet.name} before starting run mode.")
         if pallet.content_status in {"complete_parts", "defective_parts"}:
             raise problem(409, f"{pallet.name} is already marked {pallet.content_status.replace('_', ' ')}.")
-    if settings.robot_connection_mode == "physical":
-        if not settings.pallet_motion_enabled:
-            raise problem(403, "Enable physical pallet movements before starting run mode.")
-        if not settings.cnc_telemetry_enabled or not settings.cnc_host.strip():
-            raise problem(409, "Enable and configure CNC telemetry before starting physical run mode.")
-        if not settings.cnc_ssh_username or not settings.cnc_ssh_password:
-            raise problem(409, "Configure the PathPilot SSH username and password before starting physical run mode.")
-        # Reject the batch before enabling its coordinator unless both machines
-        # are live and idle. Individual commands repeat these interlocks.
-        _assert_motion_ready(session, settings)
-        try:
-            cnc_state = read_linuxcnc_cycle_state(
-                settings.cnc_host.strip(), settings.cnc_ssh_port,
-                settings.cnc_ssh_username, settings.cnc_ssh_password,
-                settings.cnc_timeout_seconds,
-            )
-        except CncTelemetryError as exc:
-            raise problem(409, f"Live CNC telemetry is unavailable. Run mode was not started: {exc}") from exc
-        if cnc_state.get("estop"):
-            raise problem(409, "PathPilot is in E-stop. Run mode was not started.")
-        if not cnc_state.get("enabled"):
-            raise problem(409, "PathPilot is not enabled. Run mode was not started.")
-        if cnc_state.get("interp_state") != 1:
-            raise problem(409, "PathPilot is not idle. Stop or finish its active program before starting run mode.")
-        for pallet in queue:
-            _assert_pool_motion_position_configured(settings, pallet.pool_slot_number or 0)
-        _assert_run_mode_files_ready(settings, queue)
+    if settings.robot_connection_mode == "physical" and not settings.pallet_motion_enabled:
+        raise problem(403, "Enable physical pallet movements before starting run mode.")
+    if settings.robot_connection_mode == "physical" and (not settings.cnc_telemetry_enabled or not settings.cnc_host.strip()):
+        raise problem(409, "Enable and configure CNC telemetry before starting physical run mode.")
+    if settings.robot_connection_mode == "physical" and (not settings.cnc_ssh_username or not settings.cnc_ssh_password):
+        raise problem(409, "Configure the PathPilot SSH username and password before starting physical run mode.")
+
+    # Persist the request before slow network checks. A lost browser response can
+    # therefore never leave a hidden start that the Stop control cannot cancel.
     settings.run_mode_enabled = True
     if payload.safety_confirm is not None:
         settings.run_mode_safety_confirm = payload.safety_confirm
-    settings.run_mode_state = "starting"
-    settings.run_mode_detail = f"Preparing {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+    settings.run_mode_start_request_id = request_id
+    settings.run_mode_state = "start_requested"
+    settings.run_mode_detail = f"Start requested. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
     settings.run_mode_current_pallet_id = None
     settings.run_mode_return_slot = None
     settings.run_mode_pending_action = ""
@@ -4082,21 +4385,31 @@ def start_run_mode(session: Session, payload: StartRunMode) -> None:
     settings.run_mode_confirmation_granted = False
     bump(settings)
     commit_or_conflict(session)
+    return request_id
 
 
 def stop_run_mode(session: Session, expected_revision: int) -> None:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    if not settings.run_mode_enabled:
+    if not settings.run_mode_enabled and settings.run_mode_state != "stopping":
         return
     settings.run_mode_enabled = False
     settings.run_mode_state = "stopping"
-    settings.run_mode_detail = "Stop requested. The current controller command will finish, but no next step will start."
+    settings.run_mode_detail = (
+        "Stop requested. No pending or subsequent automated step may start; "
+        "an already-running mill program is not aborted."
+    )
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
     bump(settings)
     commit_or_conflict(session)
+    diagnostics().record(
+        "run_mode",
+        "stop_requested",
+        "Run Mode stop requested; the scheduler will not dispatch another action.",
+        details={"state": settings.run_mode_state},
+    )
 
 
 def confirm_run_mode_action(session: Session, payload: ConfirmRunModeAction) -> None:
@@ -4105,13 +4418,28 @@ def confirm_run_mode_action(session: Session, payload: ConfirmRunModeAction) -> 
     if not settings.run_mode_enabled or settings.run_mode_confirmation_token != payload.token:
         raise problem(409, "That run-mode confirmation is no longer active.")
     if not payload.approved:
+        cnc_fault = settings.run_mode_pending_action == "retry_cnc_program"
+        cnc_preflight_retry = settings.run_mode_pending_action == "retry_cnc_preflight"
+        robot_retry = settings.run_mode_pending_action == "retry_robot_transfer"
+        previous_detail = settings.run_mode_detail
         settings.run_mode_enabled = False
         settings.run_mode_state = "stopped"
-        settings.run_mode_detail = "Operator declined the pending action. Run mode stopped."
+        settings.run_mode_detail = (
+            f"Operator stopped Run Mode after a CNC fault. The pallet remains in place. {previous_detail}"
+            if cnc_fault
+            else f"Operator stopped Run Mode after PathPilot connection recovery was exhausted. The pallet remains in place. {previous_detail}"
+            if cnc_preflight_retry
+            else f"Operator stopped Run Mode before retrying the robot transfer. The pallet remains in place. {previous_detail}"
+            if robot_retry
+            else "Operator declined the pending action. Run mode stopped."
+        )
         settings.run_mode_pending_action = ""
         settings.run_mode_confirmation_token = ""
         settings.run_mode_confirmation_granted = False
     else:
+        if settings.run_mode_pending_action in {"retry_cnc_program", "retry_cnc_preflight", "retry_robot_transfer"}:
+            settings.machine_state = "idle"
+            settings.run_mode_alert = ""
         settings.run_mode_confirmation_granted = True
         settings.run_mode_state = "approved"
         settings.run_mode_detail = "Operator approved the pending action."
@@ -4119,12 +4447,19 @@ def confirm_run_mode_action(session: Session, payload: ConfirmRunModeAction) -> 
     commit_or_conflict(session)
 
 
-def _await_run_mode_action(session_factory, action: str, detail: str) -> bool:
+def _await_run_mode_action(
+    session_factory,
+    action: str,
+    detail: str,
+    *,
+    force_confirmation: bool = False,
+    run_token: str | None = None,
+) -> bool:
     with session_factory() as session:
         settings = get_settings(session)
-        if not settings.run_mode_enabled:
+        if not _run_mode_token_is_active(settings, run_token):
             return False
-        if not settings.run_mode_safety_confirm:
+        if not settings.run_mode_safety_confirm and not force_confirmation:
             settings.run_mode_state = action
             settings.run_mode_detail = detail
             bump(settings)
@@ -4143,7 +4478,7 @@ def _await_run_mode_action(session_factory, action: str, detail: str) -> bool:
         time.sleep(0.25)
         with session_factory() as session:
             settings = get_settings(session)
-            if not settings.run_mode_enabled:
+            if not _run_mode_token_is_active(settings, run_token):
                 return False
             if settings.run_mode_confirmation_token != token:
                 return False
@@ -4182,8 +4517,9 @@ def _run_cnc_cycle(
     remote_program: str,
     *,
     cycle_label: str,
-    timeout_seconds: float = 24 * 60 * 60,
+    timeout_seconds: float = _CNC_LONG_CYCLE_MAXIMUM_SECONDS,
     continue_check=None,
+    status_report=None,
 ) -> bool:
     """Run one PathPilot program and wait for LinuxCNC to return to Idle."""
     if settings.robot_connection_mode == "simulated":
@@ -4194,21 +4530,146 @@ def _run_cnc_cycle(
         settings.cnc_ssh_password, settings.cnc_timeout_seconds,
     )
     require_a = settings.cnc_require_a_axis_homed
+    # PathPilot can retain interpreter_errcode after a prior operation even when
+    # the interpreter is idle. Capture it before this program so it cannot be
+    # mistaken for a new failure after a successful cycle.
+    try:
+        baseline = read_linuxcnc_cycle_state(*connection)
+    except CncTelemetryError as exc:
+        raise CncPreDispatchTelemetryError(
+            f"PathPilot telemetry was unavailable before {cycle_label} was dispatched: {exc}"
+        ) from exc
+    baseline_interpreter_error = baseline.get("interpreter_error")
 
-    run_linuxcnc_program(*connection, remote_program, require_a)
+    start_result = run_linuxcnc_program(*connection, remote_program, require_a)
+    if not isinstance(start_result, dict) or start_result.get("started") is not True:
+        raise CncProgramFault(
+            f"{cycle_label} was not started: PathPilot did not confirm that its interpreter left Idle."
+        )
+    diagnostics().record(
+        "run_mode",
+        "cnc_cycle_started",
+        f"{cycle_label} started.",
+        details={
+            "program": remote_program,
+            "loaded_program": start_result.get("loaded_program"),
+            "interp_state": start_result.get("interp_state"),
+        },
+    )
     started = time.monotonic()
-    saw_running = False
+    # The launch command has already observed a non-Idle state. This also covers
+    # a very short program that finishes before the first follow-up SSH poll.
+    saw_running = True
+    telemetry_outage_started: float | None = None
+    last_outage_report = 0.0
+    retry_delay = 1.0
     while time.monotonic() - started < timeout_seconds:
         if continue_check and not continue_check():
             return False
-        telemetry = read_linuxcnc_cycle_state(*connection)
+        try:
+            telemetry = read_linuxcnc_cycle_state(*connection)
+        except CncTelemetryError as exc:
+            now = time.monotonic()
+            if telemetry_outage_started is None:
+                telemetry_outage_started = now
+                diagnostics().record(
+                    "run_mode",
+                    "cnc_telemetry_outage",
+                    f"{cycle_label} is still running, but PathPilot telemetry is temporarily unavailable.",
+                    severity="warning",
+                    details={"program": remote_program, "error": str(exc)},
+                )
+            outage_seconds = now - telemetry_outage_started
+            if status_report and now - last_outage_report >= _CNC_TELEMETRY_STATUS_INTERVAL_SECONDS:
+                status_report(
+                    "telemetry_unavailable",
+                    f"{cycle_label} remains unconfirmed while PathPilot telemetry reconnects "
+                    f"({int(outage_seconds)} seconds). No new robot or mill action will be dispatched.",
+                )
+                last_outage_report = now
+            # Do not retry or restart the CNC program after an observation loss.
+            # The controller may still be cutting. Keep a bounded, gentle
+            # read-only reconnect loop until the cycle time limit is reached.
+            time.sleep(retry_delay)
+            retry_delay = min(_CNC_TELEMETRY_RETRY_MAX_SECONDS, retry_delay * 2)
+            continue
+        if telemetry_outage_started is not None:
+            outage_seconds = time.monotonic() - telemetry_outage_started
+            diagnostics().record(
+                "run_mode",
+                "cnc_telemetry_restored",
+                f"PathPilot telemetry resumed while monitoring {cycle_label}.",
+                details={"program": remote_program, "outage_seconds": round(outage_seconds, 3)},
+            )
+            if status_report:
+                status_report(
+                    "telemetry_restored",
+                    f"PathPilot telemetry resumed after {int(outage_seconds)} seconds. Continuing to monitor {cycle_label}.",
+                )
+            telemetry_outage_started = None
+            retry_delay = 1.0
+        fault_detail = _cnc_cycle_fault_detail(telemetry)
         interpreter_state = telemetry.get("interp_state")
+        if (
+            fault_detail == f"LinuxCNC interpreter error {baseline_interpreter_error}."
+            and baseline_interpreter_error not in (None, 0, "0")
+        ):
+            fault_detail = None
+        if fault_detail:
+            raise CncProgramFault(f"{cycle_label} stopped: {fault_detail}")
         if interpreter_state != 1:
             saw_running = True
-        elif saw_running or time.monotonic() - started >= 1.0:
+        elif saw_running:
+            diagnostics().record(
+                "run_mode",
+                "cnc_cycle_completed",
+                f"{cycle_label} returned to Idle after a confirmed start.",
+                details={
+                    "program": remote_program,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
+            )
             return True
-        time.sleep(0.5)
-    raise problem(504, f"{cycle_label} did not return PathPilot to Idle before its timeout.")
+        time.sleep(_CNC_RUNNING_POLL_SECONDS)
+    raise problem(
+        504,
+        f"{cycle_label} did not return PathPilot to Idle within {round(timeout_seconds / 3600, 1)} hours. "
+        "The scheduler did not retry or move the pallet.",
+    )
+
+
+def _cnc_cycle_fault_detail(telemetry: dict[str, object]) -> str | None:
+    if telemetry.get("estop") is True:
+        return "PathPilot entered E-stop."
+    if telemetry.get("enabled") is False:
+        return "PathPilot became disabled."
+    if (
+        telemetry.get("jog_lockout_configured") is True
+        and telemetry.get("jog_locked_out") is True
+    ) or (
+        telemetry.get("motion_stop_lockout_configured") is True
+        and telemetry.get("motion_stop_locked_out") is True
+    ):
+        return (
+            "PathPilot motion is locked out after a probe or unexpected-stop event. "
+            "Restore the probe and press Reset on PathPilot to re-enable operation."
+        )
+    if telemetry.get("rcs_error") is True or telemetry.get("exec_error") is True:
+        return "LinuxCNC reported an execution error."
+    interpreter_error = telemetry.get("interpreter_error")
+    if interpreter_error not in (None, 0, "0"):
+        return f"LinuxCNC interpreter error {interpreter_error}."
+
+    alarm_terms = re.compile(r"\b(alarm|error|fail(?:ed|ure)?|broken|breakage|out[- ]of[- ]tolerance)\b", re.IGNORECASE)
+    messages = telemetry.get("error_messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            text = str(message.get("text") or "").strip()
+            if text and (message.get("is_error") is True or alarm_terms.search(text)):
+                return text[:500]
+    return None
 
 
 def _run_manual_mill_load_position_cycle(settings: AppSettings) -> bool:
@@ -4226,30 +4687,126 @@ def _run_mode_cnc_cycle(
     remote_program: str,
     *,
     cycle_label: str,
-    timeout_seconds: float = 24 * 60 * 60,
+    timeout_seconds: float = _CNC_LONG_CYCLE_MAXIMUM_SECONDS,
+    run_token: str | None = None,
 ) -> bool:
-    with session_factory() as session:
-        settings = get_settings(session)
-        if not settings.run_mode_enabled:
-            return False
 
     def run_mode_is_enabled() -> bool:
         with session_factory() as check_session:
-            return get_settings(check_session).run_mode_enabled
+            return _run_mode_token_is_active(get_settings(check_session), run_token)
 
-    return _run_cnc_cycle(
-        settings,
-        remote_program,
-        cycle_label=cycle_label,
-        timeout_seconds=timeout_seconds,
-        continue_check=run_mode_is_enabled,
-    )
+    def report_observation_state(state: str, detail: str) -> None:
+        with session_factory() as report_session:
+            settings = get_settings(report_session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return
+            settings.run_mode_state = state
+            settings.run_mode_detail = detail
+            settings.run_mode_alert = detail if state == "telemetry_unavailable" else ""
+            bump(settings)
+            commit_or_conflict(report_session)
+
+    pre_dispatch_attempt = 0
+    while True:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return False
+        try:
+            return _run_cnc_cycle(
+                settings,
+                remote_program,
+                cycle_label=cycle_label,
+                timeout_seconds=timeout_seconds,
+                continue_check=run_mode_is_enabled,
+                status_report=report_observation_state,
+            )
+        except CncPreDispatchTelemetryError as exc:
+            pre_dispatch_attempt += 1
+            if pre_dispatch_attempt <= _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS:
+                delay = min(
+                    _RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS,
+                    2 ** (pre_dispatch_attempt - 1),
+                )
+                with session_factory() as session:
+                    settings = get_settings(session)
+                    if not _run_mode_token_is_active(settings, run_token):
+                        return False
+                    _set_run_mode_status(
+                        session,
+                        "recovering_cnc_telemetry",
+                        f"PathPilot telemetry is unavailable before {cycle_label}. "
+                        f"No program was sent. Retrying automatically in {delay} seconds "
+                        f"({pre_dispatch_attempt}/{_RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS}).",
+                    )
+                diagnostics().record(
+                    "run_mode",
+                    "cnc_pre_dispatch_retry",
+                    "Retrying PathPilot telemetry before a CNC program dispatch.",
+                    severity="warning",
+                    details={
+                        "program": remote_program,
+                        "attempt": pre_dispatch_attempt,
+                        "delay_seconds": delay,
+                        "error": str(exc),
+                    },
+                )
+                time.sleep(delay)
+                continue
+            detail = (
+                f"{exc} Automatic PathPilot reconnect attempts were exhausted before any program was sent."
+            )
+            retry_action = "retry_cnc_preflight"
+        except CncProgramFault as exc:
+            detail = str(exc)
+            retry_action = "retry_cnc_program"
+        except CncTelemetryError as exc:
+            # A start request may have reached PathPilot before the SSH response
+            # was lost. Retrying here could run the same machining program twice.
+            _finish_run_mode(
+                session_factory,
+                "faulted",
+                f"{cycle_label} has an uncertain PathPilot command result: {exc}. "
+                "The queue stopped without retrying the program. Inspect PathPilot and reconcile before continuing.",
+                run_token,
+            )
+            return False
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return False
+            settings.machine_state = "error"
+            settings.run_mode_alert = detail
+            bump(settings)
+            commit_or_conflict(session)
+        diagnostics().record(
+            "run_mode",
+            "cnc_fault",
+            detail,
+            severity="error",
+            details={"program": remote_program, "cycle_label": cycle_label},
+        )
+        if not _await_run_mode_action(
+            session_factory,
+            retry_action,
+            (
+                f"{detail} The queue is paused and the pallet has not been moved. "
+                + (
+                    "Inspect the mill and clear its alarm, then retry this same program, or stop Run Mode and leave the pallet in place."
+                    if retry_action == "retry_cnc_program"
+                    else "Check the PathPilot connection, then retry the connection check or stop Run Mode and leave the pallet in place."
+                )
+            ),
+            force_confirmation=True,
+            run_token=run_token,
+        ):
+            return False
 
 
-def _run_mode_load_position_cycle(session_factory) -> bool:
+def _run_mode_load_position_cycle(session_factory, run_token: str | None = None) -> bool:
     with session_factory() as session:
         settings = get_settings(session)
-        if not settings.run_mode_enabled:
+        if not _run_mode_token_is_active(settings, run_token):
             return False
         if settings.robot_connection_mode == "simulated":
             remote_program = str(MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME)
@@ -4260,12 +4817,133 @@ def _run_mode_load_position_cycle(session_factory) -> bool:
         remote_program,
         cycle_label="The mill loading-position program",
         timeout_seconds=5 * 60,
+        run_token=run_token,
     )
 
 
-def _run_mode_machine_cycle(session_factory, pallet_id: str) -> bool:
+def _run_mode_start_robot_transfer(
+    session_factory,
+    *,
+    operation: str,
+    pallet_id: str,
+    pallet_name: str,
+    return_slot: int,
+    run_token: str | None,
+) -> tuple[bool, str | None]:
+    """Dispatch one robot transfer, pausing safely on pre-dispatch failures."""
+    action_label = "load into" if operation == "load" else "unload from"
+    automatic_attempt = 0
+    while True:
+        try:
+            with session_factory() as session:
+                settings = get_settings(session)
+                if not _run_mode_token_is_active(settings, run_token):
+                    return False, None
+                _set_run_mode_status(
+                    session,
+                    "loading" if operation == "load" else "unloading",
+                    f"Mongo is preparing to {action_label} the mill for {pallet_name}.",
+                    pallet_id=pallet_id,
+                    return_slot=return_slot,
+                )
+                settings = get_settings(session)
+                motion_id = start_mill_pallet_transfer(
+                    session,
+                    StartMillPalletTransfer(
+                        expected_revision=settings.revision,
+                        operation=operation,
+                        pallet_id=pallet_id,
+                        pool_slot_number=return_slot if operation == "unload" else None,
+                    ),
+                    automated=True,
+                )
+                return True, motion_id
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            transient_transport_failure = _is_transient_robot_pre_dispatch_detail(detail)
+            automatic_attempt += 1
+            if (
+                transient_transport_failure
+                and automatic_attempt <= _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS
+            ):
+                delay = min(
+                    _RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS,
+                    2 ** (automatic_attempt - 1),
+                )
+                diagnostics().record(
+                    "run_mode",
+                    "robot_pre_dispatch_retry",
+                    "Retrying robot telemetry before a pallet transfer dispatch.",
+                    severity="warning",
+                    details={
+                        "operation": operation,
+                        "pallet_id": pallet_id,
+                        "attempt": automatic_attempt,
+                        "delay_seconds": delay,
+                        "error": detail,
+                    },
+                )
+                with session_factory() as session:
+                    settings = get_settings(session)
+                    if not _run_mode_token_is_active(settings, run_token):
+                        return False, None
+                    _set_run_mode_status(
+                        session,
+                        "recovering_robot_telemetry",
+                        f"Mongo telemetry is unavailable before {operation} for {pallet_name}. "
+                        f"No robot motion was dispatched. Retrying automatically in {delay} seconds "
+                        f"({automatic_attempt}/{_RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS}).",
+                        pallet_id=pallet_id,
+                        return_slot=return_slot,
+                    )
+                try:
+                    reset_robot_connections()
+                except RobotTelemetryError:
+                    pass
+                time.sleep(delay)
+                continue
+            diagnostics().record(
+                "run_mode",
+                "robot_transfer_pre_dispatch_blocked",
+                detail,
+                severity="warning",
+                details={
+                    "operation": operation,
+                    "pallet_id": pallet_id,
+                    "pallet_name": pallet_name,
+                    "return_slot": return_slot,
+                },
+            )
+            with session_factory() as session:
+                settings = get_settings(session)
+                if not _run_mode_token_is_active(settings, run_token):
+                    return False, None
+                settings.run_mode_alert = detail
+                bump(settings)
+                commit_or_conflict(session)
+            if not _await_run_mode_action(
+                session_factory,
+                "retry_robot_transfer",
+                f"{detail} Automatic reconnect attempts were exhausted. No robot movement was dispatched and the mill positioning step is already complete. "
+                f"Retry only the robot {operation} transfer, or stop Run Mode and leave the pallet in its current location.",
+                force_confirmation=True,
+                run_token=run_token,
+            ):
+                return False, None
+            try:
+                reset_robot_connections()
+            except RobotTelemetryError:
+                # The next preflight reports the current connection detail and
+                # returns to this same operator-controlled recovery point.
+                pass
+            time.sleep(0.5)
+
+
+def _run_mode_machine_cycle(session_factory, pallet_id: str, run_token: str | None = None) -> bool:
     with session_factory() as session:
         settings = get_settings(session)
+        if not _run_mode_token_is_active(settings, run_token):
+            return False
         pallet = session.get(Pallet, pallet_id)
         if not pallet or pallet.location != "machine" or not pallet.program_path:
             raise problem(409, "The run-mode pallet is no longer ready in the mill.")
@@ -4288,12 +4966,13 @@ def _run_mode_machine_cycle(session_factory, pallet_id: str) -> bool:
         session_factory,
         remote_program,
         cycle_label=f"The assigned program for {pallet_name}",
+        run_token=run_token,
     )
     if not completed or not archive_results:
         return completed
     with session_factory() as session:
         settings = get_settings(session)
-        if not settings.run_mode_enabled:
+        if not _run_mode_token_is_active(settings, run_token):
             return False
         _set_run_mode_status(
             session,
@@ -4313,6 +4992,14 @@ def _run_mode_machine_cycle(session_factory, pallet_id: str) -> bool:
                 session,
                 "results_archive_warning",
                 settings.run_mode_alert,
+                pallet_id=pallet_id,
+            )
+            return True
+        if archived_path is None:
+            _set_run_mode_status(
+                session,
+                "results_unchanged",
+                f"{PurePosixPath(results_source).name} was unchanged for {pallet_name}; no archive was needed.",
                 pallet_id=pallet_id,
             )
             return True
@@ -4361,19 +5048,221 @@ def clear_stale_run_mode_status(session: Session, expected_revision: int) -> Non
     )
 
 
-def execute_run_mode(session_factory) -> None:
+def start_run_mode_recovery(session: Session, payload) -> str:
+    """Resume an interrupted unload without guessing or repeating completed work."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if settings.run_mode_enabled:
+        raise problem(409, "Run Mode is already active.")
+    if settings.run_mode_state not in {"faulted", "interrupted", "stopped"}:
+        raise problem(409, "Run Mode is not awaiting recovery.")
+    if _locked_motion(session):
+        raise problem(409, "Resolve the active robot-motion record before recovering Run Mode.")
+    pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+    if not pallet:
+        raise problem(409, "Run recovery requires a pallet currently marked in the mill.")
+    return_slot = pallet.return_pool_slot_number
+    if not return_slot or return_slot > settings.pool_slot_count:
+        raise problem(409, "The pallet does not have a valid reserved return pool position.")
+    occupied = session.scalar(select(Pallet).where(
+        Pallet.location == "pool",
+        Pallet.pool_slot_number == return_slot,
+        Pallet.id != pallet.id,
+    ))
+    if occupied:
+        raise problem(409, f"Pool position {return_slot:02d} is occupied by {occupied.name}.")
+
+    run_token = str(uuid4())
+    settings.run_mode_enabled = True
+    settings.run_mode_start_request_id = run_token
+    settings.run_mode_state = "recovery_requested"
+    settings.run_mode_detail = (
+        f"Recovery requested for {pallet.name}: "
+        + (
+            "retrying only the robot unload because the mill is already at its loading position."
+            if payload.strategy == "retry_robot_only"
+            else "repositioning the mill, then retrying the robot unload."
+        )
+    )
+    settings.run_mode_current_pallet_id = pallet.id
+    settings.run_mode_return_slot = return_slot
+    settings.run_mode_pending_action = ""
+    settings.run_mode_confirmation_token = ""
+    settings.run_mode_confirmation_granted = False
+    settings.run_mode_alert = ""
+    bump(settings)
+    commit_or_conflict(session)
+    return run_token
+
+
+def execute_run_mode_recovery(session_factory, run_token: str, strategy: str) -> None:
+    """Recover a pallet left in the mill, then continue the remaining queue."""
+    try:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return
+            pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+            if not pallet or not pallet.return_pool_slot_number:
+                raise problem(409, "The pallet recovery state changed before recovery began.")
+            pallet_id = pallet.id
+            pallet_name = pallet.name
+            return_slot = pallet.return_pool_slot_number
+
+        if strategy == "reposition_and_retry":
+            with session_factory() as session:
+                _set_run_mode_status(
+                    session,
+                    "positioning_mill",
+                    f"Recovery is moving the mill to its loading position before unloading {pallet_name}.",
+                    pallet_id=pallet_id,
+                    return_slot=return_slot,
+                )
+            if not _run_mode_load_position_cycle(session_factory, run_token):
+                return
+
+        transfer_ready, motion_id = _run_mode_start_robot_transfer(
+            session_factory,
+            operation="unload",
+            pallet_id=pallet_id,
+            pallet_name=pallet_name,
+            return_slot=return_slot,
+            run_token=run_token,
+        )
+        if not transfer_ready:
+            return
+        if not _run_mode_motion_succeeded(session_factory, motion_id):
+            raise problem(409, f"Mongo could not recover {pallet_name}. Reconcile the robot-motion fault before continuing.")
+
+        with session_factory() as session:
+            settings = get_settings(session)
+            pallet = session.get(Pallet, pallet_id)
+            if pallet:
+                pallet.content_status = "complete_parts"
+            settings.run_mode_current_pallet_id = None
+            settings.run_mode_return_slot = None
+            remaining = session.scalar(select(Pallet.id).where(Pallet.queue_position.is_not(None)))
+            if remaining:
+                settings.run_mode_state = "advancing"
+                settings.run_mode_detail = f"Recovered {pallet_name}. Continuing the remaining production queue."
+                bump(settings)
+                commit_or_conflict(session)
+            else:
+                commit_or_conflict(session)
+                _finish_run_mode(session_factory, "complete", f"Recovered {pallet_name}; all queued work is complete.", run_token)
+                return
+        execute_run_mode(session_factory, run_token)
+    except HTTPException as exc:
+        _finish_run_mode(session_factory, "faulted", str(exc.detail), run_token)
+    except (CncTelemetryError, RobotDashboardError, RobotFileAccessError) as exc:
+        _finish_run_mode(session_factory, "faulted", str(exc), run_token)
+    except Exception as exc:  # pragma: no cover - defensive coordinator boundary
+        _finish_run_mode(session_factory, "faulted", f"Unexpected run-recovery failure: {exc}", run_token)
+
+
+def _prepare_run_mode(session_factory, run_token: str | None) -> bool:
+    """Perform slow controller/file checks after the cancellable start request is committed."""
+    recovery_attempt = 0
+    while True:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return False
+            queue = session.scalars(
+                select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
+            ).all()
+            if not queue:
+                raise problem(409, "The production queue became empty while Run Mode was starting.")
+            if settings.robot_connection_mode != "physical":
+                break
+            try:
+                _assert_motion_ready(session, settings)
+                cnc_state = read_linuxcnc_cycle_state(
+                    settings.cnc_host.strip(), settings.cnc_ssh_port,
+                    settings.cnc_ssh_username, settings.cnc_ssh_password,
+                    settings.cnc_timeout_seconds,
+                )
+            except HTTPException as exc:
+                detail = str(exc.detail)
+                transient = _is_transient_robot_pre_dispatch_detail(detail)
+            except CncTelemetryError as exc:
+                detail = f"Live CNC telemetry is unavailable before Run Mode starts: {exc}"
+                transient = True
+            else:
+                if cnc_state.get("estop"):
+                    raise problem(409, "PathPilot is in E-stop. Run mode was not started.")
+                if not cnc_state.get("enabled"):
+                    raise problem(409, "PathPilot is not enabled. Run mode was not started.")
+                if cnc_state.get("interp_state") != 1:
+                    raise problem(409, "PathPilot is not idle. Stop or finish its active program before starting run mode.")
+                for pallet in queue:
+                    _assert_pool_motion_position_configured(settings, pallet.pool_slot_number or 0)
+                _assert_run_mode_files_ready(settings, queue)
+                break
+
+            recovery_attempt += 1
+            if not transient or recovery_attempt > _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS:
+                raise problem(409, f"{detail} Run Mode was not started.")
+            delay = min(
+                _RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS,
+                2 ** (recovery_attempt - 1),
+            )
+            _set_run_mode_status(
+                session,
+                "recovering_startup_telemetry",
+                f"Controller telemetry is unavailable before Run Mode starts. No program or robot movement was sent. "
+                f"Retrying automatically in {delay} seconds ({recovery_attempt}/{_RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS}).",
+            )
+            diagnostics().record(
+                "run_mode",
+                "startup_telemetry_retry",
+                "Retrying controller telemetry before Run Mode dispatch.",
+                severity="warning",
+                details={"attempt": recovery_attempt, "delay_seconds": delay, "error": detail},
+            )
+        try:
+            reset_robot_connections()
+        except RobotTelemetryError:
+            pass
+        time.sleep(delay)
+
+    with session_factory() as session:
+        settings = get_settings(session)
+        if not _run_mode_token_is_active(settings, run_token):
+            return False
+        _set_run_mode_status(session, "starting", "Controller checks passed. Preparing the first queued pallet.")
+    return True
+
+
+def _finalize_stop_request(session_factory, run_token: str | None) -> None:
+    if run_token is None:
+        return
+    with session_factory() as session:
+        settings = get_settings(session)
+        if settings.run_mode_start_request_id != run_token or settings.run_mode_state != "stopping":
+            return
+        settings.run_mode_state = "stopped"
+        settings.run_mode_detail = "Stop override acknowledged. No further automated action will run."
+        settings.run_mode_start_request_id = ""
+        bump(settings)
+        commit_or_conflict(session)
+
+
+def execute_run_mode(session_factory, run_token: str | None = None) -> None:
     """Process queued pallets serially, stopping on the first uncertain state."""
     try:
+        if not _prepare_run_mode(session_factory, run_token):
+            return
         while True:
             with session_factory() as session:
                 settings = get_settings(session)
-                if not settings.run_mode_enabled:
+                if not _run_mode_token_is_active(settings, run_token):
                     return
                 pallet = session.scalar(
                     select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
                 )
                 if not pallet:
-                    _finish_run_mode(session_factory, "complete", "All queued pallets completed successfully.")
+                    _finish_run_mode(session_factory, "complete", "All queued pallets completed successfully.", run_token)
                     return
                 if pallet.location != "pool" or not pallet.pool_slot_number or not pallet.program_path:
                     raise problem(409, f"{pallet.name} is not ready in a pool position with an assigned program.")
@@ -4388,6 +5277,7 @@ def execute_run_mode(session_factory) -> None:
             if not _await_run_mode_action(
                 session_factory, "loading",
                 f"Move the mill to its G53 loading position, then load {pallet_name} from Pool {return_slot:02d}?",
+                run_token=run_token,
             ):
                 return
             with session_factory() as session:
@@ -4396,33 +5286,33 @@ def execute_run_mode(session_factory) -> None:
                     f"Moving the mill to its G53 loading position before loading {pallet_name}.",
                     pallet_id=pallet_id, return_slot=return_slot,
                 )
-            if not _run_mode_load_position_cycle(session_factory):
+            if not _run_mode_load_position_cycle(session_factory, run_token):
                 return
-            with session_factory() as session:
-                settings = get_settings(session)
-                if not settings.run_mode_enabled:
-                    return
-                _set_run_mode_status(
-                    session, "loading", f"Mongo is loading {pallet_name} into the mill.",
-                    pallet_id=pallet_id, return_slot=return_slot,
-                )
-                settings = get_settings(session)
-                motion_id = start_mill_pallet_transfer(session, StartMillPalletTransfer(
-                    expected_revision=settings.revision, operation="load", pallet_id=pallet_id,
-                ), automated=True)
+            transfer_ready, motion_id = _run_mode_start_robot_transfer(
+                session_factory,
+                operation="load",
+                pallet_id=pallet_id,
+                pallet_name=pallet_name,
+                return_slot=return_slot,
+                run_token=run_token,
+            )
+            if not transfer_ready:
+                return
             if not _run_mode_motion_succeeded(session_factory, motion_id):
                 raise problem(409, f"Mongo could not load {pallet_name}. Resolve the robot-motion fault before restarting run mode.")
 
             if not _await_run_mode_action(
                 session_factory, "machining", f"Start {pallet_name}'s assigned mill program?",
+                run_token=run_token,
             ):
                 return
-            if not _run_mode_machine_cycle(session_factory, pallet_id):
+            if not _run_mode_machine_cycle(session_factory, pallet_id, run_token):
                 return
 
             if not _await_run_mode_action(
                 session_factory, "unloading",
                 f"Return the mill to its G53 loading position, then unload {pallet_name} to Pool {return_slot:02d}?",
+                run_token=run_token,
             ):
                 return
             with session_factory() as session:
@@ -4431,21 +5321,18 @@ def execute_run_mode(session_factory) -> None:
                     f"Moving the mill to its G53 loading position before unloading {pallet_name}.",
                     pallet_id=pallet_id, return_slot=return_slot,
                 )
-            if not _run_mode_load_position_cycle(session_factory):
+            if not _run_mode_load_position_cycle(session_factory, run_token):
                 return
-            with session_factory() as session:
-                settings = get_settings(session)
-                if not settings.run_mode_enabled:
-                    return
-                _set_run_mode_status(
-                    session, "unloading", f"Mongo is unloading {pallet_name} from the mill.",
-                    pallet_id=pallet_id, return_slot=return_slot,
-                )
-                settings = get_settings(session)
-                motion_id = start_mill_pallet_transfer(session, StartMillPalletTransfer(
-                    expected_revision=settings.revision, operation="unload", pallet_id=pallet_id,
-                    pool_slot_number=return_slot,
-                ), automated=True)
+            transfer_ready, motion_id = _run_mode_start_robot_transfer(
+                session_factory,
+                operation="unload",
+                pallet_id=pallet_id,
+                pallet_name=pallet_name,
+                return_slot=return_slot,
+                run_token=run_token,
+            )
+            if not transfer_ready:
+                return
             if not _run_mode_motion_succeeded(session_factory, motion_id):
                 raise problem(409, f"Mongo could not return {pallet_name}. Resolve the robot-motion fault before restarting run mode.")
 
@@ -4461,11 +5348,13 @@ def execute_run_mode(session_factory) -> None:
                 bump(settings)
                 commit_or_conflict(session)
     except HTTPException as exc:
-        _finish_run_mode(session_factory, "faulted", str(exc.detail))
+        _finish_run_mode(session_factory, "faulted", str(exc.detail), run_token)
     except (CncTelemetryError, RobotDashboardError, RobotFileAccessError) as exc:
-        _finish_run_mode(session_factory, "faulted", str(exc))
+        _finish_run_mode(session_factory, "faulted", str(exc), run_token)
     except Exception as exc:  # pragma: no cover - defensive coordinator boundary
-        _finish_run_mode(session_factory, "faulted", f"Unexpected run-mode failure: {exc}")
+        _finish_run_mode(session_factory, "faulted", f"Unexpected run-mode failure: {exc}", run_token)
+    finally:
+        _finalize_stop_request(session_factory, run_token)
 
 
 def recover_pallet_motion(session: Session, motion_id: str, payload: RecoverPalletMotion) -> None:
@@ -4490,19 +5379,27 @@ def recover_pallet_motion(session: Session, motion_id: str, payload: RecoverPall
         if occupant:
             raise problem(409, "Another pallet is already marked as being in the mill.")
         pallet.location, pallet.pool_slot_number = "machine", None
+        pallet.return_pool_slot_number = (
+            pallet.return_pool_slot_number or motion.source_slot or motion.destination_slot
+        )
         settings.machine_state = "running"
     elif payload.resolution == "source_pool":
         pallet.location, pallet.pool_slot_number = "pool", motion.source_slot
+        pallet.return_pool_slot_number = None
     elif payload.resolution == "destination_pool":
         occupant = session.scalar(select(Pallet).where(Pallet.location == "pool", Pallet.pool_slot_number == motion.destination_slot, Pallet.id != pallet.id))
         if occupant:
             raise problem(409, "The destination pool position is now occupied.")
         pallet.location, pallet.pool_slot_number = "pool", motion.destination_slot
+        pallet.return_pool_slot_number = None
     else:
         held = session.scalar(select(Pallet).where(Pallet.location == "robot_held", Pallet.id != pallet.id))
         if held:
             raise problem(409, "Another pallet is already marked Robot-held.")
         pallet.location, pallet.pool_slot_number = "robot_held", None
+        pallet.return_pool_slot_number = (
+            pallet.return_pool_slot_number or motion.source_slot or motion.destination_slot
+        )
     motion.status = "reconciled"
     motion.completed_at = datetime.now(timezone.utc).isoformat()
     motion.failure_detail = f"{motion.failure_detail or 'Robot movement fault.'} Reconciled as {payload.resolution}."
@@ -4697,8 +5594,10 @@ def queue_pallet(
         raise problem(404, "Pallet not found.")
     assert_pallet_manageable_during_run(settings, pallet)
     if pallet.location == "machine":
+        pool_slot = best_pool_return_slot(session, settings, pallet)
         pallet.location = "pool"
-        pallet.pool_slot_number = first_open_pool_slot(session, settings)
+        pallet.pool_slot_number = pool_slot
+        pallet.return_pool_slot_number = None
     elif pallet.location != "pool":
         raise problem(
             409,
@@ -4796,6 +5695,7 @@ def reconcile_programs(session: Session, settings: AppSettings, *, force_scan: b
     for pallet in assigned:
         if pallet.program_path not in available:
             pallet.program_path = None
+            _clear_pallet_program_metadata(pallet)
             cleared.append(pallet.name)
     return cleared
 
@@ -4833,10 +5733,17 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         .order_by(Pallet.pool_slot_number.desc())
         .limit(1)
     )
-    if highest_occupied and payload.pool_slot_count is not None and payload.pool_slot_count < highest_occupied:
+    highest_reserved = session.scalar(
+        select(Pallet.return_pool_slot_number)
+        .where(Pallet.return_pool_slot_number.is_not(None))
+        .order_by(Pallet.return_pool_slot_number.desc())
+        .limit(1)
+    )
+    highest_in_use = max(highest_occupied or 0, highest_reserved or 0)
+    if highest_in_use and payload.pool_slot_count is not None and payload.pool_slot_count < highest_in_use:
         raise problem(
             409,
-            f"Pool position {highest_occupied} is occupied. Move that pallet before reducing capacity.",
+            f"Pool position {highest_in_use} is occupied or reserved. Return or move that pallet before reducing capacity.",
         )
     if payload.on_deck_enabled is False and session.scalar(select(Pallet).where(Pallet.location == "on_deck")):
         raise problem(409, "Move the pallet out of On deck before disabling that station.")
@@ -5330,14 +6237,72 @@ def rename_debug_io(session: Session, payload: RenameDebugIo) -> None:
     commit_or_conflict(session)
 
 
-def refresh_programs(session: Session, expected_revision: int) -> list[str]:
+def refresh_programs(session: Session, expected_revision: int) -> dict[str, object]:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    cleared = reconcile_programs(session, settings, force_scan=True)
-    if cleared:
+    remote_configured = bool(
+        settings.mill_programs_page_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    )
+    if remote_configured:
+        root = PurePosixPath(settings.mill_file_directory)
+        extensions = set(json.loads(settings.mill_program_extensions))
+        try:
+            remote_files = list_robot_program_files(
+                host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
+                username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
+                directory=str(root), extensions=extensions,
+                timeout_seconds=settings.cnc_timeout_seconds,
+            )
+        except RobotFileAccessError as exc:
+            # Never clear assignments from an empty fallback catalog when the
+            # authoritative PathPilot directory could not be reached.
+            raise problem(502, f"Could not refresh PathPilot programs: {exc}") from exc
+        programs = [str(PurePosixPath(path).relative_to(root)) for path in remote_files]
+        key = (
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            str(root), tuple(sorted(extensions)),
+        )
+        with _PALLET_PROGRAM_REMOTE_LOCK:
+            _PALLET_PROGRAM_REMOTE_CACHE[key] = (time.monotonic(), list(programs))
+        available = set(programs)
+        cleared: list[str] = []
+        for pallet in session.scalars(select(Pallet).where(Pallet.program_path.is_not(None))).all():
+            if pallet.program_path not in available:
+                pallet.program_path = None
+                _clear_pallet_program_metadata(pallet)
+                cleared.append(pallet.name)
+    else:
+        programs, _ = available_programs(settings, force=True)
+        cleared = reconcile_programs(session, settings)
+
+    metadata_changed = False
+    metadata_by_program: dict[str, dict[str, object]] = {}
+    for pallet in session.scalars(select(Pallet).where(Pallet.program_path.is_not(None))).all():
+        program_path = pallet.program_path or ""
+        if program_path not in metadata_by_program:
+            metadata_by_program[program_path] = read_assigned_program_metadata(settings, program_path)
+        metadata = metadata_by_program[program_path]
+        previous = (
+            pallet.program_tools_json, pallet.expected_cycle_seconds,
+            pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
+        )
+        _store_pallet_program_metadata(pallet, metadata)
+        current = (
+            pallet.program_tools_json, pallet.expected_cycle_seconds,
+            pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
+        )
+        metadata_changed = metadata_changed or previous != current
+    if cleared or metadata_changed:
         bump(settings)
         commit_or_conflict(session)
-    return cleared
+    return {
+        "cleared_assignments": cleared,
+        "programs": programs,
+        "metadata_refreshed": len(metadata_by_program),
+    }
 
 
 def simulate_signal(
@@ -5358,8 +6323,9 @@ def simulate_signal(
         )
         if not pallet:
             raise problem(409, "No pallet is currently in the Mill.")
+        pallet.pool_slot_number = best_pool_return_slot(session, settings, pallet)
         pallet.location = "pool"
-        pallet.pool_slot_number = first_open_pool_slot(session, settings)
+        pallet.return_pool_slot_number = None
         pallet.content_status = (
             "complete_parts" if signal == "complete" else "defective_parts"
         )

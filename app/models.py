@@ -86,6 +86,7 @@ class AppSettings(Base):
     run_mode_pending_action: Mapped[str] = mapped_column(String(30), default="")
     run_mode_confirmation_token: Mapped[str] = mapped_column(String(36), default="")
     run_mode_confirmation_granted: Mapped[bool] = mapped_column(Boolean, default=False)
+    run_mode_start_request_id: Mapped[str] = mapped_column(String(36), default="")
     mill_file_directory: Mapped[str] = mapped_column(String(500), default="/home/operator/gcode/Gcode")
     mill_program_extensions: Mapped[str] = mapped_column(String, default='[".nc",".tap",".gcode",".cnc"]')
     mill_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -168,9 +169,15 @@ class Pallet(Base):
     weight_kg: Mapped[float] = mapped_column(Float)
     content_status: Mapped[str] = mapped_column(String(30))
     program_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    program_tools_json: Mapped[str] = mapped_column(String, default="[]")
+    expected_cycle_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    program_metadata_state: Mapped[str] = mapped_column(String(20), default="unavailable")
+    program_metadata_detail: Mapped[str] = mapped_column(String(500), default="")
+    program_cycle_basis: Mapped[str | None] = mapped_column(String(100), nullable=True)
     location: Mapped[str] = mapped_column(String(20), default="pool")
     queue_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pool_slot_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    return_pool_slot_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class RobotMotion(Base):
