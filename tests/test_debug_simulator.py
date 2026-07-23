@@ -1,4 +1,7 @@
 from fastapi.testclient import TestClient
+from pathlib import PurePosixPath
+
+from app import service
 
 
 def create_pallet(client: TestClient, revision: int) -> dict:
@@ -119,26 +122,23 @@ def test_debug_completion_rejects_full_pool(client: TestClient) -> None:
         },
     ).json()
     board = create_pallet(client, board["revision"])
-    board = client.put(
-        "/api/settings",
-        json={
-            "expected_revision": board["revision"],
-            "source_folder": "",
-            "program_extensions": [".nc"],
-            "weight_unit": "lb",
-            "pool_slot_count": 1,
-            "debug_menu_enabled": True,
-            "robot_connection_mode": "simulated",
-            "robot_host": "",
-            "robot_port": 30004,
-            "robot_poll_hz": 10,
-            "robot_timeout_seconds": 1.0,
-        },
-    ).json()["board"]
+    second_id = next(item["id"] for item in board["pallets"] if item["id"] != first_id)
+    # Simulate legacy data without a return reservation so the only configured
+    # pool position can genuinely be occupied by another pallet.
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        machine = session.get(service.Pallet, first_id)
+        second = session.get(service.Pallet, second_id)
+        machine.return_pool_slot_number = None
+        second.pool_slot_number = 1
+        settings.pool_slot_count = 1
+        service.bump(settings)
+        session.commit()
+        revision = settings.revision
 
     response = client.post(
         "/api/debug/signals/complete",
-        json={"expected_revision": board["revision"]},
+        json={"expected_revision": revision},
     )
 
     assert response.status_code == 409
@@ -296,7 +296,6 @@ def test_debug_program_run_uses_dashboard(client: TestClient, monkeypatch) -> No
         lambda *args: called.update(args=args),
     )
     monkeypatch.setattr("app.service.read_robot_snapshot", lambda *args: {"robot": {}})
-    monkeypatch.setattr("app.service.loaded_robot_program", lambda *args: None)
 
     response = client.post(
         "/api/debug/programs/run",
@@ -351,6 +350,101 @@ def test_robot_program_files_use_configured_sftp(client: TestClient, monkeypatch
 
     assert response.status_code == 200
     assert called["extensions"] is None
+
+
+def test_robot_programs_page_lists_files_when_enabled(client: TestClient, monkeypatch) -> None:
+    board = client.get("/api/board").json()
+    assert client.get("/robot-programs").status_code == 200
+    board = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "robot_connection_mode": "physical",
+            "robot_host": "192.168.0.10",
+            "robot_port": 30004,
+            "robot_poll_hz": 10,
+            "robot_timeout_seconds": 1.0,
+            "robot_file_access_enabled": True,
+            "robot_file_username": "root",
+            "robot_file_password": "easybot",
+            "robot_programs_page_enabled": True,
+            "robot_editor_command": "code",
+        },
+    ).json()["board"]
+    monkeypatch.setattr(
+        "app.main.list_robot_directory",
+        lambda **kwargs: {"root": "/programs", "path": "/programs", "parent": None, "entries": [{"name": "job.urp", "path": "/programs/job.urp", "kind": "file", "size": 12, "modified_at": "2026-01-01T00:00:00+00:00"}]},
+    )
+
+    response = client.get("/api/robot-files")
+
+    assert client.get("/robot-programs").status_code == 200
+    assert response.status_code == 200
+    assert response.json()["entries"][0]["name"] == "job.urp"
+    assert board["settings"]["robot_programs_page_enabled"] is True
+
+    from app.robot_files import RobotFileConflict
+
+    monkeypatch.setattr(
+        "app.main.copy_robot_file",
+        lambda **kwargs: (_ for _ in ()).throw(RobotFileConflict(PurePosixPath("/programs/job.urp"))),
+    )
+    conflict = client.post(
+        "/api/robot-files/action",
+        json={"action": "copy", "path": "/programs/job.urp", "destination_directory": "/programs"},
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["destination"] == "/programs/job.urp"
+
+
+def test_mill_programs_page_lists_pathpilot_files(client: TestClient, monkeypatch) -> None:
+    board = client.get("/api/board").json()
+    board = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "source_folder": "",
+            "program_extensions": [".nc"],
+            "weight_unit": "lb",
+            "pool_slot_count": 16,
+            "robot_connection_mode": board["settings"]["robot_connection_mode"],
+            "robot_host": board["settings"]["robot_host"],
+            "robot_port": board["settings"]["robot_port"],
+            "robot_poll_hz": board["settings"]["robot_poll_hz"],
+            "robot_timeout_seconds": board["settings"]["robot_timeout_seconds"],
+            "cnc_host": "tormach",
+            "cnc_ssh_port": 22,
+            "cnc_ssh_username": "operator",
+            "cnc_ssh_password": "secret",
+            "cnc_timeout_seconds": 2,
+            "mill_file_directory": "/home/operator/gcode",
+            "mill_program_extensions": [".nc", ".tap"],
+            "mill_programs_page_enabled": True,
+            "mill_programs_filter_enabled": True,
+            "mill_editor_command": "code",
+        },
+    ).json()["board"]
+    called = {}
+
+    def list_files(**kwargs):
+        called.update(kwargs)
+        return {"root": "/home/operator/gcode", "path": "/home/operator/gcode", "parent": None, "entries": []}
+
+    monkeypatch.setattr("app.main.list_robot_directory", list_files)
+
+    response = client.get("/api/mill-files")
+
+    assert client.get("/mill-programs").status_code == 200
+    assert response.status_code == 200
+    assert called["host"] == "tormach"
+    assert called["directory"] == "/home/operator/gcode"
+    assert called["extensions"] == {".nc", ".tap"}
+    assert board["settings"]["mill_programs_page_enabled"] is True
 
 
 def test_toggle_physical_output_requires_manual_io_unlock(client: TestClient) -> None:

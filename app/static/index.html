@@ -1,14 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html class="schedule-document" lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <script src="/static/app.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260720-13">
+    <script src="/static/app.js?v=20260723-01" defer></script>
   </head>
-  <body>
+  <body class="schedule-page">
     <header class="topbar">
       <a class="brand" href="/">
         <span class="brand-mark">M</span>
@@ -16,7 +16,11 @@
       </a>
       <nav aria-label="Main navigation">
         <a class="nav-link active" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/tools">Tools</a>
         <a class="nav-link" href="/debugging">Debugging</a>
+        <a class="nav-link hidden" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link hidden" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
         <a class="nav-link" href="/settings">Settings</a>
       </nav>
       <span class="system-state" id="system-state">
@@ -32,11 +36,26 @@
           <h1>Pallet schedule</h1>
         </div>
         <div class="toolbar">
+          <div class="run-mode-controls">
+            <button class="button run-mode-button" id="run-mode-toggle" type="button">Start run mode</button>
+          </div>
+          <button class="button secondary" id="autoschedule-queue" type="button">Optimize by tools</button>
           <button class="button primary" id="create-pallet">+ New pallet</button>
         </div>
       </section>
 
-      <div class="notice hidden" id="program-warning" role="status"></div>
+      <div class="notice dismissible-notice hidden" id="program-warning" role="status">
+        <span id="program-warning-message"></span>
+        <button class="notice-dismiss" id="dismiss-program-warning" type="button">Dismiss</button>
+      </div>
+      <section class="run-mode-status" id="run-mode-status" aria-live="polite"></section>
+      <section class="robot-motion-status hidden" id="robot-motion-status" aria-live="polite">
+        <div id="robot-motion-summary"></div>
+        <div class="status-actions">
+          <button class="button danger hidden" type="button" id="recover-robot-motion">Recover</button>
+          <button class="notice-dismiss" id="dismiss-robot-motion" type="button">Dismiss</button>
+        </div>
+      </section>
 
       <div class="board-layout">
         <div class="operations-rail">
@@ -54,7 +73,7 @@
           <section class="zone queue-zone" data-zone="queue">
             <header class="zone-heading">
               <div>
-                <p class="section-number">02 / Ordered</p>
+                <p class="section-number">03 / Ordered</p>
                 <h2>Production queue</h2>
               </div>
               <span class="zone-count" id="queue-count">0 pallets</span>
@@ -64,10 +83,40 @@
         </div>
 
         <div class="production-workspace">
+          <div class="flow-stations">
+            <section class="zone station-zone robot-held-zone" data-zone="robot_held">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">Robot transfer</p>
+                  <h2>Robot-held</h2>
+                </div>
+              </header>
+              <div class="station-bay" id="robot-held-slot"></div>
+            </section>
+            <section class="zone station-zone" data-zone="on_deck">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">02 / Staged</p>
+                  <h2>On deck</h2>
+                </div>
+              </header>
+              <div class="station-bay drop-target" id="on-deck-slot" data-destination="on_deck"></div>
+            </section>
+            <section class="zone station-zone" data-zone="dripping">
+              <header class="zone-heading">
+                <div>
+                  <p class="section-number">05 / Return staging</p>
+                  <h2>Dripping</h2>
+                </div>
+              </header>
+              <div class="station-bay drop-target" id="dripping-slot" data-destination="dripping"></div>
+            </section>
+          </div>
+
           <section class="zone pool-zone" data-zone="pool">
             <header class="zone-heading">
               <div>
-                <p class="section-number">03 / Available</p>
+                <p class="section-number">04 / Available</p>
                 <h2>Pallet pool</h2>
               </div>
               <span class="zone-count" id="pool-count">0 pallets</span>
@@ -78,7 +127,7 @@
           <section class="zone storage-zone" data-zone="storage">
             <header class="zone-heading">
               <div>
-                <p class="section-number">04 / Inventory</p>
+                <p class="section-number">06 / Inventory</p>
                 <h2>Storage</h2>
               </div>
               <span class="zone-count" id="storage-count">0 pallets</span>
@@ -124,7 +173,8 @@
         <input type="hidden" id="pallet-id">
         <label>
           Workholding
-          <input id="pallet-workholding" required maxlength="250" autocomplete="off">
+          <input id="pallet-workholding" list="workholding-options" required maxlength="250" autocomplete="off">
+          <datalist id="workholding-options"></datalist>
         </label>
         <div class="form-row">
           <label>
@@ -144,12 +194,13 @@
         <div class="program-picker">
           <label>
             Assigned program
-            <input id="pallet-program" list="program-options" placeholder="No program assigned" autocomplete="off">
-            <datalist id="program-options"></datalist>
+            <select id="pallet-program">
+              <option value="">No program assigned</option>
+            </select>
           </label>
           <button class="button secondary" type="button" id="refresh-programs">Refresh programs</button>
         </div>
-        <p class="field-help">Programs are read from the folder configured in Settings.</p>
+        <p class="field-help" id="pallet-program-help">Programs are read only from the configured Gcode folder.</p>
         <div class="dialog-actions">
           <button class="button ghost" type="button" data-close-pallet>Cancel</button>
           <button class="button primary" id="save-pallet" type="submit">Save pallet</button>
@@ -169,6 +220,93 @@
         <div class="dialog-actions">
           <button class="button ghost" value="cancel">Cancel</button>
           <button class="button danger" id="confirm-action" value="confirm">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="mill-putaway-dialog">
+      <form method="dialog" id="mill-putaway-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Mongo transfer</p>
+            <h2>Put away <span id="mill-putaway-pallet-name"></span></h2>
+          </div>
+        </div>
+        <p>Mongo will unload this pallet from the mill and put it into the selected pool position.</p>
+        <input id="mill-putaway-pallet-id" type="hidden">
+        <label>Destination pool position
+          <select id="mill-putaway-slot"></select>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" id="cancel-mill-putaway" type="button">Cancel</button>
+          <button class="button" type="submit">Unload and put away</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="storage-send-to-pool-dialog">
+      <form method="dialog" id="storage-send-to-pool-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Schedule update</p>
+            <h2>Move <span id="storage-send-to-pool-pallet-name"></span> to pool</h2>
+          </div>
+        </div>
+        <p id="storage-send-to-pool-suggestion"></p>
+        <p class="muted">This records the pallet in the selected pool position. It does not command Mongo or the mill.</p>
+        <input id="storage-send-to-pool-pallet-id" type="hidden">
+        <label>Pool position
+          <input id="storage-send-to-pool-slot" type="number" min="1" step="1" required>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" id="cancel-storage-send-to-pool" type="button">Cancel</button>
+          <button class="button" type="submit">Record in pool</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="run-confirm-dialog">
+      <form method="dialog" id="run-confirm-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Run mode safety check</p>
+            <h2 id="run-confirm-title">Confirm next action</h2>
+          </div>
+        </div>
+        <p id="run-confirm-message"></p>
+        <p class="field-help">Verify the robot, mill, pallet, door, workholding, and surrounding cell are clear before continuing.</p>
+        <div class="dialog-actions">
+          <button class="button danger" id="run-confirm-stop" type="button">Stop run mode</button>
+          <button class="button primary" id="run-confirm-approve" type="button">Approve action</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="motion-recovery-dialog">
+      <form method="dialog" id="motion-recovery-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Movement fault</p><h2>Reconcile pallet location</h2></div></div>
+        <p id="motion-recovery-message"></p>
+        <label>Observed pallet location<select id="motion-recovery-resolution"></select></label>
+        <div class="dialog-actions"><button class="button ghost" id="cancel-motion-recovery" type="button">Cancel</button><button class="button danger" id="save-motion-recovery" type="submit">Save recovery</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="autoschedule-dialog" class="autoschedule-dialog">
+      <form method="dialog">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">ATC-aware queue planning</p>
+            <h2>Optimized pallet order</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close">&times;</button>
+        </div>
+        <div class="autoschedule-summary" id="autoschedule-summary"></div>
+        <p class="notice hidden" id="autoschedule-warning"></p>
+        <ol class="autoschedule-steps" id="autoschedule-steps"></ol>
+        <p class="field-help" id="autoschedule-note"></p>
+        <div class="dialog-actions">
+          <button class="button ghost" value="cancel">Keep current order</button>
+          <button class="button primary" id="apply-autoschedule" type="button">Apply optimized order</button>
         </div>
       </form>
     </dialog>
