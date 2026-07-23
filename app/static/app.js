@@ -72,6 +72,20 @@ function newRunModeRequestId() {
   return `${Date.now().toString(36)}-${random[0].toString(36)}${random[1].toString(36)}`.slice(0, 36);
 }
 
+function reconcilePendingRunModeStart(nextBoard) {
+  const run = nextBoard?.run_mode || {};
+  // A persisted start request always sets enabled before any slow controller
+  // check. If the authoritative board is idle/completed/faulted, this browser
+  // request cannot still own a start lock.
+  if (runModeStartPending && !run.enabled && run.state !== "start_requested") {
+    runModeStartPending = false;
+    runModeStopQueued = false;
+    pendingRunModeRequestId = null;
+    return true;
+  }
+  return false;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -145,6 +159,7 @@ async function loadPalletProgramOptions(selectedProgram = "") {
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
+    cache: "no-store",
     headers: {"Content-Type": "application/json", ...(options.headers || {})},
     ...options,
   });
@@ -192,10 +207,11 @@ function palletCard(pallet, position = null) {
   const program = pallet.program_path || "No program";
   const runLocked = Boolean(board.run_mode?.enabled);
   const canManage = !runLocked || pallet.location !== "machine";
-  const queueAction = canManage && pallet.queue_position === null
+  const activeMotionPalletId = board.robot_motion?.active?.pallet_id;
+  const queueAction = canManage && pallet.id !== activeMotionPalletId && pallet.queue_position === null
     ? (pallet.location === "pool" ? `<button class="text-button" data-action="queue">Queue</button>` : "")
     : "";
-  const dequeueAction = canManage && position !== null && pallet.queue_position !== null
+  const dequeueAction = canManage && pallet.id !== activeMotionPalletId && position !== null && pallet.queue_position !== null
     ? `<button class="text-button" data-action="dequeue">Remove from queue</button>`
     : "";
   const motionLocked = Boolean(board.robot_motion?.active) || runLocked;
@@ -211,6 +227,12 @@ function palletCard(pallet, position = null) {
     : "";
   const manualReturnAction = pallet.location === "machine" && !motionLocked
     ? `<button class="text-button danger-text" data-action="manual-return-to-pool">Record return to pool</button>`
+    : "";
+  const sendToPoolAction = pallet.location === "storage" && !motionLocked
+    ? `<button class="text-button" data-action="send-to-pool">Move to pool</button>`
+    : "";
+  const returnToStorageAction = ["pool", "on_deck", "dripping"].includes(pallet.location) && !motionLocked
+    ? `<button class="text-button" data-action="return-to-storage">Return to storage</button>`
     : "";
   const queueBadge = pallet.queue_position !== null && position === null
     ? `<span class="queue-chip">Queued #${pallet.queue_position + 1}</span>`
@@ -244,6 +266,8 @@ function palletCard(pallet, position = null) {
         ${automaticPutAwayAction}
         ${millPutAwayAction}
         ${manualReturnAction}
+        ${sendToPoolAction}
+        ${returnToStorageAction}
         ${canManage ? `<button class="text-button" data-action="edit">Edit</button>
         <button class="text-button" data-action="duplicate">Duplicate</button>
         <button class="text-button danger-text" data-action="delete">Delete</button>` : ""}
@@ -532,8 +556,9 @@ async function loadBoard() {
     try {
       const nextBoard = await api("/api/board");
       const nextBoardKey = JSON.stringify(nextBoard);
+      const startLockCleared = reconcilePendingRunModeStart(nextBoard);
       board = nextBoard;
-      if (nextBoardKey !== renderedBoardKey) renderBoard();
+      if (startLockCleared || nextBoardKey !== renderedBoardKey) renderBoard();
     } catch (error) {
       ui.state.classList.remove("online");
       ui.state.lastChild.textContent = " Unavailable";
@@ -754,8 +779,9 @@ ui.runModeToggle.addEventListener("click", () => {
       try {
         board = await api("/api/board");
         renderBoard();
-        if (!board.run_mode?.enabled) {
-          showToast("The start request may still be in transit. The control remains locked until the connection is restored or the page is reloaded.", "error");
+        if (reconcilePendingRunModeStart(board)) {
+          renderRunMode();
+          showToast("Run Mode did not start. The control is ready to try again.", "error");
           return;
         }
       } catch (_refreshError) {
@@ -830,6 +856,14 @@ document.addEventListener("click", async event => {
     );
   }
   if (action === "mongo-unload") openMillPutAwayDialog(pallet);
+  if (action === "send-to-pool") openStorageSendToPoolDialog(pallet);
+  if (action === "return-to-storage") {
+    askConfirmation(
+      "Return pallet to storage",
+      `Record ${pallet.name} in Storage? This is a schedule-only update and removes it from the production queue if it is queued. No robot or mill command will be sent.`,
+      () => movePallet(pallet.id, "storage"),
+    );
+  }
   if (action === "manual-return-to-pool") {
     const preferred = pallet.return_pool_slot_number
       ? `Pool ${String(pallet.return_pool_slot_number).padStart(2, "0")}`
@@ -881,11 +915,7 @@ async function startRobotMotion(operation, poolSlotNumber, palletId = null) {
 }
 
 function openMillPutAwayDialog(pallet) {
-  const openSlots = Array.from({length: board.settings.pool_slot_count}, (_, index) => index + 1)
-    .filter(slot => !board.pallets.some(item =>
-      (item.location === "pool" && item.pool_slot_number === slot)
-      || (item.id !== pallet.id && ["machine", "robot_held"].includes(item.location) && item.return_pool_slot_number === slot),
-    ));
+  const openSlots = availablePoolSlots(pallet);
   if (!openSlots.length) {
     showToast("No empty pallet-pool positions are available.", "error");
     return;
@@ -895,6 +925,30 @@ function openMillPutAwayDialog(pallet) {
   document.querySelector("#mill-putaway-slot").innerHTML = openSlots
     .map(slot => `<option value="${slot}">Pool ${String(slot).padStart(2, "0")}</option>`).join("");
   document.querySelector("#mill-putaway-dialog").showModal();
+}
+
+function availablePoolSlots(pallet) {
+  return Array.from({length: board.settings.pool_slot_count}, (_, index) => index + 1)
+    .filter(slot => !board.pallets.some(item =>
+      (item.location === "pool" && item.pool_slot_number === slot)
+      || (item.id !== pallet.id && ["machine", "robot_held"].includes(item.location) && item.return_pool_slot_number === slot),
+    ));
+}
+
+function openStorageSendToPoolDialog(pallet) {
+  const openSlots = availablePoolSlots(pallet);
+  if (!openSlots.length) {
+    showToast("No empty pallet-pool positions are available.", "error");
+    return;
+  }
+  const suggestedSlot = openSlots[0];
+  const input = document.querySelector("#storage-send-to-pool-slot");
+  document.querySelector("#storage-send-to-pool-pallet-id").value = pallet.id;
+  document.querySelector("#storage-send-to-pool-pallet-name").textContent = pallet.name;
+  document.querySelector("#storage-send-to-pool-suggestion").textContent = `Suggested position: Pool ${String(suggestedSlot).padStart(2, "0")}. Enter another open position if needed.`;
+  input.max = String(board.settings.pool_slot_count);
+  input.value = String(suggestedSlot);
+  document.querySelector("#storage-send-to-pool-dialog").showModal();
 }
 
 async function startMillTransfer(operation, palletId = null, poolSlotNumber = null) {
@@ -919,6 +973,29 @@ document.querySelector("#mill-putaway-form").addEventListener("submit", async ev
 });
 document.querySelector("#cancel-mill-putaway").addEventListener("click", () => {
   document.querySelector("#mill-putaway-dialog").close();
+});
+
+document.querySelector("#storage-send-to-pool-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const palletId = document.querySelector("#storage-send-to-pool-pallet-id").value;
+  const slot = Number(document.querySelector("#storage-send-to-pool-slot").value);
+  if (!Number.isInteger(slot) || slot < 1 || slot > board.settings.pool_slot_count) {
+    showToast(`Enter a pool position from 1 to ${board.settings.pool_slot_count}.`, "error");
+    return;
+  }
+  document.querySelector("#storage-send-to-pool-dialog").close();
+  const name = palletById(palletId)?.name || "Pallet";
+  await mutate(`/api/pallets/${palletId}/move`, {
+    method: "POST",
+    body: JSON.stringify({
+      expected_revision: board.revision,
+      destination: "pool",
+      pool_slot_number: slot,
+    }),
+  }, `${name} was recorded in Pool ${String(slot).padStart(2, "0")}. No controller command was sent.`);
+});
+document.querySelector("#cancel-storage-send-to-pool").addEventListener("click", () => {
+  document.querySelector("#storage-send-to-pool-dialog").close();
 });
 
 document.addEventListener("click", event => {
@@ -991,7 +1068,11 @@ document.addEventListener("dragstart", event => {
   const card = event.target.closest(".pallet-card");
   if (!card) return;
   const pallet = palletById(card.dataset.palletId);
-  if (pallet?.location === "machine" || pallet?.location === "robot_held") {
+  if (
+    pallet?.location === "machine"
+    || pallet?.location === "robot_held"
+    || pallet?.id === board.robot_motion?.active?.pallet_id
+  ) {
     event.preventDefault();
     return;
   }

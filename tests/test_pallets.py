@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app import service
-from app.models import Pallet
+from app.models import Pallet, RobotMotion
 from app.pallet_names import PALLET_NAMES
 
 
@@ -305,6 +305,18 @@ def test_queue_machine_pool_and_storage_invariants(client: TestClient) -> None:
     assert stored["queue_position"] is None
 
     board = client.post(
+        f"/api/pallets/{second['id']}/move",
+        json={
+            "expected_revision": board["revision"],
+            "destination": "pool",
+            "pool_slot_number": 3,
+        },
+    ).json()
+    returned_from_storage = next(item for item in board["pallets"] if item["id"] == second["id"])
+    assert returned_from_storage["location"] == "pool"
+    assert returned_from_storage["pool_slot_number"] == 3
+
+    board = client.post(
         f"/api/pallets/{first['id']}/move",
         json={
             "expected_revision": board["revision"],
@@ -469,6 +481,52 @@ def test_queue_can_be_reordered(client: TestClient) -> None:
         key=lambda item: item["queue_position"],
     )
     assert [item["id"] for item in queue] == [second["id"], first["id"]]
+
+
+def test_queue_edits_allow_other_pallets_during_active_robot_motion(client: TestClient) -> None:
+    board = create_pallet(client, 0)
+    board = create_pallet(client, board["revision"])
+    first, second = board["pallets"]
+    board = client.post(
+        f"/api/pallets/{first['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    ).json()
+    with client.app.state.session_factory() as session:
+        session.add(RobotMotion(
+            id="queue-active-motion",
+            pallet_id=first["id"],
+            operation="pick",
+            source_slot=first["pool_slot_number"],
+            destination_slot=None,
+            program_path="/programs/pick.script",
+            status="running",
+            retry_count=0,
+            observed_busy=True,
+            created_at="2026-01-01T00:00:00+00:00",
+        ))
+        session.commit()
+
+    queued_other = client.post(
+        f"/api/pallets/{second['id']}/queue",
+        json={"expected_revision": board["revision"]},
+    )
+    assert queued_other.status_code == 200
+
+    blocked_active = client.delete(
+        f"/api/pallets/{first['id']}/queue?expected_revision={queued_other.json()['revision']}",
+    )
+    assert blocked_active.status_code == 409
+    assert "active robot movement" in blocked_active.json()["detail"]
+
+    blocked_reorder = client.put(
+        "/api/queue",
+        json={
+            "expected_revision": queued_other.json()["revision"],
+            "pallet_ids": [second["id"], first["id"]],
+        },
+    )
+    assert blocked_reorder.status_code == 409
+    assert "active robot movement" in blocked_reorder.json()["detail"]
 
 
 def test_only_pool_pallets_can_be_queued_and_dequeue_compacts(

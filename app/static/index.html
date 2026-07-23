@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260720-13">
-    <script src="/static/app.js?v=20260720-36" defer></script>
+    <script src="/static/app.js?v=20260723-01" defer></script>
   </head>
   <body class="schedule-page">
     <header class="topbar">
@@ -240,6 +240,27 @@
         <div class="dialog-actions">
           <button class="button ghost" id="cancel-mill-putaway" type="button">Cancel</button>
           <button class="button" type="submit">Unload and put away</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="storage-send-to-pool-dialog">
+      <form method="dialog" id="storage-send-to-pool-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Schedule update</p>
+            <h2>Move <span id="storage-send-to-pool-pallet-name"></span> to pool</h2>
+          </div>
+        </div>
+        <p id="storage-send-to-pool-suggestion"></p>
+        <p class="muted">This records the pallet in the selected pool position. It does not command Mongo or the mill.</p>
+        <input id="storage-send-to-pool-pallet-id" type="hidden">
+        <label>Pool position
+          <input id="storage-send-to-pool-slot" type="number" min="1" step="1" required>
+        </label>
+        <div class="dialog-actions">
+          <button class="button ghost" id="cancel-storage-send-to-pool" type="button">Cancel</button>
+          <button class="button" type="submit">Record in pool</button>
         </div>
       </form>
     </dialog>

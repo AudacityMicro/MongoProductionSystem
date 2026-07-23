@@ -349,9 +349,20 @@ try:
         message = channel.poll()
         if not message:
             break
-        kind, text = message
-        if not isinstance(text, str):
+        # PathPilot builds do not all return the same error-channel tuple
+        # shape. Keep the LinuxCNC kind and message, ignoring later metadata.
+        if isinstance(message, (tuple, list)):
+            if len(message) < 2:
+                continue
+            kind = message[0]
+            text = message[1]
+        else:
+            kind = None
+            text = message
+        if isinstance(text, bytes):
             text = text.decode("utf-8", "replace")
+        elif not isinstance(text, str):
+            text = str(text)
         messages.append({"kind": kind, "text": text, "is_error": kind in error_kinds})
 except Exception:
     pass
@@ -572,9 +583,20 @@ def read_errors():
         item = errors.poll()
         if not item:
             break
-        kind, text = item
-        if not isinstance(text, str):
+        # Some PathPilot versions append metadata to error-channel records.
+        # Do not let a diagnostic record break a program start that succeeded.
+        if isinstance(item, (tuple, list)):
+            if len(item) < 2:
+                continue
+            kind = item[0]
+            text = item[1]
+        else:
+            kind = None
+            text = item
+        if isinstance(text, bytes):
             text = text.decode("utf-8", "replace")
+        elif not isinstance(text, str):
+            text = str(text)
         messages.append({{"kind": kind, "text": text}})
     return messages
 
@@ -607,6 +629,12 @@ def read_hal_pin(name):
         "/home/operator/tmc/bin/halcmd", "getp", name,
     ]).strip().upper()
     return raw == "TRUE"
+
+def read_optional_hal_pin(name):
+    try:
+        return read_hal_pin(name)
+    except Exception:
+        return None
 
 def motion_lockout_active():
     return bool(
@@ -688,6 +716,7 @@ read_errors()
 # that UI state machine. Always release both momentary inputs afterward.
 set_hal_pin("halui.program.run", False)
 set_hal_pin("halui.mode.auto", False)
+run_pin_observed = False
 try:
     set_hal_pin("halui.mode.auto", True)
     auto_deadline = time.time() + 5.0
@@ -702,13 +731,22 @@ try:
     else:
         raise RuntimeError("PathPilot did not acknowledge the HALUI Auto-mode request.")
     set_hal_pin("halui.program.run", True)
-    time.sleep(0.1)
+    # PathPilot can return from a short generated program before stat().poll()
+    # sees a non-Idle interpreter. HALUI's running pin is independent evidence
+    # that Cycle Start was accepted. Older configurations may not expose it.
+    run_pin_deadline = time.time() + 0.5
+    while time.time() < run_pin_deadline:
+        if read_optional_hal_pin("halui.program.is-running") is True:
+            run_pin_observed = True
+            break
+        time.sleep(0.05)
 finally:
     set_hal_pin("halui.program.run", False)
     set_hal_pin("halui.mode.auto", False)
-# Accepting Cycle Start does not prove that execution began. Confirm a real
-# non-Idle transition before the scheduler is allowed to monitor completion.
-started = False
+# Accepting Cycle Start does not prove that execution began. Confirm either a
+# HALUI running-pin observation or a real non-Idle transition before the
+# scheduler is allowed to monitor completion.
+started = run_pin_observed
 start_deadline = time.time() + 5.0
 last_interp_state = None
 launch_messages = []
@@ -719,6 +757,8 @@ while time.time() < start_deadline:
     last_interp_state = getattr(status, "interp_state", None)
     if last_interp_state != linuxcnc.INTERP_IDLE:
         started = True
+        break
+    if run_pin_observed:
         break
     if getattr(status, "estop", False):
         raise RuntimeError("PathPilot entered E-stop before the program started.")
@@ -743,6 +783,7 @@ if not started:
 print("MONGO_CNC_RUN=" + json.dumps({{
     "accepted": True,
     "started": True,
+    "run_pin_observed": run_pin_observed,
     "filename": filename,
     "loaded_program": loaded_program,
     "interp_state": last_interp_state,

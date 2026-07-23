@@ -708,6 +708,8 @@ G20
 G90
 G53 G1 Z{z:.4f} F100.0
 G53 G1 X{x:.4f} Y{y:.4f} F100.0
+( Hold long enough for PathPilot remote status to observe this generated cycle. )
+G4 P1.0
 M30
 """
 
@@ -2850,60 +2852,91 @@ def _assert_no_locked_motion(session: Session) -> None:
     _assert_reliability_inactive(session)
 
 
+def _assert_queue_edit_allowed(session: Session, pallet_ids: set[str]) -> RobotMotion | None:
+    """Allow queue planning during motion without changing the motion's pallet."""
+    _assert_reliability_inactive(session)
+    motion = _locked_motion(session)
+    if motion and motion.pallet_id in pallet_ids:
+        raise problem(
+            409,
+            "The pallet assigned to the active robot movement cannot be changed in the Queue until that movement finishes.",
+        )
+    return motion
+
+
 def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail: str | None = None) -> None:
-    pallet = session.get(Pallet, motion.pallet_id)
-    if not pallet:
-        motion.status = "faulted"
-        motion.failure_detail = "The pallet was deleted while its robot movement was active."
-    elif success and motion.operation == "pick":
-        pallet.location = "robot_held"
-        pallet.pool_slot_number = None
-        pallet.return_pool_slot_number = motion.source_slot
-        motion.status = "succeeded"
-    elif success and motion.operation == "put":
-        pallet.location = "pool"
-        pallet.pool_slot_number = motion.destination_slot
-        pallet.return_pool_slot_number = None
-        motion.status = "succeeded"
-    elif success and motion.operation == "load_mill":
-        # Queue membership is virtual; a pallet leaves its run position only once it is in the mill.
-        if pallet.queue_position is not None:
-            pallet.queue_position = None
-            session.flush()
-            compact_queue(session, pallet.id)
-        pallet.location = "machine"
-        pallet.pool_slot_number = None
-        pallet.return_pool_slot_number = motion.source_slot or pallet.return_pool_slot_number
-        get_settings(session).machine_state = "running"
-        motion.status = "succeeded"
-    elif success and motion.operation == "unload_mill":
-        pallet.location = "pool"
-        pallet.pool_slot_number = motion.destination_slot
-        pallet.return_pool_slot_number = None
-        get_settings(session).machine_state = "idle"
-        motion.status = "succeeded"
-    else:
-        motion.status = "faulted"
-        motion.failure_detail = detail or "Robot motion failed. Inspect the cell and reconcile the pallet location."
-    motion.completed_at = datetime.now(timezone.utc).isoformat()
-    settings = get_settings(session)
-    bump(settings)
-    commit_or_conflict(session)
-    diagnostics().record(
-        "robot_motion",
-        "completed" if motion.status == "succeeded" else "faulted",
-        f"Robot motion {motion.operation} {motion.status}.",
-        severity="info" if motion.status == "succeeded" else "error",
-        details={
-            "motion_id": motion.id,
-            "pallet_id": motion.pallet_id,
-            "operation": motion.operation,
-            "source_slot": motion.source_slot,
-            "destination_slot": motion.destination_slot,
-            "retry_count": motion.retry_count,
-            "failure_detail": motion.failure_detail,
-        },
-    )
+    """Persist a confirmed physical result without discarding concurrent queue edits."""
+    motion_id = motion.id
+    for completion_attempt in range(3):
+        pallet = session.get(Pallet, motion.pallet_id)
+        if not pallet:
+            motion.status = "faulted"
+            motion.failure_detail = "The pallet was deleted while its robot movement was active."
+        elif success and motion.operation == "pick":
+            pallet.location = "robot_held"
+            pallet.pool_slot_number = None
+            pallet.return_pool_slot_number = motion.source_slot
+            motion.status = "succeeded"
+        elif success and motion.operation == "put":
+            pallet.location = "pool"
+            pallet.pool_slot_number = motion.destination_slot
+            pallet.return_pool_slot_number = None
+            motion.status = "succeeded"
+        elif success and motion.operation == "load_mill":
+            # Queue membership is virtual; a pallet leaves its run position only once it is in the mill.
+            if pallet.queue_position is not None:
+                pallet.queue_position = None
+                session.flush()
+                compact_queue(session, pallet.id)
+            pallet.location = "machine"
+            pallet.pool_slot_number = None
+            pallet.return_pool_slot_number = motion.source_slot or pallet.return_pool_slot_number
+            get_settings(session).machine_state = "running"
+            motion.status = "succeeded"
+        elif success and motion.operation == "unload_mill":
+            pallet.location = "pool"
+            pallet.pool_slot_number = motion.destination_slot
+            pallet.return_pool_slot_number = None
+            get_settings(session).machine_state = "idle"
+            motion.status = "succeeded"
+        else:
+            motion.status = "faulted"
+            motion.failure_detail = detail or "Robot motion failed. Inspect the cell and reconcile the pallet location."
+        motion.completed_at = datetime.now(timezone.utc).isoformat()
+        settings = get_settings(session)
+        bump(settings)
+        try:
+            commit_or_conflict(session)
+        except HTTPException as exc:
+            if exc.status_code != 409 or completion_attempt == 2:
+                raise
+            diagnostics().record(
+                "robot_motion",
+                "completion_commit_retry",
+                "Retrying a confirmed robot-motion completion after a concurrent schedule update.",
+                severity="warning",
+                details={"motion_id": motion_id, "attempt": completion_attempt + 1},
+            )
+            motion = session.get(RobotMotion, motion_id)
+            if not motion or motion.status not in {"requested", "running"}:
+                return
+            continue
+        diagnostics().record(
+            "robot_motion",
+            "completed" if motion.status == "succeeded" else "faulted",
+            f"Robot motion {motion.operation} {motion.status}.",
+            severity="info" if motion.status == "succeeded" else "error",
+            details={
+                "motion_id": motion.id,
+                "pallet_id": motion.pallet_id,
+                "operation": motion.operation,
+                "source_slot": motion.source_slot,
+                "destination_slot": motion.destination_slot,
+                "retry_count": motion.retry_count,
+                "failure_detail": motion.failure_detail,
+            },
+        )
+        return
 
 
 def start_robot_supervisor_listener(session: Session) -> None:
@@ -5588,10 +5621,10 @@ def queue_pallet(
 ) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    _assert_queue_edit_allowed(session, {pallet_id})
     assert_pallet_manageable_during_run(settings, pallet)
     if pallet.location == "machine":
         pool_slot = best_pool_return_slot(session, settings, pallet)
@@ -5629,10 +5662,10 @@ def dequeue_pallet(
 ) -> None:
     settings = get_settings(session)
     check_revision(settings, expected_revision)
-    _assert_no_locked_motion(session)
     pallet = session.get(Pallet, pallet_id)
     if not pallet:
         raise problem(404, "Pallet not found.")
+    _assert_queue_edit_allowed(session, {pallet_id})
     assert_pallet_manageable_during_run(settings, pallet)
     if pallet.queue_position is None:
         raise problem(409, "Pallet is not in the Queue.")
@@ -5646,7 +5679,7 @@ def dequeue_pallet(
 def reorder_queue(session: Session, payload: ReorderQueue) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    _assert_no_locked_motion(session)
+    _assert_reliability_inactive(session)
     queue = session.scalars(
         select(Pallet).where(Pallet.queue_position.is_not(None))
     ).all()
@@ -5654,6 +5687,18 @@ def reorder_queue(session: Session, payload: ReorderQueue) -> None:
         raise problem(422, "Queue contains duplicate pallet IDs.")
     if set(payload.pallet_ids) != {item.id for item in queue}:
         raise problem(422, "Queue reorder must contain every queued pallet exactly once.")
+    motion = _locked_motion(session)
+    if motion:
+        motion_pallet = next((item for item in queue if item.id == motion.pallet_id), None)
+        if (
+            motion_pallet is not None
+            and motion_pallet.queue_position is not None
+            and payload.pallet_ids[motion_pallet.queue_position] != motion.pallet_id
+        ):
+            raise problem(
+                409,
+                "The pallet assigned to the active robot movement must keep its current Queue position until that movement finishes.",
+            )
     if settings.run_mode_enabled:
         for item in queue:
             if item.location == "machine" and payload.pallet_ids[item.queue_position] != item.id:

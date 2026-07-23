@@ -287,6 +287,49 @@ def test_simulated_mill_transfer_moves_pool_pallet_to_machine_then_back(client: 
     assert moved["return_pool_slot_number"] is None
 
 
+def test_motion_completion_retries_after_concurrent_queue_edit(client: TestClient) -> None:
+    board = _create_pallet(client, 0)
+    board = _create_pallet(client, board["revision"])
+    motion_pallet, queued_pallet = board["pallets"]
+
+    with client.app.state.session_factory() as session:
+        session.add(service.RobotMotion(
+            id="completion-retry-motion",
+            pallet_id=motion_pallet["id"],
+            operation="pick",
+            source_slot=motion_pallet["pool_slot_number"],
+            destination_slot=None,
+            program_path="/programs/pick.script",
+            status="running",
+            retry_count=0,
+            observed_busy=True,
+            created_at="2026-01-01T00:00:00+00:00",
+        ))
+        session.commit()
+
+    worker_session = client.app.state.session_factory()
+    try:
+        motion = worker_session.get(service.RobotMotion, "completion-retry-motion")
+        service.get_settings(worker_session)  # Hold the stale revision a worker would have during motion.
+
+        queued = client.post(
+            f"/api/pallets/{queued_pallet['id']}/queue",
+            json={"expected_revision": board["revision"]},
+        )
+        assert queued.status_code == 200
+
+        service._finish_motion(worker_session, motion, True)
+    finally:
+        worker_session.close()
+
+    result = client.get("/api/board").json()
+    completed = next(item for item in result["pallets"] if item["id"] == motion_pallet["id"])
+    preserved_queue = next(item for item in result["pallets"] if item["id"] == queued_pallet["id"])
+    assert completed["location"] == "robot_held"
+    assert preserved_queue["queue_position"] == 0
+    assert result["robot_motion"]["history"][0]["status"] == "succeeded"
+
+
 def test_automatic_put_away_returns_machine_pallet_to_original_position(client: TestClient) -> None:
     board = _create_pallet(client, 0)
     pallet = board["pallets"][0]

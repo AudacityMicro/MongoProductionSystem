@@ -133,6 +133,15 @@ def test_health_and_pages(client: TestClient) -> None:
     assert "Close and relaunch" in settings_page
     assert "Workholding library" in settings_page
     assert 'id="workholding-options"' in schedule_page
+    schedule_script_response = client.get("/static/app.js")
+    assert schedule_script_response.headers["cache-control"] == "no-store, max-age=0"
+    schedule_script = schedule_script_response.text
+    assert "function reconcilePendingRunModeStart(nextBoard)" in schedule_script
+    assert "Run Mode did not start. The control is ready to try again." in schedule_script
+    assert 'cache: "no-store"' in schedule_script
+    assert "startLockCleared || nextBoardKey !== renderedBoardKey" in schedule_script
+    assert 'data-action="return-to-storage"' in schedule_script
+    assert "Move to pool" in schedule_script
 
 
 def test_cnc_debug_baseline(client: TestClient) -> None:
@@ -155,6 +164,7 @@ def test_mill_load_position_program_raises_z_before_xy() -> None:
     assert "G90" in program
     assert "G53 G1 Z0.0000 F100.0" in program
     assert "G53 G1 X0.0100 Y4.9000 F100.0" in program
+    assert "G4 P1.0" in program
     assert program.index("G53 G1 Z") < program.index("G53 G1 X")
     assert program.rstrip().endswith("M30")
 
@@ -181,6 +191,9 @@ def test_pathpilot_program_run_uses_halui_remote_start(monkeypatch) -> None:
     assert "command.auto(" not in captured["script"]
     assert 'set_hal_pin("halui.mode.auto", True)' in captured["script"]
     assert 'read_hal_pin("halui.mode.is-auto")' in captured["script"]
+    assert 'read_optional_hal_pin("halui.program.is-running")' in captured["script"]
+    assert "run_pin_observed = False" in captured["script"]
+    assert '"run_pin_observed": run_pin_observed' in captured["script"]
     assert 'set_hal_pin("halui.program.run", True)' in captured["script"]
     assert captured["script"].count('set_hal_pin("halui.program.run", False)') >= 2
     assert captured["script"].count('set_hal_pin("halui.mode.auto", False)') >= 2
@@ -191,6 +204,10 @@ def test_pathpilot_program_run_uses_halui_remote_start(monkeypatch) -> None:
     assert 'if last_interp_state != linuxcnc.INTERP_IDLE' in captured["script"]
     assert 'interpreter never left Idle' in captured["script"]
     assert "errors = linuxcnc.error_channel()" in captured["script"]
+    assert "if isinstance(item, (tuple, list)):" in captured["script"]
+    assert "kind = item[0]" in captured["script"]
+    assert "text = item[1]" in captured["script"]
+    assert "kind, text = item" not in captured["script"]
     assert '"task_mode=" + str(getattr(status, "task_mode", None))' in captured["script"]
     assert captured["marker"] == "MONGO_CNC_RUN="
     compile(captured["script"], "<pathpilot-run-script>", "exec")
