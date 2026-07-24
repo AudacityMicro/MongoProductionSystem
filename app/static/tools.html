@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#17211d">
+    <title>Tools | Mongo Production System</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260719-11">
+    <script src="/static/tools.js?v=20260715-3" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark">M</span><span>Mongo Production System</span></a>
+      <nav aria-label="Main navigation">
+        <a class="nav-link" href="/">Schedule</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link active" href="/tools">Tools</a>
+        <a class="nav-link" href="/debugging">Debugging</a>
+        <a class="nav-link hidden" data-robot-programs-nav href="/robot-programs">Robot Programs</a>
+        <a class="nav-link hidden" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
+        <a class="nav-link" href="/settings">Settings</a>
+      </nav>
+      <span class="system-state" id="system-state"><span class="state-light" aria-hidden="true"></span> Loading</span>
+    </header>
+    <main class="tools-page">
+      <section class="settings-heading"><p class="eyebrow">Mill tool management</p><h1>Tools</h1><p>Fusion 360 library data with the current ATC inventory.</p><div class="tool-color-legend" aria-label="Tool status colors"><span class="tool-status-atc">In ATC</span><span class="tool-status-measured">Measured, not in ATC</span><span class="tool-status-zero">Zero or no length</span></div></section>
+      <section class="atc-zone"><header class="zone-heading"><div><p class="section-number">Current machine</p><h2>ATC</h2></div><span class="zone-count" id="atc-count">0 tools</span></header><div class="atc-grid" id="atc-grid"></div></section>
+      <section class="tool-library-zone"><header class="zone-heading"><div><p class="section-number">Fusion 360 library</p><h2>Tool library</h2></div><div class="toolbar"><label>Sort <select id="tool-sort"><option value="number-asc">Tool number: low to high</option><option value="number-desc">Tool number: high to low</option><option value="description-asc">Description: A to Z</option></select></label><button class="button secondary" id="refresh-tools" type="button">Refresh</button></div></header><p class="notice hidden" id="tools-warning"></p><div class="tool-library-list" id="tool-library-list"></div></section>
+    </main>
+  </body>
+</html>

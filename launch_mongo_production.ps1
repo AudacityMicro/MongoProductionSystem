@@ -28,6 +28,41 @@ if ($userPath) {
 Remove-Item Env:Path -ErrorAction SilentlyContinue
 $env:Path = $cleanPath
 
+# Ask a healthy existing backend to close persistent robot sockets before it is
+# replaced. This also refuses a restart while robot motion or run mode is active.
+try {
+    $existingHealth = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 2
+    if ($existingHealth.status -eq "ok") {
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri "http://127.0.0.1:8000/api/system/prepare-shutdown" `
+            -ContentType "application/json" `
+            -Body "{}" `
+            -TimeoutSec 5 | Out-Null
+        Start-Sleep -Milliseconds 250
+    }
+} catch {
+    # No healthy backend is the normal first-launch case. If port 8000 is
+    # listening, preserve the error instead of force-killing an active motion.
+    $existingListener = & netstat.exe -ano -p tcp |
+        Select-String -Pattern '^\s*TCP\s+\S+:8000\s+\S+\s+LISTENING\s+\d+\s*$'
+    if ($existingListener) {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        if ($statusCode -eq 404) {
+            # One-time upgrade path from builds that predate prepare-shutdown.
+            $board = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/board" -TimeoutSec 5
+            if ($board.robot_motion.active -or $board.run_mode.enabled) {
+                throw "The older backend has an active robot operation and cannot be safely replaced."
+            }
+        } else {
+            throw "The existing backend could not prepare for a safe restart: $($_.Exception.Message)"
+        }
+    }
+}
+
 # Uvicorn can create a worker process on Windows, leaving the PID file pointing
 # at its venv parent. netstat reliably exposes the actual port owner here.
 $processIds = [System.Collections.Generic.HashSet[int]]::new()

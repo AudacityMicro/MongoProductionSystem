@@ -7,19 +7,31 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 
+def _configure_sqlite(connection, _record) -> None:
+    cursor = connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        # Board polling, diagnostics, and background control workers share one
+        # SQLite database. A longer wait avoids turning a brief WAL writer
+        # overlap into an operator-visible controller failure.
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA wal_autocheckpoint=1000")
+        cursor.execute("PRAGMA journal_size_limit=67108864")
+    finally:
+        cursor.close()
+
+
 def create_database_engine(database_url: str) -> Engine:
     engine = create_engine(
         database_url,
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False, "timeout": 30}
         if database_url.startswith("sqlite")
         else {},
     )
     if database_url.startswith("sqlite"):
-        event.listen(
-            engine,
-            "connect",
-            lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"),
-        )
+        event.listen(engine, "connect", _configure_sqlite)
     return engine
 
 
@@ -31,4 +43,3 @@ def run_migrations(database_url: str) -> None:
     config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
     command.upgrade(config, "head")
-

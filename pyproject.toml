@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
     "paramiko>=3.5,<4",
+    "python-multipart>=0.0.20,<1",
     "sqlalchemy>=2.0,<3",
     "UrRtde @ git+https://github.com/UniversalRobots/RTDE_Python_Client_Library.git@v2.7.12",
     "uvicorn[standard]>=0.34,<1",
