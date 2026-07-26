@@ -14,6 +14,7 @@ def mps_program(*tools: int, cycle_seconds: float = 60) -> str:
         f"(MPS-TOOLS:{','.join(str(tool) for tool in tools)})\n"
         f"(MPS-CYCLE-SECONDS:{cycle_seconds})\n"
         "(MPS-CYCLE-BASIS:FUSION-CUTTING-ESTIMATE)\n"
+        "(MPS-STATUS-FILE:/home/operator/gcode/MongoProduction/mill-status.txt)\n"
         "M30\n"
     )
 

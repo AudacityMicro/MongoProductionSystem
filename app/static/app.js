@@ -325,7 +325,7 @@ function renderBoard() {
     : emptyState("Picked pallets appear here");
 
   ui.storage.innerHTML = stored.length
-    ? stored.map(item => palletCard(item)).join("")
+    ? stored.map(item => `<div class="storage-position"><span class="storage-row-label">Stored</span>${palletCard(item)}</div>`).join("")
     : emptyState("Stored pallets appear here");
 
   document.querySelector("#queue-count").textContent = `${queue.length} pallet${queue.length === 1 ? "" : "s"}`;
@@ -462,7 +462,7 @@ function renderRunMode() {
   ui.runModeStatus.className = `run-mode-status ${escapeHtml(run.state || "idle")}`;
   const pallet = run.current_pallet_name ? ` · ${escapeHtml(run.current_pallet_name)}` : "";
   const showDetail = (
-    !run.enabled && ["faulted", "interrupted"].includes(run.state)
+    !run.enabled && ["faulted", "interrupted", "stopped"].includes(run.state)
   ) || [
     "telemetry_unavailable",
     "telemetry_restored",
@@ -474,6 +474,8 @@ function renderRunMode() {
   const machinePallet = board.pallets.find(item => item.location === "machine");
   const recoveryActions = showDetail && machinePallet?.return_pool_slot_number
     ? `<div class="run-mode-recovery-actions">
+        <button class="button secondary" type="button" data-recover-run-mode="rerun_assigned_program">Run assigned program again</button>
+        <button class="button secondary" type="button" data-recover-run-mode="manual_complete_and_unload">Mark complete and unload</button>
         <button class="button secondary" type="button" data-recover-run-mode="retry_robot_only">Retry robot unload only</button>
         <button class="button ghost" type="button" data-recover-run-mode="reposition_and_retry">Reposition mill, then retry</button>
       </div>`
@@ -514,7 +516,11 @@ ui.runModeStatus.addEventListener("click", async event => {
   const recoveryButton = event.target.closest("[data-recover-run-mode]");
   if (recoveryButton && board) {
     const strategy = recoveryButton.dataset.recoverRunMode;
-    const prompt = strategy === "retry_robot_only"
+    const prompt = strategy === "rerun_assigned_program"
+      ? "Run this pallet's assigned mill program again, then unload it and continue the queue?"
+      : strategy === "manual_complete_and_unload"
+        ? "Confirm the work is complete. The mill will move to its loading position, then Mongo will unload the pallet and continue the queue."
+      : strategy === "retry_robot_only"
       ? "Confirm the mill is still at its loading position. Retry only the robot unload?"
       : "Move the mill to its loading position again, then retry the robot unload?";
     if (!window.confirm(prompt)) return;

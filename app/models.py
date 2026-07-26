@@ -92,12 +92,8 @@ class AppSettings(Base):
     mill_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     mill_programs_filter_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     mill_editor_command: Mapped[str] = mapped_column(String(500), default="code")
-    mill_results_archiving_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    mill_results_source_path: Mapped[str] = mapped_column(
-        String(500), default="/home/operator/gcode/RESULTS.TXT"
-    )
-    mill_results_archive_directory: Mapped[str] = mapped_column(
-        String(500), default="/home/operator/gcode/results"
+    mill_status_file_path: Mapped[str] = mapped_column(
+        String(500), default="/home/operator/gcode/MongoProduction/mill-status.txt"
     )
     pool_location_positions: Mapped[str] = mapped_column(String, default="[]")
     on_deck_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')

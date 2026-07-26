@@ -142,6 +142,8 @@ def test_health_and_pages(client: TestClient) -> None:
     assert "startLockCleared || nextBoardKey !== renderedBoardKey" in schedule_script
     assert 'data-action="return-to-storage"' in schedule_script
     assert "Move to pool" in schedule_script
+    assert 'class="pool-position-list" id="pool-list"' in schedule_page
+    assert 'class="storage-position-list drop-target" id="storage-list"' in schedule_page
 
 
 def test_cnc_debug_baseline(client: TestClient) -> None:
@@ -934,6 +936,33 @@ def test_cnc_cycle_treats_alarm_as_failure_before_idle(client: TestClient, monke
         )
 
 
+def test_cnc_cycle_requires_status_record_before_completion(client: TestClient, monkeypatch) -> None:
+    telemetry = iter((
+        {"interp_state": 1, "enabled": True, "interpreter_error": 0},
+        {"interp_state": 2, "enabled": True},
+        {"interp_state": 1, "enabled": True},
+    ))
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_username = "operator"
+        settings.cnc_ssh_password = "secret"
+        session.commit()
+    monkeypatch.setattr(service, "run_linuxcnc_program", lambda *args: {"accepted": True, "started": True})
+    monkeypatch.setattr(service, "read_linuxcnc_cycle_state", lambda *args: next(telemetry))
+    monkeypatch.setattr(service, "_mill_status_record", lambda *_: (False, "missing COMPLETED record"))
+    monkeypatch.setattr(service.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(cnc_linuxcnc.CncProgramFault, match="missing COMPLETED record"):
+        service._run_cnc_cycle(
+            settings,
+            "/home/operator/gcode/Gcode/job.nc",
+            cycle_label="The assigned program",
+            completion_status={"program": "/home/operator/gcode/Gcode/job.nc", "previous_signature": None},
+        )
+
+
 def test_cnc_cycle_reports_pathpilot_motion_lockout() -> None:
     detail = service._cnc_cycle_fault_detail({
         "enabled": True,
@@ -1196,171 +1225,86 @@ def test_run_mode_retries_cnc_pre_dispatch_telemetry_without_starting_program(cl
     assert len(attempts) == 2
 
 
-def test_mill_results_archive_uses_program_name_and_utc_timestamp(client: TestClient, monkeypatch) -> None:
-    copied = {}
-    with client.app.state.session_factory() as session:
-        settings = service.get_settings(session)
-        settings.cnc_host = "tormach"
-        settings.cnc_ssh_password = "secret"
-        settings.mill_file_directory = "/home/operator/gcode"
-        settings.mill_results_source_path = "/home/operator/gcode/RESULTS.TXT"
-        settings.mill_results_archive_directory = "/home/operator/gcode/Results"
-        session.commit()
-
-    monkeypatch.setattr(
-        service,
-        "remote_file_signature",
-        lambda **kwargs: {"size": 20, "mtime": 2, "sha256": "new"},
-    )
-
-    def fake_copy(**kwargs):
-        copied.update(kwargs)
-        return f"{kwargs['destination_directory']}/{kwargs['destination_name']}"
-
-    monkeypatch.setattr(service, "copy_remote_file_as", fake_copy)
-    archived = service._archive_mill_results(
-        settings,
-        "customer/jobs/Op 1 - Top.nc",
-        {"size": 10, "mtime": 1, "sha256": "old"},
-    )
-
-    assert copied["source"] == "/home/operator/gcode/RESULTS.TXT"
-    assert copied["destination_directory"] == "/home/operator/gcode/Results"
-    assert copied["destination_name"].startswith("Op_1_-_Top__")
-    assert copied["destination_name"].endswith("Z__RESULTS.TXT")
-    assert archived == f"/home/operator/gcode/Results/{copied['destination_name']}"
-
-
-def test_mill_results_paths_allow_pathpilot_results_beside_gcode(client: TestClient) -> None:
+def test_mill_status_file_path_is_inside_pathpilot_data_root(client: TestClient) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
         settings.mill_file_directory = "/home/operator/gcode/Gcode"
-        settings.mill_results_source_path = "/home/operator/gcode/RESULTS.TXT"
-        settings.mill_results_archive_directory = "/home/operator/gcode/results"
-
-        assert service._mill_results_paths(settings) == (
-            "/home/operator/gcode/RESULTS.TXT",
-            "/home/operator/gcode/results",
-        )
-        assert service._mill_results_file_connection(settings)["directory"] == "/home/operator/gcode"
+        settings.mill_status_file_path = "/home/operator/gcode/MongoProduction/mill-status.txt"
+        assert service._mill_status_file_path(settings) == "/home/operator/gcode/MongoProduction/mill-status.txt"
+        assert service._mill_status_file_connection(settings)["directory"] == "/home/operator/gcode"
 
 
-def test_mill_results_archive_skips_unchanged_file(client: TestClient, monkeypatch) -> None:
-    signature = {"size": 20, "mtime": 2, "sha256": "same"}
+def test_mill_status_record_requires_fresh_matching_completion(client: TestClient, monkeypatch) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
-    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: signature)
-
-    assert service._archive_mill_results(settings, "job.nc", signature) is None
-
-
-def test_run_mode_machine_cycle_archives_fresh_results(client: TestClient, monkeypatch) -> None:
-    signatures = iter((
-        {"size": 10, "mtime": 1, "sha256": "before"},
-        {"size": 20, "mtime": 2, "sha256": "after"},
-    ))
-    copied = []
-    with client.app.state.session_factory() as session:
-        settings = service.get_settings(session)
-        settings.run_mode_enabled = True
-        settings.robot_connection_mode = "physical"
         settings.cnc_host = "tormach"
         settings.cnc_ssh_password = "secret"
-        settings.mill_results_archiving_enabled = True
-        pallet = Pallet(
-            id="results-cycle-pallet",
-            name="Results Cycle",
-            workholding="Fixture",
-            weight_kg=1.0,
-            content_status="raw_stock",
-            program_path="parts/finish.nc",
-            location="machine",
-        )
-        session.add(pallet)
         session.commit()
-
-    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: next(signatures))
-    monkeypatch.setattr(service, "_run_mode_cnc_cycle", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: {"size": 22, "mtime": 2, "sha256": "new"})
     monkeypatch.setattr(
         service,
-        "copy_remote_file_as",
-        lambda **kwargs: copied.append(kwargs) or f"{kwargs['destination_directory']}/{kwargs['destination_name']}",
+        "read_robot_file",
+        lambda **kwargs: {"text": "VERSION:MPS-MILL-STATUS-V1\nPROGRAM:finish.nc\nSTATE:STARTED\nSTATE:COMPLETED\n"},
     )
+    assert service._mill_status_record(settings, "/home/operator/gcode/Gcode/finish.nc", {"size": 1}) == (True, "")
 
-    completed = service._run_mode_machine_cycle(client.app.state.session_factory, pallet.id)
 
-    assert completed is True
-    assert len(copied) == 1
-    assert copied[0]["destination_name"].startswith("finish__")
+def test_mill_status_record_rejects_stale_or_wrong_program(client: TestClient, monkeypatch) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
-        assert settings.run_mode_state == "results_archived"
-        assert "finish__" in settings.run_mode_detail
-
-
-def test_unchanged_results_do_not_create_run_mode_alert(client: TestClient, monkeypatch) -> None:
-    signature = {"size": 20, "mtime": 2, "sha256": "same"}
-    with client.app.state.session_factory() as session:
-        settings = service.get_settings(session)
-        settings.run_mode_enabled = True
-        settings.robot_connection_mode = "physical"
         settings.cnc_host = "tormach"
         settings.cnc_ssh_password = "secret"
-        settings.mill_results_archiving_enabled = True
-        pallet = Pallet(
-            id="unchanged-results-pallet",
-            name="Unchanged Results",
-            workholding="Fixture",
-            weight_kg=1.0,
-            content_status="raw_stock",
-            program_path="finish.nc",
-            location="machine",
-        )
-        session.add(pallet)
         session.commit()
-
+    signature = {"size": 22, "mtime": 2, "sha256": "same"}
     monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: signature)
-    monkeypatch.setattr(service, "_run_mode_cnc_cycle", lambda *args, **kwargs: True)
-
-    assert service._run_mode_machine_cycle(client.app.state.session_factory, pallet.id) is True
-    board = client.get("/api/board").json()
-    assert board["run_mode"]["enabled"] is True
-    assert board["run_mode"]["state"] == "results_unchanged"
-    assert board["run_mode"]["alert"] is None
+    complete, detail = service._mill_status_record(settings, "/home/operator/gcode/Gcode/finish.nc", signature)
+    assert not complete
+    assert "did not change" in detail
 
 
-def test_results_archive_failure_alerts_without_stopping_run_mode(client: TestClient, monkeypatch) -> None:
+def test_mill_status_record_accepts_fresh_legacy_doubled_path(client: TestClient, monkeypatch) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
-        settings.run_mode_enabled = True
-        settings.robot_connection_mode = "physical"
         settings.cnc_host = "tormach"
         settings.cnc_ssh_password = "secret"
-        settings.mill_results_archiving_enabled = True
-        pallet = Pallet(
-            id="missing-results-pallet",
-            name="Missing Results",
-            workholding="Fixture",
-            weight_kg=1.0,
-            content_status="raw_stock",
-            program_path="finish.nc",
-            location="machine",
-        )
-        session.add(pallet)
         session.commit()
 
-    monkeypatch.setattr(service, "remote_file_signature", lambda **kwargs: None)
-    monkeypatch.setattr(service, "_run_mode_cnc_cycle", lambda *args, **kwargs: True)
+    def signature(**kwargs):
+        if "/home/operator/gcode/home/operator/gcode/" in kwargs["path"]:
+            return {"size": 22, "mtime": 2, "sha256": "new"}
+        return None
 
-    assert service._run_mode_machine_cycle(client.app.state.session_factory, pallet.id) is True
-    board = client.get("/api/board").json()
-    assert board["run_mode"]["enabled"] is True
-    assert board["run_mode"]["state"] == "results_archive_warning"
-    assert "Production continued normally" in board["run_mode"]["alert"]
+    monkeypatch.setattr(service, "remote_file_signature", signature)
+    monkeypatch.setattr(
+        service,
+        "read_robot_file",
+        lambda **kwargs: {"text": "VERSION:MPS-MILL-STATUS-V1\nPROGRAM:finish.nc\nSTATE:STARTED\nSTATE:COMPLETED\n"},
+    )
+    complete, detail = service._mill_status_record(
+        settings,
+        "/home/operator/gcode/Gcode/finish.nc",
+        None,
+        {"size": 1, "mtime": 1, "sha256": "old"},
+    )
+    assert complete
+    assert "legacy" in detail
 
-    dismissed = client.post("/api/run-mode/alert/dismiss", json={}).json()
-    assert dismissed["run_mode"]["alert"] is None
-    assert dismissed["run_mode"]["enabled"] is True
+
+def test_mill_status_file_access_creates_reads_and_removes_temporary_file(client: TestClient, monkeypatch) -> None:
+    calls = []
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_password = "secret"
+        session.commit()
+    monkeypatch.setattr(service, "write_robot_text_file", lambda **kwargs: calls.append(("write", kwargs)) or kwargs["path"])
+    monkeypatch.setattr(service, "read_robot_file", lambda **kwargs: {"text": calls[0][1]["text"]})
+    monkeypatch.setattr(service, "delete_robot_path", lambda **kwargs: calls.append(("delete", kwargs)))
+
+    result = service.test_mill_status_file_access(settings)
+
+    assert result["path"].endswith("MongoProduction/mill-status.txt")
+    assert [call[0] for call in calls] == ["write", "delete"]
 
 
 def test_stale_run_mode_fault_can_be_cleared_without_changing_queue(client: TestClient) -> None:

@@ -61,9 +61,9 @@ const ui = {
   millProgramsFilterEnabled: document.querySelector("#mill-programs-filter-enabled"),
   millProgramsPageEnabled: document.querySelector("#mill-programs-page-enabled"),
   millEditorCommand: document.querySelector("#mill-editor-command"),
-  millResultsArchivingEnabled: document.querySelector("#mill-results-archiving-enabled"),
-  millResultsSourcePath: document.querySelector("#mill-results-source-path"),
-  millResultsArchiveDirectory: document.querySelector("#mill-results-archive-directory"),
+  millStatusFilePath: document.querySelector("#mill-status-file-path"),
+  testMillStatusFile: document.querySelector("#test-mill-status-file"),
+  millStatusFileTestStatus: document.querySelector("#mill-status-file-test-status"),
   palletMotionEnabled: document.querySelector("#pallet-motion-enabled"),
   palletMotionTimeoutSeconds: document.querySelector("#pallet-motion-timeout-seconds"),
   palletMotionApproachYClearance: document.querySelector("#pallet-motion-approach-y-clearance"),
@@ -600,9 +600,7 @@ function settingsDraft() {
     mill_programs_filter_enabled: ui.millProgramsFilterEnabled.checked,
     mill_programs_page_enabled: ui.millProgramsPageEnabled.checked,
     mill_editor_command: ui.millEditorCommand.value.trim() || "code",
-    mill_results_archiving_enabled: ui.millResultsArchivingEnabled.checked,
-    mill_results_source_path: ui.millResultsSourcePath.value.trim() || "/home/operator/gcode/RESULTS.TXT",
-    mill_results_archive_directory: ui.millResultsArchiveDirectory.value.trim() || "/home/operator/gcode/results",
+    mill_status_file_path: ui.millStatusFilePath.value.trim() || "/home/operator/gcode/MongoProduction/mill-status.txt",
     pallet_motion_enabled: ui.palletMotionEnabled.checked,
     pallet_motion_timeout_seconds: fieldNumber(ui.palletMotionTimeoutSeconds, 120),
     pallet_motion_generation: {
@@ -723,9 +721,7 @@ async function loadSettings() {
     ui.millProgramsFilterEnabled.checked = board.settings.mill_programs_filter_enabled;
     ui.millProgramsPageEnabled.checked = board.settings.mill_programs_page_enabled;
     ui.millEditorCommand.value = board.settings.mill_editor_command || "code";
-    ui.millResultsArchivingEnabled.checked = board.settings.mill_results_archiving_enabled !== false;
-    ui.millResultsSourcePath.value = board.settings.mill_results_source_path || "/home/operator/gcode/RESULTS.TXT";
-    ui.millResultsArchiveDirectory.value = board.settings.mill_results_archive_directory || "/home/operator/gcode/results";
+    ui.millStatusFilePath.value = board.settings.mill_status_file_path || "/home/operator/gcode/MongoProduction/mill-status.txt";
     renderMotionChannelOptions();
     ui.palletMotionEnabled.checked = board.settings.pallet_motion_enabled;
     ui.palletMotionTimeoutSeconds.value = board.settings.pallet_motion_timeout_seconds || 120;
@@ -859,6 +855,26 @@ ui.testCncTelemetry.addEventListener("click", async () => {
   } finally {
     ui.testCncTelemetry.disabled = false;
     ui.testCncTelemetry.textContent = originalLabel;
+  }
+});
+
+ui.testMillStatusFile.addEventListener("click", async () => {
+  const originalLabel = ui.testMillStatusFile.textContent;
+  ui.testMillStatusFile.disabled = true;
+  ui.testMillStatusFile.textContent = "Testing...";
+  ui.millStatusFileTestStatus.textContent = "Creating and reading a temporary status-file check...";
+  try {
+    if (hasUnsavedChanges()) {
+      ui.millStatusFileTestStatus.textContent = "Save Settings first so the test uses the displayed status-file path.";
+      return;
+    }
+    const result = await api("/api/debug/cnc/status-file-test", {method: "POST"});
+    ui.millStatusFileTestStatus.textContent = `${result.message} ${result.path}`;
+  } catch (error) {
+    ui.millStatusFileTestStatus.textContent = error.message;
+  } finally {
+    ui.testMillStatusFile.disabled = false;
+    ui.testMillStatusFile.textContent = originalLabel;
   }
 });
 
