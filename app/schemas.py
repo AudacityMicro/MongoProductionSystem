@@ -301,7 +301,9 @@ class ConfirmRunModeAction(RevisionRequest):
 
 
 class RecoverRunMode(RevisionRequest):
-    strategy: Literal["retry_robot_only", "reposition_and_retry"]
+    strategy: Literal[
+        "retry_robot_only", "reposition_and_retry", "rerun_assigned_program", "manual_complete_and_unload",
+    ]
 
 
 class SettingsUpdate(RevisionRequest):
@@ -367,9 +369,7 @@ class SettingsUpdate(RevisionRequest):
     mill_programs_page_enabled: bool | None = None
     mill_programs_filter_enabled: bool | None = None
     mill_editor_command: str | None = Field(default=None, max_length=500)
-    mill_results_archiving_enabled: bool | None = None
-    mill_results_source_path: str | None = Field(default=None, max_length=500)
-    mill_results_archive_directory: str | None = Field(default=None, max_length=500)
+    mill_status_file_path: str | None = Field(default=None, max_length=500)
 
     @field_validator("robot_host", "robot_supervisor_hostname", "robot_supervisor_listen_host")
     @classmethod
@@ -378,7 +378,7 @@ class SettingsUpdate(RevisionRequest):
 
     @field_validator(
         "robot_file_host", "robot_file_username", "robot_file_directory", "cnc_host", "cnc_ssh_username",
-        "mill_file_directory", "mill_results_source_path", "mill_results_archive_directory",
+        "mill_file_directory", "mill_status_file_path",
     )
     @classmethod
     def strip_robot_file_text(cls, value: str | None) -> str | None:

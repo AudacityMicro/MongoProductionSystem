@@ -172,23 +172,19 @@ For each pallet, the controller sequence is:
 
 1. Run `mongo_mill_load_position.nc` on PathPilot and wait for Idle.
 2. Run the pool-pick script followed by `load_mill.script` on Mongo.
-3. Run the pallet's assigned PathPilot program and wait for Idle.
-4. If `RESULTS.TXT` changed during the cycle, archive it with the program name
-   and a UTC timestamp. An unchanged file is skipped normally; missing results
-   or archive failures alert the operator without stopping the pallet workflow.
-5. Run `mongo_mill_load_position.nc` again and wait for Idle.
-6. Run `unload_mill.script` followed by the original pool-position put script.
-7. Mark the pallet complete, return it to its pool position, and advance.
+3. Run the pallet's assigned PathPilot program and wait for both PathPilot Idle
+   and a fresh matching `COMPLETED` record in the dedicated mill status file.
+4. Run `mongo_mill_load_position.nc` again and wait for Idle.
+5. Run `unload_mill.script` followed by the original pool-position put script.
+6. Mark the pallet complete, return it to its pool position, and advance.
 
-PathPilot program monitoring does not treat Idle alone as success. An E-stop,
-disabled control, LinuxCNC execution/interpreter error, or alarm/error message
-pauses the queue before the pallet is moved or marked complete. The operator is
-prompted to clear and inspect the mill and either retry that same program or
-stop Run Mode with the pallet left in its current physical position.
-
-The RESULTS.TXT source and archive directory are configured under Mill Programs
-in Settings. Both paths must remain inside the configured PathPilot program
-directory; the archive directory is created automatically.
+PathPilot program monitoring does not treat Idle alone as success. The updated
+Fusion post writes `/home/operator/gcode/MongoProduction/mill-status.txt` with
+`STARTED` and then `COMPLETED` only at normal program end. An E-stop, alarm,
+manual stop, missing record, wrong-program record, or unreadable status file
+pauses the queue before the pallet is moved or marked complete. The operator
+can rerun the assigned program, confirm manual completion and unload, or leave
+the pallet in the mill.
 
 When action confirmation is enabled, the operator must approve loading,
 machining, and unloading. Stopping Run Mode prevents the next workflow step;

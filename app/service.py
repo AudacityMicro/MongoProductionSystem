@@ -43,12 +43,13 @@ from app.robot_dashboard import (
 )
 from app.robot_files import (
     RobotFileAccessError,
-    copy_remote_file_as,
+    delete_robot_path,
     list_robot_program_files,
     read_robot_file,
     read_robot_file_prefix,
     remote_file_signature,
     upload_robot_file,
+    write_robot_text_file,
 )
 from app.robot_scripts import (
     PALLET_MOTION_SCRIPT_REVISION,
@@ -742,25 +743,20 @@ def _pathpilot_controller_data_root(settings: AppSettings) -> PurePosixPath:
     program_root = PurePosixPath(settings.mill_file_directory)
     if not program_root.is_absolute() or ".." in program_root.parts:
         raise problem(422, "The PathPilot program directory must be an absolute path without '..'.")
-    # PathPilot stores RESULTS.TXT and its standard results directory beside
-    # Gcode, not inside it. Permit that controller data root only.
     return program_root.parent if program_root.name.casefold() == "gcode" else program_root
 
 
-def _mill_results_paths(settings: AppSettings) -> tuple[str, str]:
+def _mill_status_file_path(settings: AppSettings) -> str:
     controller_root = _pathpilot_controller_data_root(settings)
-    source = PurePosixPath(settings.mill_results_source_path)
-    archive = PurePosixPath(settings.mill_results_archive_directory)
-    for path, label in ((source, "RESULTS.TXT source"), (archive, "results archive directory")):
-        if (
-            not path.is_absolute()
-            or ".." in path.parts
-            or path.parts[:len(controller_root.parts)] != controller_root.parts
-        ):
-            raise problem(422, f"The {label} must remain inside the PathPilot controller data directory.")
-    if source == archive:
-        raise problem(422, "The RESULTS.TXT source and archive directory must be different paths.")
-    return str(source), str(archive)
+    path = PurePosixPath(settings.mill_status_file_path)
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or path.parts[:len(controller_root.parts)] != controller_root.parts
+        or path == controller_root
+    ):
+        raise problem(422, "The mill completion status file must remain inside the PathPilot controller data directory.")
+    return str(path)
 
 
 def _mill_file_connection(settings: AppSettings) -> dict[str, object]:
@@ -774,34 +770,93 @@ def _mill_file_connection(settings: AppSettings) -> dict[str, object]:
     }
 
 
-def _mill_results_file_connection(settings: AppSettings) -> dict[str, object]:
+def _mill_status_file_connection(settings: AppSettings) -> dict[str, object]:
     connection = _mill_file_connection(settings)
     connection["directory"] = str(_pathpilot_controller_data_root(settings))
     return connection
 
 
-def _archive_mill_results(
-    settings: AppSettings,
-    program_path: str,
-    previous_signature: dict[str, int | str] | None,
-) -> tuple[bool, str | None]:
-    source, archive_directory = _mill_results_paths(settings)
-    connection = _mill_results_file_connection(settings)
-    current_signature = remote_file_signature(path=source, **connection)
-    if current_signature is None:
-        raise problem(409, f"PathPilot did not create {source} for {program_path}.")
-    if current_signature == previous_signature:
-        return None
+def _legacy_mill_status_file_path(settings: AppSettings, status_path: str | None = None) -> str:
+    """Return the accidental doubled path emitted by the first status-file post."""
+    path = PurePosixPath(status_path or _mill_status_file_path(settings))
+    return str(PurePosixPath(_pathpilot_controller_data_root(settings)) / path.relative_to("/"))
 
-    program_name = re.sub(r"[^A-Za-z0-9._-]+", "_", PurePosixPath(program_path).stem).strip("._-") or "program"
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    archive_name = f"{program_name}__{timestamp}__RESULTS.TXT"
-    return copy_remote_file_as(
-        source=source,
-        destination_directory=archive_directory,
-        destination_name=archive_name,
-        **connection,
-    )
+
+def _mill_status_record(
+    settings: AppSettings,
+    expected_program: str,
+    previous_signature: dict[str, int | str] | None,
+    previous_legacy_signature: dict[str, int | str] | None = None,
+) -> tuple[bool, str]:
+    """Return whether the post has freshly acknowledged normal completion."""
+    path = _mill_status_file_path(settings)
+    connection = _mill_status_file_connection(settings)
+    signature = remote_file_signature(path=path, **connection)
+    selected_path = path
+    selected_signature = signature
+    selected_previous_signature = previous_signature
+    legacy_path = _legacy_mill_status_file_path(settings, path)
+    if signature is None or signature == previous_signature:
+        legacy_signature = remote_file_signature(path=legacy_path, **connection)
+        if (
+            previous_legacy_signature is not None
+            and legacy_signature is not None
+            and legacy_signature != previous_legacy_signature
+        ):
+            selected_path = legacy_path
+            selected_signature = legacy_signature
+            selected_previous_signature = previous_legacy_signature
+        elif signature is None:
+            return False, "The mill completion status file has not been created. Repost this program with the updated Fusion post."
+        else:
+            return False, "The mill completion status file did not change for this program."
+    if selected_signature == selected_previous_signature:
+        return False, "The mill completion status file did not change for this program."
+    try:
+        text = str(read_robot_file(path=selected_path, **connection).get("text") or "")
+    except RobotFileAccessError as exc:
+        return False, f"The mill completion status file could not be read: {exc}"
+    fields: dict[str, str] = {}
+    states: list[str] = []
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip().upper()
+        value = value.strip()
+        if key == "STATE":
+            states.append(value.upper())
+        else:
+            fields[key] = value
+    expected_name = PurePosixPath(expected_program).name
+    if fields.get("VERSION") != "MPS-MILL-STATUS-V1":
+        return False, "The mill completion status file has an unsupported format. Repost the program with the updated Fusion post."
+    if fields.get("PROGRAM") != expected_name:
+        return False, f"The mill completion status file identifies {fields.get('PROGRAM') or 'no program'}, not {expected_name}."
+    if not states or states[0] != "STARTED" or states[-1] != "COMPLETED":
+        return False, "The mill program did not report a normal completed status."
+    if selected_path == legacy_path:
+        return True, "Completion was read from the legacy doubled status-file path. Repost this program with the corrected Fusion post."
+    return True, ""
+
+
+def test_mill_status_file_access(settings: AppSettings) -> dict[str, str]:
+    """Verify the dedicated application folder without touching production status."""
+    path = PurePosixPath(_mill_status_file_path(settings))
+    connection = _mill_status_file_connection(settings)
+    test_path = str(path.parent / ".mps-status-connection-test.txt")
+    token = str(uuid4())
+    try:
+        write_robot_text_file(path=test_path, text=token, **connection)
+        observed = str(read_robot_file(path=test_path, **connection).get("text") or "")
+        if observed != token:
+            raise RobotFileAccessError("The controller returned different content than was written.")
+    finally:
+        try:
+            delete_robot_path(path=test_path, **connection)
+        except RobotFileAccessError:
+            pass
+    return {"path": str(path), "message": "Mill status-file folder is writable and readable."}
 
 
 def _serialize_motion(motion: RobotMotion, pallet: Pallet | None = None) -> dict:
@@ -1092,9 +1147,7 @@ def board_snapshot(session: Session) -> dict:
             "mill_programs_page_enabled": settings.mill_programs_page_enabled,
             "mill_programs_filter_enabled": settings.mill_programs_filter_enabled,
             "mill_editor_command": settings.mill_editor_command,
-            "mill_results_archiving_enabled": settings.mill_results_archiving_enabled,
-            "mill_results_source_path": settings.mill_results_source_path,
-            "mill_results_archive_directory": settings.mill_results_archive_directory,
+            "mill_status_file_path": settings.mill_status_file_path,
             "fusion_tool_library_path": settings.fusion_tool_library_path,
             "fusion_tool_libraries": [{"path": path, "name": Path(path).name} for path in fusion_tool_library_paths(settings)],
         },
@@ -2066,7 +2119,11 @@ def robot_io_snapshot(session: Session) -> dict:
     summary = _board_summary(settings, pallets)
 
     if settings.robot_connection_mode == "physical":
-        if settings.robot_supervisor_enabled:
+        # The CB-series Primary stream can block URControl when a lossy link
+        # stops draining high-rate packets. Once the app listener is available,
+        # reserve controller telemetry for the compact robot-originated channel
+        # instead of repeatedly opening another legacy stream from the UI.
+        if settings.robot_supervisor_enabled or robot_supervisor().status().get("listening"):
             return _supervisor_robot_snapshot(settings, summary)
         if not settings.robot_host.strip():
             return {
@@ -4332,8 +4389,12 @@ def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> 
     if motion_scripts_need_rebuild(settings):
         raise problem(409, "Generated robot scripts do not match Settings. Rebuild them before starting run mode.")
     _assert_mill_load_position_program_current(settings)
-    if settings.mill_results_archiving_enabled:
-        _mill_results_paths(settings)
+    _mill_status_file_path(settings)
+    if settings.robot_connection_mode == "physical":
+        try:
+            test_mill_status_file_access(settings)
+        except RobotFileAccessError as exc:
+            raise problem(409, f"The dedicated mill completion status file is not accessible: {exc}") from exc
 
     required_local_scripts = {"load_mill.script", "unload_mill.script"}
     for pallet in queue:
@@ -4553,6 +4614,7 @@ def _run_cnc_cycle(
     timeout_seconds: float = _CNC_LONG_CYCLE_MAXIMUM_SECONDS,
     continue_check=None,
     status_report=None,
+    completion_status: dict[str, object] | None = None,
 ) -> bool:
     """Run one PathPilot program and wait for LinuxCNC to return to Idle."""
     if settings.robot_connection_mode == "simulated":
@@ -4653,6 +4715,15 @@ def _run_cnc_cycle(
         if interpreter_state != 1:
             saw_running = True
         elif saw_running:
+            if completion_status:
+                complete, detail = _mill_status_record(
+                    settings,
+                    str(completion_status["program"]),
+                    completion_status.get("previous_signature"),
+                    completion_status.get("previous_legacy_signature"),
+                )
+                if not complete:
+                    raise CncProgramFault(f"{cycle_label} returned to Idle without a valid completion record: {detail}")
             diagnostics().record(
                 "run_mode",
                 "cnc_cycle_completed",
@@ -4722,6 +4793,7 @@ def _run_mode_cnc_cycle(
     cycle_label: str,
     timeout_seconds: float = _CNC_LONG_CYCLE_MAXIMUM_SECONDS,
     run_token: str | None = None,
+    completion_status: dict[str, object] | None = None,
 ) -> bool:
 
     def run_mode_is_enabled() -> bool:
@@ -4753,6 +4825,7 @@ def _run_mode_cnc_cycle(
                 timeout_seconds=timeout_seconds,
                 continue_check=run_mode_is_enabled,
                 status_report=report_observation_state,
+                completion_status=completion_status,
             )
         except CncPreDispatchTelemetryError as exc:
             pre_dispatch_attempt += 1
@@ -4984,65 +5057,36 @@ def _run_mode_machine_cycle(session_factory, pallet_id: str, run_token: str | No
             pallet.program_path,
             set(json.loads(settings.mill_program_extensions)),
         )
-        archive_results = settings.robot_connection_mode == "physical" and settings.mill_results_archiving_enabled
-        results_before = None
-        if archive_results:
-            results_source, _ = _mill_results_paths(settings)
-            results_before = remote_file_signature(
-                path=results_source,
-                **_mill_results_file_connection(settings),
+        completion_status = None
+        if settings.robot_connection_mode == "physical":
+            metadata = read_assigned_program_metadata(settings, pallet.program_path)
+            expected_status_path = _mill_status_file_path(settings)
+            if metadata.get("mill_status_file") != expected_status_path:
+                raise problem(
+                    409,
+                    "The assigned program does not declare the configured mill completion status file. Repost it with the updated Fusion post.",
+                )
+            status_before = remote_file_signature(
+                path=expected_status_path,
+                **_mill_status_file_connection(settings),
             )
-        cycle_settings = settings
+            legacy_status_before = remote_file_signature(
+                path=_legacy_mill_status_file_path(settings, expected_status_path),
+                **_mill_status_file_connection(settings),
+            )
+            completion_status = {
+                "program": remote_program,
+                "previous_signature": status_before,
+                "previous_legacy_signature": legacy_status_before,
+            }
         pallet_name = pallet.name
-        program_path = pallet.program_path
-    completed = _run_mode_cnc_cycle(
+    return _run_mode_cnc_cycle(
         session_factory,
         remote_program,
         cycle_label=f"The assigned program for {pallet_name}",
         run_token=run_token,
+        completion_status=completion_status,
     )
-    if not completed or not archive_results:
-        return completed
-    with session_factory() as session:
-        settings = get_settings(session)
-        if not _run_mode_token_is_active(settings, run_token):
-            return False
-        _set_run_mode_status(
-            session,
-            "archiving_results",
-            f"Archiving RESULTS.TXT for {pallet_name}.",
-            pallet_id=pallet_id,
-        )
-        try:
-            archived_path = _archive_mill_results(cycle_settings, program_path, results_before)
-        except (HTTPException, RobotFileAccessError) as exc:
-            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            settings.run_mode_alert = (
-                f"{pallet_name} completed, but RESULTS.TXT was not archived: {detail}. "
-                "Production continued normally."
-            )
-            _set_run_mode_status(
-                session,
-                "results_archive_warning",
-                settings.run_mode_alert,
-                pallet_id=pallet_id,
-            )
-            return True
-        if archived_path is None:
-            _set_run_mode_status(
-                session,
-                "results_unchanged",
-                f"{PurePosixPath(results_source).name} was unchanged for {pallet_name}; no archive was needed.",
-                pallet_id=pallet_id,
-            )
-            return True
-        _set_run_mode_status(
-            session,
-            "results_archived",
-            f"Archived {PurePosixPath(archived_path).name} for {pallet_name}.",
-            pallet_id=pallet_id,
-        )
-    return True
 
 
 def dismiss_run_mode_alert(session: Session) -> None:
@@ -5114,6 +5158,10 @@ def start_run_mode_recovery(session: Session, payload) -> str:
         + (
             "retrying only the robot unload because the mill is already at its loading position."
             if payload.strategy == "retry_robot_only"
+            else "running the assigned mill program again before unloading."
+            if payload.strategy == "rerun_assigned_program"
+            else "marking the pallet complete after operator confirmation, then moving the mill to its loading position and unloading."
+            if payload.strategy == "manual_complete_and_unload"
             else "repositioning the mill, then retrying the robot unload."
         )
     )
@@ -5142,7 +5190,11 @@ def execute_run_mode_recovery(session_factory, run_token: str, strategy: str) ->
             pallet_name = pallet.name
             return_slot = pallet.return_pool_slot_number
 
-        if strategy == "reposition_and_retry":
+        if strategy == "rerun_assigned_program":
+            if not _run_mode_machine_cycle(session_factory, pallet_id, run_token):
+                return
+
+        if strategy in {"reposition_and_retry", "rerun_assigned_program", "manual_complete_and_unload"}:
             with session_factory() as session:
                 _set_run_mode_status(
                     session,
@@ -5919,14 +5971,9 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.mill_programs_filter_enabled = payload.mill_programs_filter_enabled
     if payload.mill_editor_command is not None:
         settings.mill_editor_command = payload.mill_editor_command
-    if payload.mill_results_archiving_enabled is not None:
-        settings.mill_results_archiving_enabled = payload.mill_results_archiving_enabled
-    if payload.mill_results_source_path is not None:
-        settings.mill_results_source_path = payload.mill_results_source_path
-    if payload.mill_results_archive_directory is not None:
-        settings.mill_results_archive_directory = payload.mill_results_archive_directory
-    if settings.mill_results_archiving_enabled:
-        _mill_results_paths(settings)
+    if payload.mill_status_file_path is not None:
+        settings.mill_status_file_path = payload.mill_status_file_path
+    _mill_status_file_path(settings)
     if payload.fusion_tool_library_path is not None:
         settings.fusion_tool_library_path = payload.fusion_tool_library_path
     if payload.workholding_library is not None:

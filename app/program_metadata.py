@@ -12,6 +12,7 @@ _CYCLE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _BASIS_RE = re.compile(r"^\s*\(\s*MPS-CYCLE-BASIS\s*:?\s*([^\r\n)]*)\)\s*$", re.IGNORECASE | re.MULTILINE)
+_STATUS_FILE_RE = re.compile(r"^\s*\(\s*MPS-STATUS-FILE\s*:?\s*([^\r\n)]*)\)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def unavailable_program_metadata(detail: str) -> dict[str, object]:
@@ -21,6 +22,7 @@ def unavailable_program_metadata(detail: str) -> dict[str, object]:
         "program_metadata_state": "unavailable",
         "program_metadata_detail": detail,
         "program_cycle_basis": None,
+        "mill_status_file": None,
     }
 
 
@@ -45,10 +47,12 @@ def parse_program_metadata(text: str) -> dict[str, object]:
         return unavailable_program_metadata("The MPS cycle-time estimate is outside the supported range.")
 
     basis_match = _BASIS_RE.search(text)
+    status_file_match = _STATUS_FILE_RE.search(text)
     return {
         "program_tools": [f"T{tool}" for tool in tools],
         "expected_cycle_seconds": int(math.ceil(cycle_seconds)),
         "program_metadata_state": "parsed",
         "program_metadata_detail": "Metadata read from the assigned G-code header.",
         "program_cycle_basis": basis_match.group(1).strip() if basis_match else None,
+        "mill_status_file": status_file_match.group(1).strip() if status_file_match else None,
     }

@@ -226,6 +226,40 @@ def upload_robot_file(
         raise
 
 
+def write_robot_text_file(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    directory: str,
+    path: str,
+    text: str,
+    timeout_seconds: float,
+) -> str:
+    """Write a small UTF-8 controller file, creating its parent directories."""
+    root = _root_path(directory)
+    target = _safe_path(root, path)
+    if target == root:
+        raise RobotFileAccessError("Choose a file path below the configured controller directory.")
+    try:
+        with robot_sftp_client(host, port, username, password, timeout_seconds) as sftp:
+            _ensure_remote_directory(sftp, root, target.parent)
+            temporary = target.with_name(f".{target.name}.tmp")
+            with sftp.open(str(temporary), "wb") as remote:
+                remote.write(text.encode("utf-8"))
+            try:
+                sftp.posix_rename(str(temporary), str(target))
+            except (AttributeError, OSError):
+                try:
+                    sftp.remove(str(target))
+                except OSError:
+                    pass
+                sftp.rename(str(temporary), str(target))
+            return str(target)
+    except RobotFileAccessError:
+        raise
+
+
 def _path_exists(sftp: paramiko.SFTPClient, path: PurePosixPath) -> bool:
     try:
         sftp.stat(str(path))

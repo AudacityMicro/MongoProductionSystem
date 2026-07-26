@@ -59,6 +59,7 @@ from app.service import (
     cnc_debug_snapshot,
     cnc_io_labels_snapshot,
     test_cnc_telemetry_connection,
+    test_mill_status_file_access,
     add_fusion_tool_library,
     dashboard_snapshot,
     tools_snapshot,
@@ -835,6 +836,10 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
             payload.password,
             payload.timeout_seconds,
         )
+
+    @application.post("/api/debug/cnc/status-file-test")
+    def test_cnc_status_file(session: Session = Depends(get_session)) -> dict:
+        return test_mill_status_file_access(get_settings(session))
 
     @application.post("/api/debug/io/toggle")
     def toggle_debug_io_value(

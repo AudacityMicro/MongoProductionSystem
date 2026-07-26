@@ -385,20 +385,16 @@
               <input id="mill-editor-command" maxlength="500" placeholder="code">
             </label>
             <fieldset class="location-fieldset">
-              <legend>Cycle results archive</legend>
-              <label class="checkbox-control">
-                <input id="mill-results-archiving-enabled" type="checkbox">
-                <span>Archive RESULTS.TXT after each pallet program<small>Unchanged files are skipped normally. Missing files or archive errors create a warning without stopping production.</small></span>
-              </label>
+              <legend>Production completion status</legend>
               <label>
-                RESULTS.TXT source path
-                <input id="mill-results-source-path" maxlength="500" placeholder="/home/operator/gcode/RESULTS.TXT">
+                Mill status-file path
+                <input id="mill-status-file-path" maxlength="500" placeholder="/home/operator/gcode/MongoProduction/mill-status.txt">
               </label>
-              <label>
-                Results archive directory
-                <input id="mill-results-archive-directory" maxlength="500" placeholder="/home/operator/gcode/results">
-              </label>
-              <p class="field-help">PathPilot normally writes <code>RESULTS.TXT</code> beside the <code>Gcode</code> folder. Both paths must stay inside the PathPilot controller data directory. Archives use <code>program__UTC-timestamp__RESULTS.TXT</code> filenames; the archive directory is created automatically.</p>
+              <div class="inline-actions">
+                <button class="button secondary" id="test-mill-status-file" type="button">Test status-file access</button>
+                <span class="field-help" id="mill-status-file-test-status" role="status" aria-live="polite"></span>
+              </div>
+              <p class="field-help">The updated Fusion post overwrites this dedicated file with <code>STARTED</code> and appends <code>COMPLETED</code> only at normal program end. Run Mode unloads only after this file and PathPilot both confirm completion.</p>
             </fieldset>
             <p class="field-help">Uses the PathPilot host, SSH port, username, password, and timeout above. All file operations stay inside this program directory. Default: <code>/home/operator/gcode/Gcode</code>.</p>
           </div>

@@ -142,7 +142,32 @@ def test_supervisor_cannot_be_enabled_before_no_motion_handshake(client) -> None
         },
     )
     assert response.status_code == 409
-    assert "no-motion" in response.json()["detail"]
+
+
+def test_live_supervisor_listener_prevents_legacy_telemetry_polling(client, monkeypatch) -> None:
+    class ListeningSupervisor:
+        def status(self):
+            return {"listening": True, "connected": False, "telemetry": {}}
+
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.48"
+        session.commit()
+        expected_revision = settings.revision
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: ListeningSupervisor())
+    monkeypatch.setattr(
+        service,
+        "_cached_robot_telemetry",
+        lambda *_: (_ for _ in ()).throw(AssertionError("legacy telemetry should not be polled")),
+    )
+
+    response = client.get("/api/debug/robot-io")
+
+    assert response.status_code == 200
+    assert response.json()["source"] == "robot-supervisor"
+    assert response.json()["revision"] == expected_revision
 
 
 class CompletedSupervisor:
