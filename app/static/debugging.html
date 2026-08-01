@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Debugging | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260720-12">
-    <script src="/static/debugging.js?v=20260720-22" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260726-08">
+    <script src="/static/popup.js?v=20260726-01" defer></script>
+    <script src="/static/debugging.js?v=20260726-13" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -37,10 +38,21 @@
       </section>
 
       <nav class="settings-category-nav debug-category-nav" aria-label="Debugging sections">
+        <a href="#debug-connections">Connections</a>
         <a href="#debug-system">System</a>
         <a href="#debug-robot">Robot</a>
         <a href="#debug-mill">Mill</a>
       </nav>
+
+      <section class="debug-category" id="debug-connections" aria-labelledby="debug-connections-title">
+        <header class="debug-category-heading">
+          <p>Cell status</p>
+          <h2 id="debug-connections-title">Connections</h2>
+          <span>Robot and mill transport state, command sequence alignment, and recovery controls.</span>
+          <button class="button secondary" id="debug-auto-recover" type="button">Auto recover</button>
+        </header>
+        <div class="debug-connection-deck" id="debug-connection-deck"></div>
+      </section>
 
       <section class="debug-category" id="debug-system" aria-labelledby="debug-system-title">
         <header class="debug-category-heading">
@@ -61,7 +73,6 @@
             <div><dt>Machine state</dt><dd id="debug-machine-state">Unknown</dd></div>
             <div><dt>Updated</dt><dd id="debug-timestamp">Unknown</dd></div>
           </dl>
-          <button class="secondary-action" id="retry-mongo-connection" type="button">Retry Mongo connection</button>
           <button class="secondary-action" id="clear-mongo-fault" type="button">Clear robot fault/error</button>
         </article>
 
@@ -80,8 +91,8 @@
         <article class="debug-overview-card">
           <p class="section-number">System 03</p>
           <h2>Network diagnostic</h2>
-          <p class="debug-digital-help">Runs 20 pings from this application computer to <code>8.8.8.8</code>. Use it to capture loss and latency during a connection problem.</p>
-          <button class="secondary-action" id="run-network-test" type="button">Run 20-packet test</button>
+          <p class="debug-digital-help">Tests Desktop-to-Mongo/Mill/Internet and Mill-to-Desktop/Mongo/Internet. Mongo's supervisor link is reported directly; UR controllers do not expose shell ICMP.</p>
+          <button class="secondary-action" id="run-network-test" type="button">Run network matrix</button>
           <div class="network-test-result" id="network-test-result" role="status">No test run yet.</div>
         </article>
 
@@ -113,9 +124,9 @@
           <p class="debug-digital-help">Mongo owns this TCP connection and reports sequenced atomic command events. An uncertain or latched command must be reconciled; it is never repeated through the legacy transport.</p>
           <div class="supervisor-status-grid" id="robot-supervisor-status-grid"></div>
           <div class="inline-actions">
-            <button class="button secondary" id="debug-supervisor-bootstrap" type="button">No-motion bootstrap</button>
-            <button class="button secondary" id="debug-supervisor-maintenance" type="button">Enter Maintenance Mode</button>
+             <button class="button secondary" id="debug-supervisor-maintenance" type="button">Enter Maintenance Mode</button>
             <button class="button secondary" id="debug-supervisor-clear-latch" type="button">Clear reconciled latch</button>
+            <a class="button secondary" href="/api/debug/robot-supervisor/status-document" target="_blank" rel="noopener">Open robot status document</a>
           </div>
           <div class="network-test-result" id="robot-supervisor-detail" role="status">Loading supervisor status...</div>
           <div class="debug-table-shell">
@@ -373,6 +384,12 @@
           </div>
         </header>
         <p class="debug-digital-help" id="cnc-notes">Loading CNC connection details.</p>
+        <div class="cnc-subsection-heading"><div><p class="section-number">Mill 00 / Supervisor transport</p><h3>Mill supervisor</h3></div><span>Persistent controller connection</span></div>
+        <div class="cnc-data-grid" id="mill-supervisor-grid"></div>
+        <p class="debug-digital-help" id="mill-supervisor-detail">No staged mill-supervisor connection is started automatically.</p>
+        <div class="inline-actions">
+          <button class="button secondary" id="reconcile-mill-supervisor" type="button" disabled>Reconcile last mill result</button>
+        </div>
         <div class="cnc-summary-grid">
           <article><span>Controller</span><strong id="cnc-controller-state">Unavailable</strong></article>
           <article><span>Program</span><strong id="cnc-program">Unavailable</strong></article>
@@ -394,7 +411,7 @@
         <div class="cnc-data-grid" id="cnc-motion-grid"></div>
         <div class="debug-table-shell cnc-axis-table">
           <table class="debug-table">
-            <thead><tr><th>Axis</th><th>Position</th><th>Commanded</th><th>Velocity</th><th>Distance to go</th><th>Following error</th><th>Home</th><th>Limit</th></tr></thead>
+            <thead><tr><th>Axis</th><th>Position</th><th>Commanded</th><th>Velocity</th><th>Distance to go</th><th>Home</th><th>Limit</th></tr></thead>
             <tbody id="cnc-axis-rows"></tbody>
           </table>
         </div>

@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
 import secrets
 import socket
 import struct
@@ -28,6 +31,12 @@ EVENT_COMPLETED = 3
 EVENT_FAULTED = 4
 EVENT_LATCHED = 5
 EVENT_IDLE = 6
+
+# The generated URScript emits this only after an atomic dispatcher function
+# returns normally but its outbound supervisor socket was lost.
+FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION = 104
+STATUS_DOCUMENT_VERSION = "MPS-ROBOT-STATUS-V1"
+STATUS_DOCUMENT_MINIMUM_INTERVAL_SECONDS = 5.0
 
 EVENT_NAMES = {
     EVENT_ACCEPTED: "accepted",
@@ -170,12 +179,13 @@ class DispatchReceipt:
 class RobotSupervisorManager:
     """Own the one robot-originated socket without coupling socket threads to SQLAlchemy."""
 
-    def __init__(self) -> None:
+    def __init__(self, status_document_path: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._listener_thread: threading.Thread | None = None
+        self._listener_started_at: float | None = None
         self._listener: socket.socket | None = None
         self._connection: socket.socket | None = None
         self._connections: set[socket.socket] = set()
@@ -193,6 +203,8 @@ class RobotSupervisorManager:
         self._robot_session: int | None = None
         self._robot_last_sequence = 0
         self._robot_last_event = 0
+        self._robot_last_fault = 0
+        self._robot_last_event_at: str | None = None
         self._robot_latched = False
         self._events: OrderedDict[int, SupervisorEvent] = OrderedDict()
         self._event_history: OrderedDict[int, list[SupervisorEvent]] = OrderedDict()
@@ -202,6 +214,12 @@ class RobotSupervisorManager:
         self._protocol_resynchronizations = 0
         self._rejected_connections = 0
         self._maximum_retained_sequences = 512
+        self._status_document_path = status_document_path or (
+            Path(__file__).resolve().parents[1] / "runtime" / "robot-supervisor-status.json"
+        )
+        self._status_document_written_at: str | None = None
+        self._status_document_write_monotonic = 0.0
+        self._status_document_error: str | None = None
 
     def start(self, host: str, port: int, heartbeat_seconds: float, telemetry_hz: float = 1.0) -> None:
         with self._lock:
@@ -239,6 +257,7 @@ class RobotSupervisorManager:
             self._connection = None
             self._listener = None
             self._listener_thread = None
+            self._listener_started_at = None
             self._connections.clear()
             self._condition.notify_all()
         for item in sockets:
@@ -251,6 +270,7 @@ class RobotSupervisorManager:
             thread.join(timeout=2)
         if was_running:
             diagnostics().record("robot_supervisor", "listener_stopped", "Robot supervisor listener stopped.")
+        self._persist_status_document(force=True)
 
     def _listen_loop(self) -> None:
         try:
@@ -261,6 +281,8 @@ class RobotSupervisorManager:
             listener.settimeout(0.5)
             with self._lock:
                 self._listener = listener
+                self._listener_started_at = time.monotonic()
+            self._persist_status_document(force=True)
             diagnostics().record(
                 "robot_supervisor",
                 "listener_started",
@@ -278,6 +300,7 @@ class RobotSupervisorManager:
                 severity="error",
                 details={"error": str(exc), "host": self._listen_host, "port": self._listen_port},
             )
+            self._persist_status_document(force=True)
             return
 
         while not self._stop.is_set():
@@ -387,6 +410,7 @@ class RobotSupervisorManager:
                     severity="warning",
                     details={"peer": peer},
                 )
+            self._persist_status_document(force=True)
 
     def _activate_connection(self, connection: socket.socket, peer: str, values: list[int]) -> None:
         if len(values) != 8:
@@ -405,6 +429,8 @@ class RobotSupervisorManager:
             self._robot_session = session
             self._robot_last_sequence = last_sequence
             self._robot_last_event = last_event
+            self._robot_last_fault = 0
+            self._robot_last_event_at = datetime.now(timezone.utc).isoformat()
             self._robot_latched = bool(latched)
             if previous_session is not None and previous_session != session:
                 self._events.clear()
@@ -429,6 +455,7 @@ class RobotSupervisorManager:
                 "latched": bool(latched),
             },
         )
+        self._persist_status_document(force=True)
 
     def _send_heartbeat(self, connection: socket.socket) -> None:
         with self._lock:
@@ -455,6 +482,8 @@ class RobotSupervisorManager:
                 self._robot_session = session
                 self._robot_last_sequence = last_sequence
                 self._robot_last_event = last_event
+                self._robot_last_fault = 0
+                self._robot_last_event_at = datetime.now(timezone.utc).isoformat()
                 self._robot_latched = bool(latched)
             elif kind == KIND_EVENT:
                 if len(values) != 8:
@@ -486,6 +515,8 @@ class RobotSupervisorManager:
                 self._robot_session = session
                 self._robot_last_sequence = max(last_sequence, sequence)
                 self._robot_last_event = event_code
+                self._robot_last_fault = fault_code
+                self._robot_last_event_at = event.received_at
                 self._robot_latched = event_code == EVENT_LATCHED
             elif kind == KIND_TELEMETRY:
                 telemetry = self._decode_telemetry(values)
@@ -501,6 +532,77 @@ class RobotSupervisorManager:
             else:
                 raise SupervisorProtocolError(f"Unexpected robot frame kind {kind}.")
             self._condition.notify_all()
+        # Events are durable immediately; telemetry is checkpointed at a bounded
+        # interval so a 2 Hz status stream does not continually write the disk.
+        self._persist_status_document(force=kind in {KIND_HELLO, KIND_EVENT})
+
+    def _status_document_payload_locked(self) -> dict[str, object]:
+        return {
+            "version": STATUS_DOCUMENT_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "command": {
+                "robot_session": self._robot_session,
+                "last_sequence": self._robot_last_sequence,
+                "last_event": EVENT_NAMES.get(self._robot_last_event, self._robot_last_event),
+                "last_event_at": self._robot_last_event_at,
+                "fault_code": self._robot_last_fault,
+                "latched": self._robot_latched,
+            },
+            "connection": {
+                "connected": self._connection is not None,
+                "connection_generation": self._connection_generation,
+            },
+        }
+
+    def _persist_status_document(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if not force and now - self._status_document_write_monotonic < STATUS_DOCUMENT_MINIMUM_INTERVAL_SECONDS:
+                return
+            self._status_document_write_monotonic = now
+            document = self._status_document_payload_locked()
+            path = self._status_document_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+            with self._lock:
+                self._status_document_written_at = str(document["generated_at"])
+                self._status_document_error = None
+        except OSError as exc:
+            with self._lock:
+                self._status_document_error = str(exc)
+            diagnostics().record(
+                "robot_supervisor",
+                "status_document_write_failed",
+                "Could not checkpoint robot-originated status to the local status document.",
+                severity="warning",
+                details={"path": str(path), "error": str(exc)},
+            )
+
+    def status_document(self) -> dict[str, object]:
+        with self._lock:
+            path = self._status_document_path
+            written_at = self._status_document_written_at
+            error = self._status_document_error
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            return {
+                "path": str(path),
+                "available": True,
+                "written_at": written_at or document.get("generated_at"),
+                "error": error,
+                "document": document,
+            }
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "path": str(path),
+                "available": False,
+                "written_at": written_at,
+                "error": error or str(exc),
+                "document": None,
+            }
 
     def _prune_events(self) -> None:
         while len(self._events) > self._maximum_retained_sequences:
@@ -667,6 +769,7 @@ class RobotSupervisorManager:
                 "listening": bool(self._listener_thread and self._listener_thread.is_alive() and self._listener),
                 "listen_host": self._listen_host,
                 "listen_port": self._listen_port,
+                "listener_age_seconds": round(now - self._listener_started_at, 3) if self._listener_started_at else None,
                 "connected": connected,
                 "peer": self._peer,
                 "connection_age_seconds": round(now - self._connected_at, 3) if connected and self._connected_at else None,
@@ -685,6 +788,11 @@ class RobotSupervisorManager:
                 "rejected_connections": self._rejected_connections,
                 "retained_event_sequences": len(self._events),
                 "telemetry": dict(self._telemetry),
+                "status_document": {
+                    "path": str(self._status_document_path),
+                    "written_at": self._status_document_written_at,
+                    "error": self._status_document_error,
+                },
             }
 
 

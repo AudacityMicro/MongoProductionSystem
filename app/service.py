@@ -23,7 +23,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.diagnostics import diagnostics
 from app.program_metadata import parse_program_metadata, unavailable_program_metadata, PROGRAM_METADATA_PREFIX_BYTES
-from app.models import AppSettings, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
+from app.models import AppSettings, MillSupervisorCommand, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
 from app.cnc_linuxcnc import (
     CncProgramFault,
@@ -31,8 +31,13 @@ from app.cnc_linuxcnc import (
     read_linuxcnc_cycle_state,
     read_linuxcnc_io_labels,
     read_linuxcnc_snapshot,
+    run_linuxcnc_network_ping_matrix,
     run_linuxcnc_program,
+    start_mill_supervisor_agent,
+    stop_mill_supervisor_agent,
+    test_mill_supervisor_runtime,
 )
+from app.mill_supervisor import mill_supervisor
 from app.robot_dashboard import (
     RobotDashboardError,
     clear_robot_fault,
@@ -71,6 +76,7 @@ from app.robot_supervisor import (
     EVENT_FAULTED,
     EVENT_LATCHED,
     EVENT_RUNNING,
+    FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION,
     OP_CLEAR_LATCH,
     OP_ENTER_MAINTENANCE,
     OP_LOAD_MILL,
@@ -249,26 +255,27 @@ def available_programs(settings: AppSettings, *, force: bool = False) -> tuple[l
         return programs, warning
 
 
-def _run_network_diagnostic() -> dict[str, object]:
-    """Run a fixed public-target ping test from the application host."""
-    target = "8.8.8.8"
-    count = 20
+_NETWORK_PING_COUNT = 5
+
+
+def _desktop_ping_path(label: str, target: str, count: int = _NETWORK_PING_COUNT) -> dict[str, object]:
+    """Run one bounded ICMP path from the application computer."""
     command = ["ping", "-n", str(count), "-w", "1000", target] if os.name == "nt" else ["ping", "-c", str(count), "-W", "1", target]
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=count + 5,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError as exc:
-        raise problem(503, "The server cannot run ping because the system ping utility is unavailable.") from exc
+        return {"source": "Desktop", "target": label, "host": target, "method": "icmp", "supported": True, "error": "The system ping utility is unavailable."}
     except subprocess.TimeoutExpired as exc:
-        raise problem(504, "The 20-packet network test timed out before completing.") from exc
+        return {"source": "Desktop", "target": label, "host": target, "method": "icmp", "supported": True, "error": "Ping timed out before completing."}
     except OSError as exc:
-        raise problem(503, f"The network test could not start: {exc}") from exc
+        return {"source": "Desktop", "target": label, "host": target, "method": "icmp", "supported": True, "error": str(exc)}
 
     output = f"{result.stdout}\n{result.stderr}"
     values = [float(value.replace(",", ".")) for value in re.findall(r"(?:time|zeit|temps|tiempo)\s*[=<]\s*(\d+(?:[.,]\d+)?)\s*ms", output, flags=re.IGNORECASE)]
@@ -277,7 +284,11 @@ def _run_network_diagnostic() -> dict[str, object]:
     loss_percent = round((count - received) * 100 / count, 1)
     transit_times = [round(value, 3) for value in values]
     return {
-        "target": target,
+        "source": "Desktop",
+        "target": label,
+        "host": target,
+        "method": "icmp",
+        "supported": True,
         "sent": count,
         "received": received,
         "packet_loss_percent": loss_percent,
@@ -288,10 +299,82 @@ def _run_network_diagnostic() -> dict[str, object]:
     }
 
 
-def _finish_network_diagnostic(trigger: str) -> None:
+def _network_targets(settings: AppSettings | None) -> list[dict[str, str]]:
+    targets = [{"label": "Internet (8.8.8.8)", "host": "8.8.8.8"}]
+    if settings:
+        targets[:0] = [
+            {"label": "Mongo", "host": settings.robot_host.strip()},
+            {"label": "Mill", "host": settings.cnc_host.strip()},
+        ]
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in targets:
+        host = item["host"]
+        if host and host not in seen:
+            unique.append(item)
+            seen.add(host)
+    return unique
+
+
+def _run_network_diagnostic(settings: AppSettings | None = None) -> dict[str, object]:
+    """Build a bounded, capability-aware connectivity matrix for the cell."""
+    targets = _network_targets(settings)
+    paths: list[dict[str, object]] = [_desktop_ping_path(item["label"], item["host"]) for item in targets]
+    if settings and settings.cnc_host.strip() and settings.cnc_ssh_username:
+        mill_targets = [
+            {"label": "Application", "host": settings.robot_supervisor_hostname.strip()},
+            {"label": "Mongo", "host": settings.robot_host.strip()},
+            {"label": "Internet (8.8.8.8)", "host": "8.8.8.8"},
+        ]
+        mill_targets = [item for item in mill_targets if item["host"] and item["host"] != settings.cnc_host.strip()]
+        try:
+            paths.extend(run_linuxcnc_network_ping_matrix(
+                settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                settings.cnc_ssh_password, settings.cnc_timeout_seconds, mill_targets, _NETWORK_PING_COUNT,
+            ))
+        except CncTelemetryError as exc:
+            paths.extend({
+                "source": "Mill", "target": item["label"], "host": item["host"], "method": "icmp",
+                "supported": True, "error": str(exc),
+            } for item in mill_targets)
+    elif settings:
+        paths.append({"source": "Mill", "target": "Network", "method": "icmp", "supported": False, "detail": "PathPilot SSH is not configured."})
+
+    supervisor = robot_supervisor().status()
+    desktop_host = settings.robot_supervisor_hostname.strip() if settings else "Application"
+    paths.append({
+        "source": "Mongo", "target": "Application", "host": desktop_host, "method": "supervisor-tcp",
+        "supported": True, "connected": bool(supervisor.get("connected")),
+        "detail": "Observed through the robot-originated supervisor connection; Universal Robots does not expose an OS ICMP shell.",
+    })
+    for item in targets:
+        if item["label"] == "Mongo":
+            continue
+        paths.append({
+            "source": "Mongo", "target": item["label"], "host": item["host"], "method": "icmp",
+            "supported": False, "detail": "Universal Robots does not expose a supported OS ICMP command interface.",
+        })
+    public = next((path for path in paths if path.get("source") == "Desktop" and path.get("host") == "8.8.8.8"), {})
+    return {
+        "version": "MPS-NETWORK-MATRIX-V1",
+        "packet_count": _NETWORK_PING_COUNT,
+        "paths": paths,
+        # Retain the established public-path fields for existing integrations.
+        "target": "8.8.8.8",
+        "sent": public.get("sent", 0),
+        "received": public.get("received", 0),
+        "packet_loss_percent": public.get("packet_loss_percent", 100.0),
+        "minimum_ms": public.get("minimum_ms"),
+        "average_ms": public.get("average_ms"),
+        "maximum_ms": public.get("maximum_ms"),
+        "transit_times_ms": public.get("transit_times_ms", []),
+    }
+
+
+def _finish_network_diagnostic(trigger: str, settings: AppSettings | None = None) -> None:
     global _NETWORK_TEST_ACTIVE, _NETWORK_TEST_LATEST
     try:
-        result = _run_network_diagnostic()
+        result = _run_network_diagnostic(settings)
         latest: dict[str, object] = {"trigger": trigger, "completed_at": datetime.now(timezone.utc).isoformat(), "result": result}
     except HTTPException as exc:
         latest = {"trigger": trigger, "completed_at": datetime.now(timezone.utc).isoformat(), "error": str(exc.detail)}
@@ -309,7 +392,7 @@ def _finish_network_diagnostic(trigger: str) -> None:
     )
 
 
-def network_diagnostic() -> dict[str, object]:
+def network_diagnostic(settings: AppSettings | None = None) -> dict[str, object]:
     """Run a user-requested network test, limited to one start per 30 seconds."""
     global _NETWORK_TEST_ACTIVE, _NETWORK_TEST_LAST_MANUAL_START, _NETWORK_TEST_LATEST
     now = time.monotonic()
@@ -321,7 +404,7 @@ def network_diagnostic() -> dict[str, object]:
             raise problem(429, f"Wait {math.ceil(remaining)} seconds before starting another manual network test.")
         _NETWORK_TEST_ACTIVE = True
         _NETWORK_TEST_LAST_MANUAL_START = now
-    _finish_network_diagnostic("manual")
+    _finish_network_diagnostic("manual", settings)
     with _NETWORK_TEST_LOCK:
         latest = deepcopy(_NETWORK_TEST_LATEST)
     if latest and isinstance(latest.get("result"), dict):
@@ -452,10 +535,12 @@ def program_metadata(
     state: str = "unavailable",
     detail: str = "",
     cycle_basis: str | None = None,
+    wcs: list[str] | None = None,
 ) -> dict:
     hidden = not program_path or content_status in {"complete_parts", "defective_parts"}
     return {
         "program_tools": [] if hidden else list(tools or []),
+        "program_wcs": [] if hidden else list(wcs or []),
         "expected_cycle_seconds": None if hidden else expected_cycle_seconds,
         "program_metadata_state": state,
         "program_metadata_detail": detail,
@@ -513,6 +598,7 @@ def read_assigned_program_metadata(settings: AppSettings, program_path: str) -> 
 
 def _store_pallet_program_metadata(pallet: Pallet, metadata: dict[str, object]) -> None:
     pallet.program_tools_json = json.dumps(metadata.get("program_tools") or [], separators=(",", ":"))
+    pallet.program_wcs_json = json.dumps(metadata.get("program_wcs") or [], separators=(",", ":"))
     pallet.expected_cycle_seconds = metadata.get("expected_cycle_seconds")
     pallet.program_metadata_state = str(metadata.get("program_metadata_state") or "unavailable")
     pallet.program_metadata_detail = str(metadata.get("program_metadata_detail") or "")[:500]
@@ -695,6 +781,14 @@ MILL_LOAD_POSITION_PROGRAM_NAME = "mongo_mill_load_position.nc"
 MILL_PROGRAM_DIRECTORY = PurePosixPath("/home/operator/gcode/Gcode")
 
 
+def _mill_program_root(settings: AppSettings) -> PurePosixPath:
+    """Use one validated PathPilot root for browsing, validation, and launches."""
+    root = PurePosixPath(settings.mill_file_directory.strip() or str(MILL_PROGRAM_DIRECTORY))
+    if not root.is_absolute() or ".." in root.parts:
+        raise problem(422, "The PathPilot program directory must be an absolute path without '..'.")
+    return root
+
+
 def build_mill_load_position_program(position: dict[str, float]) -> str:
     """Build the PathPilot move-to-load-position program in G53 machine coordinates."""
     x = float(position["x_in"])
@@ -731,7 +825,7 @@ def rebuild_mill_load_position_program(session: Session, expected_revision: int)
         remote_path = upload_robot_file(
             host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
             username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
-            directory=settings.mill_file_directory, destination=str(MILL_PROGRAM_DIRECTORY), filename=MILL_LOAD_POSITION_PROGRAM_NAME,
+            directory=settings.mill_file_directory, destination=str(_mill_program_root(settings)), filename=MILL_LOAD_POSITION_PROGRAM_NAME,
             content=BytesIO(content.encode("ascii")), timeout_seconds=settings.cnc_timeout_seconds,
         )
     except RobotFileAccessError as exc:
@@ -859,6 +953,440 @@ def test_mill_status_file_access(settings: AppSettings) -> dict[str, str]:
     return {"path": str(path), "message": "Mill status-file folder is writable and readable."}
 
 
+_MILL_SUPERVISOR_REMOTE_DIRECTORY = "/home/operator/gcode/MongoProduction"
+_MILL_SUPERVISOR_AGENT_PATH = _MILL_SUPERVISOR_REMOTE_DIRECTORY + "/mps_mill_supervisor.py"
+_MILL_SUPERVISOR_CONFIG_PATH = _MILL_SUPERVISOR_REMOTE_DIRECTORY + "/mps_mill_supervisor.json"
+_MILL_SUPERVISOR_STATE_PATH = _MILL_SUPERVISOR_REMOTE_DIRECTORY + "/mps_mill_supervisor_state.json"
+_MILL_SUPERVISOR_PID_PATH = "/tmp/mps-mill-supervisor.pid"
+
+
+def mill_supervisor_status(session: Session) -> dict[str, object]:
+    settings = get_settings(session)
+    status = mill_supervisor().status()
+    last_result = status.get("last_result") or {}
+    result_sequence = int(last_result.get("sequence", 0) or 0)
+    result_event = str(last_result.get("event", ""))
+    if result_sequence > 0 and result_event in {"completed", "faulted", "latched"}:
+        persisted = session.scalar(
+            select(MillSupervisorCommand).where(MillSupervisorCommand.sequence == result_sequence)
+        )
+        if persisted and persisted.status in {
+            "created", "dispatching", "sent", "accepted", "running", "monitoring_released", "uncertain"
+        }:
+            persisted.status = result_event
+            persisted.completed_at = persisted.completed_at or datetime.now(timezone.utc).isoformat()
+            persisted.result_json = json.dumps(last_result.get("result") or {}, sort_keys=True, separators=(",", ":"))
+            persisted.fault_detail = str(last_result.get("detail") or "") or None
+            session.commit()
+    commands = session.scalars(
+        select(MillSupervisorCommand).order_by(MillSupervisorCommand.sequence.desc()).limit(25)
+    ).all()
+    controller_sequence = status.get("mill_last_sequence")
+    latest = commands[0] if commands else None
+    sequence_mismatch = bool(
+        status.get("connected")
+        and controller_sequence is not None
+        and int(controller_sequence) != settings.mill_supervisor_last_sequence
+    )
+    terminal_uncertain = bool(
+        latest and latest.status in {"uncertain", "faulted", "latched"}
+    )
+    status.update({
+        "enabled": settings.mill_supervisor_enabled,
+        "activation_verified": settings.mill_supervisor_activation_verified,
+        "expected_sequence": settings.mill_supervisor_last_sequence,
+        "staged": not settings.mill_supervisor_enabled,
+        "configured": bool(settings.cnc_host.strip() and settings.cnc_ssh_username and settings.cnc_ssh_password),
+        "sequence_mismatch": sequence_mismatch,
+        "reconciliation_required": sequence_mismatch or terminal_uncertain,
+        "recent_commands": [
+            {
+                "sequence": item.sequence,
+                "operation": item.operation,
+                "status": item.status,
+                "created_at": item.created_at,
+                "completed_at": item.completed_at,
+                "fault_detail": item.fault_detail,
+            }
+            for item in commands
+        ],
+    })
+    return status
+
+
+def stop_mill_supervisor_listener() -> None:
+    """Release a manually bootstrapped local listener during backend shutdown."""
+    mill_supervisor().stop()
+
+
+def start_mill_supervisor_listener(session: Session) -> None:
+    """Restore the listener automatically only after explicit activation."""
+    settings = get_settings(session)
+    if settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified:
+        mill_supervisor().start(settings.mill_supervisor_listen_host, settings.mill_supervisor_port)
+
+
+def start_mill_supervisor_recovery_watchdog(session_factory) -> None:
+    """Recover a crashed helper at low frequency without touching LinuxCNC."""
+    global _MILL_SUPERVISOR_RECOVERY_THREAD
+    if _MILL_SUPERVISOR_RECOVERY_THREAD and _MILL_SUPERVISOR_RECOVERY_THREAD.is_alive():
+        return
+    _MILL_SUPERVISOR_RECOVERY_STOP.clear()
+
+    def watch() -> None:
+        disconnected_since: float | None = None
+        last_attempt = 0.0
+        while not _MILL_SUPERVISOR_RECOVERY_STOP.wait(5.0):
+            try:
+                with session_factory() as session:
+                    settings = get_settings(session)
+                    if not (settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified):
+                        disconnected_since = None
+                        continue
+                    status = mill_supervisor().status()
+                    if status.get("connected"):
+                        disconnected_since = None
+                        continue
+                    now = time.monotonic()
+                    disconnected_since = disconnected_since or now
+                    if (
+                        now - disconnected_since < _SUPERVISOR_RECOVERY_GRACE_SECONDS
+                        or now - last_attempt < _SUPERVISOR_RECOVERY_COOLDOWN_SECONDS
+                    ):
+                        continue
+                    last_attempt = now
+                    start_mill_supervisor_agent(
+                        settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                        settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+                        _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+                    )
+                    diagnostics().record(
+                        "mill_supervisor",
+                        "agent_recovery_check",
+                        "Checked the disconnected PathPilot helper and started it only if its saved PID was not running.",
+                        severity="warning",
+                    )
+            except Exception as exc:
+                diagnostics().record(
+                    "mill_supervisor",
+                    "agent_recovery_error",
+                    "The bounded mill helper recovery check failed.",
+                    severity="warning",
+                    details={"error": str(exc)},
+                )
+
+    _MILL_SUPERVISOR_RECOVERY_THREAD = Thread(target=watch, daemon=True, name="mill-supervisor-recovery")
+    _MILL_SUPERVISOR_RECOVERY_THREAD.start()
+
+
+def stop_mill_supervisor_recovery_watchdog() -> None:
+    _MILL_SUPERVISOR_RECOVERY_STOP.set()
+
+
+def _new_mill_supervisor_command(
+    session: Session,
+    operation: str,
+    arguments: dict[str, object],
+) -> MillSupervisorCommand:
+    for attempt in range(5):
+        settings = get_settings(session)
+        if settings.mill_supervisor_last_sequence >= 2_000_000_000:
+            raise problem(409, "Mill supervisor sequence space is exhausted. Reconcile and start a new mill agent session.")
+        settings.mill_supervisor_last_sequence += 1
+        status = mill_supervisor().status()
+        command = MillSupervisorCommand(
+            id=str(uuid4()),
+            sequence=settings.mill_supervisor_last_sequence,
+            mill_session=status.get("mill_session"),
+            app_session=status.get("app_session"),
+            operation=operation,
+            arguments_json=json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            status="created",
+            attempted=False,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        session.add(command)
+        bump(settings)
+        try:
+            commit_or_conflict(session)
+            return command
+        except HTTPException as exc:
+            if exc.status_code != 409 or attempt == 4:
+                raise
+            session.expire_all()
+            diagnostics().record(
+                "mill_supervisor",
+                "command_ledger_commit_retry",
+                "Retrying an unsent mill command reservation after a concurrent board update.",
+                severity="warning",
+                details={"operation": operation, "attempt": attempt + 1},
+            )
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("Mill command reservation retry loop exited unexpectedly.")
+
+
+def _dispatch_mill_supervisor_command(session: Session, command: MillSupervisorCommand) -> tuple[bool, str]:
+    """Durably mark the first command byte before the future activation path uses it."""
+    command.attempted = True
+    command.status = "dispatching"
+    command.sent_at = datetime.now(timezone.utc).isoformat()
+    session.commit()
+    sent, detail = mill_supervisor().dispatch(
+        command.sequence,
+        command.operation,
+        json.loads(command.arguments_json),
+    )
+    if not sent:
+        command.status = "uncertain"
+        command.fault_detail = detail
+        session.commit()
+        return False, detail
+    command.status = "sent"
+    session.commit()
+    return True, ""
+
+
+def bootstrap_mill_supervisor(session: Session) -> dict[str, object]:
+    """Explicitly deploy and start the telemetry-only mill agent.
+
+    This is intentionally not called by Settings saves, startup, or Run Mode.
+    It is retained behind the staged rollout API until an operator performs the
+    firewall and no-motion activation procedure.
+    """
+    settings = get_settings(session)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before bootstrapping the mill supervisor.")
+    if not settings.cnc_host.strip() or not settings.cnc_ssh_username or not settings.cnc_ssh_password:
+        raise problem(409, "Configure PathPilot SSH before bootstrapping the mill supervisor.")
+    try:
+        test_mill_supervisor_runtime(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+        )
+    except CncTelemetryError as exc:
+        raise problem(409, f"The staged mill agent cannot use this PathPilot runtime: {exc}") from exc
+    mill_supervisor().start(settings.mill_supervisor_listen_host, settings.mill_supervisor_port)
+    asset = Path(__file__).with_name("mill_supervisor_agent.py").read_text(encoding="utf-8")
+    connection = _mill_status_file_connection(settings)
+    config = {
+        "host": settings.mill_supervisor_hostname,
+        "port": settings.mill_supervisor_port,
+        "state_path": _MILL_SUPERVISOR_STATE_PATH,
+        "telemetry_seconds": round(1.0 / settings.mill_supervisor_telemetry_hz, 3),
+        "program_root": settings.mill_file_directory,
+        "status_path": _mill_status_file_path(settings),
+        # This staged deployment may observe only. A future activation change is
+        # required before the agent can accept any controller command.
+        "execution_enabled": False,
+    }
+    try:
+        write_robot_text_file(path=_MILL_SUPERVISOR_AGENT_PATH, text=asset, **connection)
+        write_robot_text_file(path=_MILL_SUPERVISOR_CONFIG_PATH, text=json.dumps(config, sort_keys=True), **connection)
+        start_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+            _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+        )
+    except (RobotFileAccessError, CncTelemetryError) as exc:
+        raise problem(409, f"Could not bootstrap the staged mill supervisor: {exc}") from exc
+    if not mill_supervisor().wait_for_event(0, {"connected"}, 0):
+        # wait_for_event is event-sequence based; use a small explicit connection wait.
+        deadline = time.monotonic() + max(10.0, settings.cnc_timeout_seconds * 3)
+        while time.monotonic() < deadline:
+            if mill_supervisor().status().get("connected"):
+                settings.mill_supervisor_activation_verified = True
+                bump(settings)
+                commit_or_conflict(session)
+                return mill_supervisor_status(session)
+            time.sleep(0.2)
+    raise problem(409, "The mill agent was started, but did not complete an outbound telemetry-only handshake. Verify the firewall before activation.")
+
+
+def set_mill_supervisor_activation(session: Session, payload) -> dict[str, object]:
+    """Switch routing only after an idle, sequence-aligned supervisor handshake."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if not payload.confirmed:
+        raise problem(422, "Confirm that PathPilot is Idle before changing mill supervisor activation.")
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
+        raise problem(409, "Stop Run Mode and wait for robot pallet motion before changing mill supervisor activation.")
+    status = mill_supervisor().status()
+    telemetry = status.get("telemetry") or {}
+    if not (
+        status.get("connected")
+        and status.get("mill_last_sequence") == settings.mill_supervisor_last_sequence
+        and telemetry.get("interp_state") == 1
+        and telemetry.get("estop") is False
+        and telemetry.get("enabled") is True
+    ):
+        raise problem(409, "The telemetry-only mill supervisor must be connected, sequence-aligned, enabled, and Idle before activation changes.")
+    if payload.enabled and not settings.mill_supervisor_activation_verified:
+        raise problem(409, "Complete the telemetry-only mill supervisor handshake before enabling command routing.")
+
+    connection = _mill_status_file_connection(settings)
+    config = {
+        "host": settings.mill_supervisor_hostname,
+        "port": settings.mill_supervisor_port,
+        "state_path": _MILL_SUPERVISOR_STATE_PATH,
+        "telemetry_seconds": round(1.0 / settings.mill_supervisor_telemetry_hz, 3),
+        "program_root": settings.mill_file_directory,
+        "status_path": _mill_status_file_path(settings),
+        "execution_enabled": bool(payload.enabled),
+    }
+    previous_generation = int(status.get("connection_generation") or 0)
+    try:
+        asset = Path(__file__).with_name("mill_supervisor_agent.py").read_text(encoding="utf-8")
+        write_robot_text_file(path=_MILL_SUPERVISOR_AGENT_PATH, text=asset, **connection)
+        write_robot_text_file(
+            path=_MILL_SUPERVISOR_CONFIG_PATH,
+            text=json.dumps(config, sort_keys=True),
+            **connection,
+        )
+        stop_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds, _MILL_SUPERVISOR_PID_PATH,
+        )
+        start_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+            _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+        )
+        deadline = time.monotonic() + max(10.0, settings.cnc_timeout_seconds * 4)
+        while time.monotonic() < deadline:
+            current = mill_supervisor().status()
+            if (
+                current.get("connected")
+                and int(current.get("connection_generation") or 0) > previous_generation
+                and current.get("mill_last_sequence") == settings.mill_supervisor_last_sequence
+            ):
+                settings.mill_supervisor_enabled = bool(payload.enabled)
+                settings.mill_supervisor_activation_verified = True
+                bump(settings)
+                commit_or_conflict(session)
+                diagnostics().record(
+                    "mill_supervisor",
+                    "activation_changed",
+                    "Mill supervisor command routing was enabled." if payload.enabled else "Mill supervisor returned to telemetry-only mode.",
+                    details={"enabled": bool(payload.enabled)},
+                )
+                return mill_supervisor_status(session)
+            time.sleep(0.2)
+        raise CncTelemetryError("The mill agent did not reconnect with the expected durable sequence.")
+    except (RobotFileAccessError, CncTelemetryError) as exc:
+        fallback_config = dict(config)
+        fallback_config["execution_enabled"] = False
+        try:
+            write_robot_text_file(
+                path=_MILL_SUPERVISOR_CONFIG_PATH,
+                text=json.dumps(fallback_config, sort_keys=True),
+                **connection,
+            )
+            stop_mill_supervisor_agent(
+                settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                settings.cnc_ssh_password, settings.cnc_timeout_seconds, _MILL_SUPERVISOR_PID_PATH,
+            )
+            start_mill_supervisor_agent(
+                settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+                _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+            )
+        except (RobotFileAccessError, CncTelemetryError) as restore_exc:
+            diagnostics().record(
+                "mill_supervisor",
+                "telemetry_only_restore_failed",
+                "Activation failed and the telemetry-only agent could not be restored automatically.",
+                severity="error",
+                details={"error": str(restore_exc)},
+            )
+        settings.mill_supervisor_enabled = False
+        settings.mill_supervisor_activation_verified = False
+        bump(settings)
+        commit_or_conflict(session)
+        raise problem(409, f"Mill supervisor activation was not verified; command routing remains disabled: {exc}") from exc
+
+
+def update_mill_supervisor_agent(session: Session, payload) -> dict[str, object]:
+    """Deploy the current helper and restart it without changing routing mode."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if not payload.confirmed:
+        raise problem(422, "Confirm that PathPilot is Idle before updating the mill supervisor agent.")
+    payload.enabled = bool(settings.mill_supervisor_enabled)
+    return set_mill_supervisor_activation(session, payload)
+
+
+def test_mill_supervisor_command_path(session: Session) -> dict[str, object]:
+    """Exercise sequencing and acknowledgments without touching LinuxCNC command()."""
+    settings = get_settings(session)
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
+        raise problem(409, "The no-motion mill supervisor probe requires idle automation.")
+    status = mill_supervisor().status()
+    telemetry = status.get("telemetry") or {}
+    if not (
+        settings.mill_supervisor_enabled
+        and settings.mill_supervisor_activation_verified
+        and status.get("connected")
+        and status.get("mill_last_sequence") == settings.mill_supervisor_last_sequence
+        and telemetry.get("interp_state") == 1
+    ):
+        raise problem(409, "The active mill supervisor must be connected, aligned, and Idle before the no-motion probe.")
+    command = _new_mill_supervisor_command(session, "probe", {})
+    sent, detail = _dispatch_mill_supervisor_command(session, command)
+    if not sent:
+        raise problem(409, f"The no-motion mill supervisor probe became uncertain: {detail}")
+    event = mill_supervisor().wait_for_event(command.sequence, {"completed", "faulted", "latched"}, 10.0)
+    if event is None:
+        command.status = "uncertain"
+        command.fault_detail = "No terminal result arrived for the no-motion probe."
+        session.commit()
+        raise problem(504, command.fault_detail)
+    command.completed_at = event.received_at
+    command.result_json = json.dumps(event.result or {}, sort_keys=True, separators=(",", ":"))
+    command.status = event.name
+    command.fault_detail = event.detail or None
+    session.commit()
+    if event.name != "completed":
+        raise problem(409, f"The no-motion mill supervisor probe reported {event.name}: {event.detail}")
+    return {
+        "message": "Persistent mill command sequencing and acknowledgments are healthy; no LinuxCNC command was issued.",
+        "sequence": command.sequence,
+    }
+
+
+def reconcile_mill_supervisor_command(session: Session, payload) -> dict[str, object]:
+    """Reconcile only the ledger; never issue or retry a PathPilot command."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if settings.run_mode_enabled or _locked_motion(session):
+        raise problem(409, "Stop Run Mode and wait for pallet motion before reconciling a mill command.")
+    command = session.scalar(
+        select(MillSupervisorCommand).where(MillSupervisorCommand.sequence == payload.sequence)
+    )
+    if not command:
+        raise problem(404, "Mill supervisor command sequence was not found.")
+    if command.status not in {"latched", "faulted", "uncertain", "monitoring_released"}:
+        raise problem(409, f"Mill supervisor sequence {command.sequence} is not awaiting reconciliation.")
+    command.status = "operator_completed" if payload.resolution == "accept_completed" else "operator_faulted"
+    command.completed_at = command.completed_at or datetime.now(timezone.utc).isoformat()
+    command.fault_detail = (
+        "Operator confirmed the program completed; no command was resent."
+        if payload.resolution == "accept_completed"
+        else "Operator confirmed the program did not complete; no command was resent."
+    )
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record(
+        "mill_supervisor",
+        "command_reconciled",
+        f"Mill supervisor sequence {command.sequence} was reconciled as {command.status}.",
+        severity="warning",
+        details={"sequence": command.sequence, "resolution": payload.resolution},
+    )
+    return mill_supervisor_status(session)
+
+
 def _serialize_motion(motion: RobotMotion, pallet: Pallet | None = None) -> dict:
     return {
         "id": motion.id,
@@ -924,6 +1452,10 @@ def serialize_pallet(pallet: Pallet) -> dict:
         tools = json.loads(pallet.program_tools_json or "[]")
     except (TypeError, json.JSONDecodeError):
         tools = []
+    try:
+        wcs = json.loads(pallet.program_wcs_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        wcs = []
     return {
         "id": pallet.id,
         "name": pallet.name,
@@ -943,6 +1475,7 @@ def serialize_pallet(pallet: Pallet) -> dict:
             pallet.program_metadata_state,
             pallet.program_metadata_detail,
             pallet.program_cycle_basis,
+            wcs,
         ),
     }
 
@@ -1142,6 +1675,13 @@ def board_snapshot(session: Session) -> dict:
             "cnc_ssh_password": settings.cnc_ssh_password,
             "cnc_timeout_seconds": settings.cnc_timeout_seconds,
             "cnc_require_a_axis_homed": settings.cnc_require_a_axis_homed,
+            "mill_supervisor_enabled": settings.mill_supervisor_enabled,
+            "mill_supervisor_activation_verified": settings.mill_supervisor_activation_verified,
+            "mill_supervisor_hostname": settings.mill_supervisor_hostname,
+            "mill_supervisor_listen_host": settings.mill_supervisor_listen_host,
+            "mill_supervisor_port": settings.mill_supervisor_port,
+            "mill_supervisor_heartbeat_seconds": settings.mill_supervisor_heartbeat_seconds,
+            "mill_supervisor_telemetry_hz": settings.mill_supervisor_telemetry_hz,
             "mill_file_directory": settings.mill_file_directory,
             "mill_program_extensions": json.loads(settings.mill_program_extensions),
             "mill_programs_page_enabled": settings.mill_programs_page_enabled,
@@ -2014,6 +2554,13 @@ _ROBOT_TELEMETRY_CACHE: dict[
 _ROBOT_TELEMETRY_REFRESHING: set[tuple[object, ...]] = set()
 _ROBOT_TELEMETRY_LOCK = RLock()
 _ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 60.0
+_SUPERVISOR_RECOVERY_STOP = Event()
+_SUPERVISOR_RECOVERY_THREAD: Thread | None = None
+_SUPERVISOR_RECOVERY_COOLDOWN_SECONDS = 60.0
+_SUPERVISOR_RECOVERY_GRACE_SECONDS = 20.0
+_SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS = 300.0
+_MILL_SUPERVISOR_RECOVERY_STOP = Event()
+_MILL_SUPERVISOR_RECOVERY_THREAD: Thread | None = None
 _MOTION_TELEMETRY_READ_RETRY_SECONDS = 20.0
 # A temporary loss of RTDE must not mark a dispatched robot program as failed.
 # The reconnect circuit remains bounded, while the motion monitor waits long
@@ -2322,6 +2869,9 @@ def retry_robot_telemetry(session: Session) -> dict:
     with _ROBOT_TELEMETRY_LOCK:
         _ROBOT_TELEMETRY_CACHE.clear()
         _ROBOT_TELEMETRY_REFRESHING.clear()
+    if settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
+        recover_robot_supervisor_connection(session, trigger="operator")
+        return {"status": "retrying", "message": "Mongo supervisor socket was reset locally; waiting for the existing robot supervisor to reconnect."}
     return {"status": "retrying", "message": "Mongo connection state was reset; one reconnect sequence is starting."}
 
 
@@ -2529,6 +3079,7 @@ def duplicate_pallet(session: Session, pallet_id: str, expected_revision: int) -
             content_status=source.content_status,
             program_path=source.program_path,
             program_tools_json=source.program_tools_json,
+            program_wcs_json=source.program_wcs_json,
             expected_cycle_seconds=source.expected_cycle_seconds,
             program_metadata_state=source.program_metadata_state,
             program_metadata_detail=source.program_metadata_detail,
@@ -2862,6 +3413,14 @@ def _assert_motion_ready(session: Session, settings: AppSettings) -> None:
             raise problem(409, "Mongo supervisor is not connected.")
         if status["latched"]:
             raise problem(409, "Mongo supervisor is latched. Reconcile it before starting another movement.")
+        unresolved = session.scalar(
+            select(RobotSupervisorCommand).where(
+                RobotSupervisorCommand.sequence == settings.robot_supervisor_last_sequence,
+                RobotSupervisorCommand.status.in_(("uncertain", "latched", "faulted", "dispatching", "sent", "accepted", "running")),
+            )
+        )
+        if unresolved:
+            raise problem(409, "Mongo has an unresolved supervisor command. Reconcile it before starting another movement.")
         telemetry = status.get("telemetry") or {}
         age = status.get("telemetry_age_seconds")
         if not telemetry or age is None or age > settings.robot_supervisor_heartbeat_seconds * 4:
@@ -3010,6 +3569,279 @@ def stop_robot_supervisor_listener() -> None:
     robot_supervisor().stop()
 
 
+def recover_robot_supervisor_connection(session: Session, *, trigger: str) -> bool:
+    """Reset only the desktop listener so Mongo's existing supervisor reconnects.
+
+    This has no Dashboard, RTDE, file-transfer, or motion side effect. It is
+    forbidden while an automated operation is active because an in-flight move
+    must be reconciled, never treated as a normal reconnect.
+    """
+    settings = get_settings(session)
+    if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
+        return False
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
+        return False
+    if robot_supervisor().status().get("connected"):
+        return False
+    robot_supervisor().stop()
+    robot_supervisor().start(
+        settings.robot_supervisor_listen_host,
+        settings.robot_supervisor_port,
+        settings.robot_supervisor_heartbeat_seconds,
+        settings.robot_supervisor_telemetry_hz,
+    )
+    diagnostics().record(
+        "robot_supervisor",
+        "listener_recovery",
+        "Reset the local supervisor listener and is waiting for Mongo to reconnect.",
+        severity="warning",
+        details={"trigger": trigger, "port": settings.robot_supervisor_port},
+    )
+    return True
+
+
+def restart_robot_supervisor_listener(session: Session, *, trigger: str) -> dict[str, object]:
+    """Restart only the local TCP listener while the cell is idle.
+
+    Mongo owns the reconnect loop. This does not send a robot command, but it
+    is prohibited while automation may be in flight so a transport reset is
+    never mistaken for motion recovery.
+    """
+    settings = get_settings(session)
+    if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
+        raise problem(409, "Enable and verify the Mongo supervisor before restarting its listener.")
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
+        raise problem(409, "Stop Run Mode and wait for every pallet movement before restarting the supervisor listener.")
+    robot_supervisor().stop()
+    robot_supervisor().start(
+        settings.robot_supervisor_listen_host,
+        settings.robot_supervisor_port,
+        settings.robot_supervisor_heartbeat_seconds,
+        settings.robot_supervisor_telemetry_hz,
+    )
+    diagnostics().record(
+        "robot_supervisor",
+        "listener_restart_requested",
+        "Operator restarted only the local supervisor listener; waiting for Mongo to reconnect.",
+        severity="warning",
+        details={"trigger": trigger, "port": settings.robot_supervisor_port},
+    )
+    return {
+        "status": "retrying",
+        "message": "The local listener restarted. Mongo will reconnect using its bounded retry loop; no robot command was sent.",
+    }
+
+
+def recover_robot_supervisor_program(session: Session, *, trigger: str) -> dict[str, object]:
+    """Restore Mongo's no-motion supervisor without replacing operator work."""
+    settings = get_settings(session)
+    if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
+        raise problem(409, "Enable and verify the Mongo supervisor before recovering it.")
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
+        raise problem(409, "Stop Run Mode and wait for active pallet motion before recovering the Mongo supervisor.")
+    if robot_supervisor().status().get("connected"):
+        return robot_supervisor_status(session)
+    try:
+        controller = robot_program_status(settings.robot_host.strip(), settings.robot_timeout_seconds)
+    except RobotDashboardError as exc:
+        raise problem(502, f"Cannot confirm Mongo is idle before supervisor recovery: {exc}") from exc
+    loaded_program = str(controller.get("loaded_program") or "").strip()
+    if controller.get("running"):
+        raise problem(409, "Mongo is running a controller program. Supervisor recovery will not interrupt it.")
+    if loaded_program:
+        raise problem(
+            409,
+            "Mongo has a controller program selected (" + loaded_program + "). "
+            "Clear it or finish operator work before recovering the supervisor.",
+        )
+    status = bootstrap_robot_supervisor(session)
+    diagnostics().record(
+        "robot_supervisor",
+        "program_recovered",
+        "Restored Mongo's no-motion supervisor after it was not running.",
+        severity="warning",
+        details={"trigger": trigger},
+    )
+    return status
+
+
+def auto_recover_controller_connections(session: Session) -> dict[str, object]:
+    """Apply bounded, non-motion recovery and return every decision made."""
+    settings = get_settings(session)
+    results: list[dict[str, object]] = []
+    reconciliation: dict[str, object] | None = None
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    automation_idle = not settings.run_mode_enabled and active_motion is None
+
+    robot_status = robot_supervisor_status(session)
+    if settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
+        heartbeat_limit = max(5.0, settings.robot_supervisor_heartbeat_seconds * 4)
+        telemetry_age = robot_status.get("telemetry_age_seconds")
+        stale = telemetry_age is None or float(telemetry_age) > heartbeat_limit
+        if robot_status.get("connected") and not stale:
+            results.append({"controller": "Mongo", "action": "Healthy", "detail": "Supervisor connection and telemetry are live."})
+        else:
+            issue = "telemetry is stale" if robot_status.get("connected") else "supervisor is disconnected"
+            if not automation_idle:
+                results.append({"controller": "Mongo", "action": "Deferred", "detail": f"Mongo {issue}; recovery waits for Run Mode and pallet motion to become idle."})
+            else:
+                try:
+                    retry_robot_telemetry(session)
+                    results.append({"controller": "Mongo", "action": "Transport reset", "detail": f"Mongo {issue}; reset the local connection cache and listener."})
+                    deadline = time.monotonic() + max(3.0, settings.robot_supervisor_heartbeat_seconds * 3)
+                    while time.monotonic() < deadline:
+                        refreshed = robot_supervisor().status()
+                        refreshed_age = refreshed.get("telemetry_age_seconds")
+                        if refreshed.get("connected") and refreshed_age is not None and float(refreshed_age) <= heartbeat_limit:
+                            results.append({"controller": "Mongo", "action": "Recovered", "detail": "Mongo supervisor reconnected with fresh telemetry."})
+                            break
+                        time.sleep(0.2)
+                    else:
+                        recover_robot_supervisor_program(session, trigger="auto_recover")
+                        results.append({"controller": "Mongo", "action": "Supervisor restored", "detail": "Started the no-motion supervisor after Dashboard confirmed no controller program is selected."})
+                except (HTTPException, RobotTelemetryError) as exc:
+                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                    results.append({"controller": "Mongo", "action": "Deferred", "detail": str(detail)})
+        try:
+            dashboard = robot_dashboard_health(settings.robot_host.strip(), settings.robot_timeout_seconds)
+            results.append({"controller": "Mongo", "action": "Dashboard checked", "detail": "Dashboard responded." if dashboard else "Dashboard returned no health detail."})
+        except RobotDashboardError as exc:
+            results.append({"controller": "Mongo", "action": "Dashboard unavailable", "detail": str(exc)})
+        robot_status = robot_supervisor_status(session)
+        if robot_status.get("reconciliation"):
+            reconciliation = robot_status["reconciliation"]
+            results.append({
+                "controller": "Mongo",
+                "action": "Physical confirmation required",
+                "detail": "The connection is available, but the last robot command has an uncertain physical result. Confirm the observed pallet location before more motion is allowed.",
+            })
+    else:
+        results.append({"controller": "Mongo", "action": "Skipped", "detail": "Robot supervisor recovery is not enabled and verified."})
+
+    mill_status = mill_supervisor().status()
+    if settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified:
+        mill_heartbeat_limit = max(10.0, settings.mill_supervisor_heartbeat_seconds * 3)
+        mill_age = mill_status.get("telemetry_age_seconds")
+        mill_stale = mill_age is None or float(mill_age) > mill_heartbeat_limit
+        try:
+            mill_cycle = read_linuxcnc_cycle_state(
+                settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+            )
+            mill_idle = mill_cycle.get("interp_state") == 1
+            results.append({"controller": "Mill", "action": "PathPilot checked", "detail": "PathPilot reports Idle." if mill_idle else "PathPilot is not idle; no helper restart was attempted."})
+        except CncTelemetryError as exc:
+            mill_idle = False
+            results.append({"controller": "Mill", "action": "PathPilot unavailable", "detail": str(exc)})
+        if mill_status.get("connected") and not mill_stale:
+            results.append({"controller": "Mill", "action": "Healthy", "detail": "Mill supervisor connection and telemetry are live."})
+        else:
+            if not automation_idle or not mill_idle:
+                results.append({"controller": "Mill", "action": "Deferred", "detail": "Mill supervisor is stale or disconnected; helper recovery waits for idle automation and an idle PathPilot interpreter."})
+            else:
+                try:
+                    mill_supervisor().start(settings.mill_supervisor_listen_host, settings.mill_supervisor_port)
+                    start_mill_supervisor_agent(
+                        settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                        settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+                        _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+                    )
+                    deadline = time.monotonic() + max(5.0, settings.mill_supervisor_heartbeat_seconds * 3)
+                    while time.monotonic() < deadline:
+                        refreshed = mill_supervisor().status()
+                        refreshed_age = refreshed.get("telemetry_age_seconds")
+                        if refreshed.get("connected") and refreshed_age is not None and float(refreshed_age) <= mill_heartbeat_limit:
+                            results.append({"controller": "Mill", "action": "Recovered", "detail": "Mill helper reconnected with fresh telemetry."})
+                            break
+                        time.sleep(0.2)
+                    else:
+                        results.append({"controller": "Mill", "action": "Recovery pending", "detail": "The idle mill helper restart was requested; it has not reconnected yet."})
+                except CncTelemetryError as exc:
+                    results.append({"controller": "Mill", "action": "Deferred", "detail": str(exc)})
+    else:
+        results.append({"controller": "Mill", "action": "Skipped", "detail": "Mill supervisor recovery is not enabled and verified."})
+
+    if any(item["action"] in {"Dashboard unavailable", "PathPilot unavailable", "Recovery pending"} for item in results):
+        trigger_network_diagnostic_on_robot_loss()
+        results.append({"controller": "Network", "action": "Diagnostic queued", "detail": "Queued the rate-limited connectivity matrix for the next recovery diagnosis."})
+
+    diagnostics().record(
+        "controller_recovery",
+        "auto_recover_requested",
+        "Applied bounded non-motion controller recovery steps.",
+        severity="warning",
+        details={"results": results},
+    )
+    response: dict[str, object] = {"results": results}
+    if reconciliation:
+        response["reconciliation"] = reconciliation
+    return response
+
+
+def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
+    """Heal an idle stale socket without ever touching controller motion."""
+    global _SUPERVISOR_RECOVERY_THREAD
+    if _SUPERVISOR_RECOVERY_THREAD and _SUPERVISOR_RECOVERY_THREAD.is_alive():
+        return
+    _SUPERVISOR_RECOVERY_STOP.clear()
+
+    def watch() -> None:
+        last_listener_recovery = 0.0
+        last_program_recovery = 0.0
+        listener_recovery_count = 0
+        while not _SUPERVISOR_RECOVERY_STOP.wait(5.0):
+            try:
+                with session_factory() as session:
+                    status = robot_supervisor().status()
+                    listener_age = float(status.get("listener_age_seconds") or 0)
+                    if status.get("connected"):
+                        listener_recovery_count = 0
+                        continue
+                    now = time.monotonic()
+                    if not status.get("listening") or listener_age < _SUPERVISOR_RECOVERY_GRACE_SECONDS:
+                        continue
+                    # A listener reset cannot help when the controller-side
+                    # script is absent. After two bounded retries, restore it
+                    # only when Dashboard proves no operator program is loaded.
+                    if (
+                        listener_recovery_count >= 2
+                        and now - last_program_recovery >= _SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS
+                    ):
+                        try:
+                            recover_robot_supervisor_program(session, trigger="watchdog")
+                            last_program_recovery = now
+                            listener_recovery_count = 0
+                        except HTTPException as exc:
+                            diagnostics().record(
+                                "robot_supervisor",
+                                "program_recovery_deferred",
+                                "Automatic supervisor recovery was deferred to avoid replacing controller work.",
+                                severity="warning",
+                                details={"status": exc.status_code, "detail": str(exc.detail)},
+                            )
+                            last_program_recovery = now
+                        continue
+                    if now - last_listener_recovery >= _SUPERVISOR_RECOVERY_COOLDOWN_SECONDS:
+                        if recover_robot_supervisor_connection(session, trigger="watchdog"):
+                            last_listener_recovery = now
+                            listener_recovery_count += 1
+            except Exception as exc:  # A diagnostic helper must never affect production control.
+                diagnostics().record(
+                    "robot_supervisor", "listener_recovery_error", "Idle supervisor recovery check failed.",
+                    severity="warning", details={"error": str(exc)},
+                )
+
+    _SUPERVISOR_RECOVERY_THREAD = Thread(target=watch, daemon=True, name="robot-supervisor-recovery")
+    _SUPERVISOR_RECOVERY_THREAD.start()
+
+
+def stop_robot_supervisor_recovery_watchdog() -> None:
+    _SUPERVISOR_RECOVERY_STOP.set()
+
+
 def robot_supervisor_status(session: Session) -> dict[str, object]:
     settings = get_settings(session)
     status = robot_supervisor().status()
@@ -3062,6 +3894,23 @@ def robot_supervisor_status(session: Session) -> dict[str, object]:
     robot_sequence = status.get("robot_last_sequence")
     expected_sequence = settings.robot_supervisor_last_sequence
     latest_expected = next((item for item in recent if item.sequence == expected_sequence), None)
+    terminal_uncertain = bool(
+        latest_expected
+        and latest_expected.status in {"uncertain", "latched", "faulted", "dispatching", "sent", "accepted", "running"}
+    )
+    reconciliation = None
+    if terminal_uncertain and latest_expected:
+        motion = session.get(RobotMotion, latest_expected.robot_motion_id) if latest_expected.robot_motion_id else None
+        pallet = session.get(Pallet, motion.pallet_id) if motion else None
+        reconciliation = {
+            "sequence": latest_expected.sequence,
+            "operation": latest_expected.operation,
+            "command_status": latest_expected.status,
+            "motion_id": latest_expected.robot_motion_id,
+            "pallet_name": pallet.name if pallet else None,
+            "board_location": pallet.location if pallet else None,
+            "detail": latest_expected.fault_detail,
+        }
     session_mismatch = bool(
         status.get("connected")
         and expected_sequence > 0
@@ -3078,9 +3927,11 @@ def robot_supervisor_status(session: Session) -> dict[str, object]:
             status.get("latched")
             or session_mismatch
             or (status.get("connected") and robot_sequence is not None and robot_sequence != expected_sequence)
+            or terminal_uncertain
         ),
         "session_mismatch": session_mismatch,
         "pre_dispatch_fallback": settings.robot_supervisor_pre_dispatch_fallback,
+        "reconciliation": reconciliation,
         "commands": [
             {
                 "sequence": item.sequence,
@@ -3104,11 +3955,17 @@ def robot_supervisor_status(session: Session) -> dict[str, object]:
     return status
 
 
+def robot_supervisor_status_document() -> dict[str, object]:
+    """Return the durable robot-originated status checkpoint without controller I/O."""
+    return robot_supervisor().status_document()
+
+
 def bootstrap_robot_supervisor(session: Session) -> dict[str, object]:
     settings = get_settings(session)
     if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
         raise problem(409, "Configure a physical Mongo controller before bootstrapping its supervisor.")
-    if settings.run_mode_enabled or _locked_motion(session):
+    active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if settings.run_mode_enabled or active_motion:
         raise problem(409, "Stop Run Mode and resolve all pallet movements before bootstrapping the supervisor.")
     restore_enabled_after_success = settings.robot_supervisor_enabled
     settings.robot_supervisor_enabled = False
@@ -3192,14 +4049,25 @@ def reconcile_robot_supervisor(session: Session, payload) -> dict[str, object]:
     if not command:
         raise problem(404, "Supervisor command sequence was not found in the durable ledger.")
     if payload.resolution == "accept_completed":
+        if command.status not in {"uncertain", "latched", "faulted", "dispatching", "sent", "accepted", "running"}:
+            raise problem(409, f"Supervisor sequence {command.sequence} is already reconciled.")
         command.status = "operator_completed"
         command.completed_at = command.completed_at or datetime.now(timezone.utc).isoformat()
         command.fault_detail = "Operator confirmed the physical atomic operation completed. Reconcile the pallet-motion record separately if its board location is faulted."
     elif payload.resolution == "mark_faulted":
+        if command.status not in {"uncertain", "latched", "faulted", "dispatching", "sent", "accepted", "running"}:
+            raise problem(409, f"Supervisor sequence {command.sequence} is already reconciled.")
         command.status = "operator_faulted"
         command.completed_at = command.completed_at or datetime.now(timezone.utc).isoformat()
         command.fault_detail = "Operator confirmed the atomic operation did not complete."
     else:
+        if command.sequence != settings.robot_supervisor_last_sequence:
+            raise problem(409, "Only the latest supervisor command may be cleared.")
+        if command.status not in {"operator_completed", "operator_faulted", "completed"}:
+            raise problem(
+                409,
+                "Confirm whether the physical operation completed or failed before clearing the supervisor latch.",
+            )
         if not robot_supervisor().status().get("connected"):
             raise problem(409, "Mongo must be connected before its supervisor latch can be cleared.")
         clear = _new_supervisor_command(
@@ -3278,31 +4146,50 @@ def _new_supervisor_command(
     value: int = 0,
     payload_g: int = 0,
 ) -> RobotSupervisorCommand:
-    settings = get_settings(session)
-    if settings.robot_supervisor_last_sequence >= 2_000_000_000:
-        raise problem(409, "Mongo supervisor sequence space is exhausted. Rebuild and re-bootstrap a new supervisor session before sending commands.")
-    settings.robot_supervisor_last_sequence += 1
-    status = robot_supervisor().status()
-    command = RobotSupervisorCommand(
-        id=str(uuid4()),
-        sequence=settings.robot_supervisor_last_sequence,
-        robot_session=status.get("robot_session"),
-        app_session=status.get("app_session"),
-        robot_motion_id=motion.id if motion else None,
-        operation=operation,
-        opcode=opcode,
-        argument=argument,
-        value=value,
-        payload_g=payload_g,
-        transport="supervisor",
-        status="created",
-        attempted=False,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
-    session.add(command)
-    bump(settings)
-    commit_or_conflict(session)
-    return command
+    motion_id = motion.id if motion else None
+    for attempt in range(5):
+        settings = get_settings(session)
+        if settings.robot_supervisor_last_sequence >= 2_000_000_000:
+            raise problem(409, "Mongo supervisor sequence space is exhausted. Rebuild and re-bootstrap a new supervisor session before sending commands.")
+        settings.robot_supervisor_last_sequence += 1
+        status = robot_supervisor().status()
+        command = RobotSupervisorCommand(
+            id=str(uuid4()),
+            sequence=settings.robot_supervisor_last_sequence,
+            robot_session=status.get("robot_session"),
+            app_session=status.get("app_session"),
+            robot_motion_id=motion_id,
+            operation=operation,
+            opcode=opcode,
+            argument=argument,
+            value=value,
+            payload_g=payload_g,
+            transport="supervisor",
+            status="created",
+            attempted=False,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        session.add(command)
+        bump(settings)
+        try:
+            commit_or_conflict(session)
+            return command
+        except HTTPException as exc:
+            if exc.status_code != 409 or attempt == 4:
+                raise
+            # Queue and pallet edits are allowed while a robot step is running.
+            # Refresh the global revision before reserving the next sequence;
+            # the command has not been sent, so retrying cannot duplicate motion.
+            session.expire_all()
+            diagnostics().record(
+                "robot_supervisor",
+                "command_ledger_commit_retry",
+                "Retrying unsent supervisor command reservation after a concurrent schedule update.",
+                severity="warning",
+                details={"operation": operation, "motion_id": motion_id, "attempt": attempt + 1},
+            )
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("Supervisor command reservation retry loop exited unexpectedly.")
 
 
 def _dispatch_supervisor_command(
@@ -3368,11 +4255,60 @@ def _dispatch_supervisor_command(
         command.status = "completed"
         session.commit()
         return "completed", ""
-    command.status = "latched" if event.event_code == EVENT_LATCHED else "faulted"
-    command.fault_detail = (
-        f"Mongo reported {event.name} for sequence {event.sequence} with fault code {event.fault_code}. "
-        "Inspect the physical pallet location and reconcile before continuing."
-    )
+    if event.event_code == EVENT_LATCHED and event.fault_code == FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION:
+        recommendations = {
+            "pick_pool": "Robot-held",
+            "put_pool": "the destination Pool position",
+            "load_mill": "Mill",
+            "unload_mill": "Robot-held",
+        }
+        command.status = "completed_link_lost"
+        command.fault_detail = (
+            f"Mongo lost its supervisor connection while sequence {event.sequence} was running, but the robot reported "
+            f"the atomic {command.operation} step finished before latching. No follow-on command was sent. "
+            f"Confirm the pallet is in {recommendations.get(command.operation, 'its expected position')} and reconcile before continuing."
+        )
+        session.commit()
+        # Code 104 is emitted only after the robot's atomic dispatcher has
+        # returned. Clear the application latch through a new sequenced,
+        # no-motion command before allowing any following physical step.
+        supervisor_status = robot_supervisor().status()
+        if not (
+            supervisor_status.get("connected")
+            and supervisor_status.get("latched")
+            and supervisor_status.get("robot_last_sequence") == command.sequence
+        ):
+            return "faulted", (
+                f"{command.fault_detail} The reconnect state could not be verified, so the supervisor latch was not cleared."
+            )
+        clear = _new_supervisor_command(
+            session,
+            motion=None,
+            operation="clear_link_loss_latch",
+            opcode=OP_CLEAR_LATCH,
+        )
+        clear_outcome, clear_detail = _dispatch_supervisor_command(
+            session,
+            clear,
+            max(5.0, timeout_seconds),
+            allow_pre_dispatch_fallback=False,
+        )
+        if clear_outcome == "completed":
+            diagnostics().record(
+                "robot_supervisor",
+                "link_loss_completed_recovered",
+                "A completed atomic robot command lost its connection, then the matching supervisor latch was cleared automatically.",
+                severity="warning",
+                details={"sequence": command.sequence, "operation": command.operation, "clear_sequence": clear.sequence},
+            )
+            return "completed", ""
+        return "faulted", f"{command.fault_detail} Automatic latch clear was not confirmed: {clear_detail}"
+    else:
+        command.status = "latched" if event.event_code == EVENT_LATCHED else "faulted"
+        command.fault_detail = (
+            f"Mongo reported {event.name} for sequence {event.sequence} with fault code {event.fault_code}. "
+            "Inspect the physical pallet location and reconcile before continuing."
+        )
     session.commit()
     return "faulted", command.fault_detail
 
@@ -4080,7 +5016,7 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
             if settings.robot_supervisor_enabled:
                 if motion.operation in {"load_mill", "unload_mill"} and MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path:
                     try:
-                        _run_manual_mill_load_position_cycle(settings)
+                        _run_manual_mill_load_position_cycle(session, settings)
                         mill_position_already_run = True
                     except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
@@ -4171,7 +5107,7 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
             if motion.operation == "load_mill":
                 if MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path and not mill_position_already_run:
                     try:
-                        _run_manual_mill_load_position_cycle(settings)
+                        _run_manual_mill_load_position_cycle(session, settings)
                     except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                         _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
@@ -4185,7 +5121,7 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
             if motion.operation == "unload_mill":
                 if MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path and not mill_position_already_run:
                     try:
-                        _run_manual_mill_load_position_cycle(settings)
+                        _run_manual_mill_load_position_cycle(session, settings)
                     except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                         _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
@@ -4370,7 +5306,7 @@ def _assert_mill_load_position_program_current(settings: AppSettings) -> str:
     if local_content.replace("\r\n", "\n") != expected:
         raise problem(409, "The local mill loading-position program does not match Settings. Rebuild it before starting run mode.")
 
-    remote_path = str(MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME)
+    remote_path = str(_mill_program_root(settings) / MILL_LOAD_POSITION_PROGRAM_NAME)
     try:
         remote = read_robot_file(
             host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
@@ -4411,7 +5347,7 @@ def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> 
         remote_files = set(list_robot_program_files(
             host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
             username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
-            directory=str(MILL_PROGRAM_DIRECTORY), extensions=None,
+            directory=str(_mill_program_root(settings)), extensions=None,
             timeout_seconds=settings.cnc_timeout_seconds,
         ))
     except RobotFileAccessError as exc:
@@ -4419,7 +5355,7 @@ def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> 
     extensions = set(json.loads(settings.mill_program_extensions))
     missing_programs = []
     for pallet in queue:
-        remote_program = _run_mode_program_path(pallet.program_path or "", extensions)
+        remote_program = _run_mode_program_path(settings, pallet.program_path or "", extensions)
         if remote_program not in remote_files:
             missing_programs.append(f"{pallet.name}: {remote_program}")
     if missing_programs:
@@ -4506,6 +5442,21 @@ def stop_run_mode(session: Session, expected_revision: int) -> None:
     )
 
 
+def cancel_run_mode_recovery(session: Session, expected_revision: int) -> None:
+    """Stop a paused or faulted scheduler without moving a pallet or controller."""
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    settings.run_mode_enabled = False
+    settings.run_mode_state = "stopped"
+    settings.run_mode_detail = "Operator cancelled recovery. No further automated action will start; the pallet remains where it is."
+    settings.run_mode_pending_action = ""
+    settings.run_mode_confirmation_token = ""
+    settings.run_mode_confirmation_granted = False
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record("run_mode", "recovery_cancelled", settings.run_mode_detail, severity="warning")
+
+
 def confirm_run_mode_action(session: Session, payload: ConfirmRunModeAction) -> None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
@@ -4588,13 +5539,13 @@ def _await_run_mode_action(
             return True
 
 
-def _run_mode_program_path(program_path: str, extensions: set[str]) -> str:
+def _run_mode_program_path(settings: AppSettings, program_path: str, extensions: set[str]) -> str:
     relative = PurePosixPath(program_path.replace("\\", "/"))
     if relative.is_absolute() or ".." in relative.parts:
         raise problem(422, "Queued mill program paths must remain inside the PathPilot Gcode folder.")
     if relative.suffix.lower() not in extensions:
         raise problem(422, f"Queued program {program_path} is not an allowed mill program type.")
-    return str(MILL_PROGRAM_DIRECTORY.joinpath(*relative.parts))
+    return str(_mill_program_root(settings).joinpath(*relative.parts))
 
 
 def _run_mode_motion_succeeded(session_factory, motion_id: str | None) -> bool:
@@ -4606,10 +5557,147 @@ def _run_mode_motion_succeeded(session_factory, motion_id: str | None) -> bool:
         return bool(motion and motion.status == "succeeded")
 
 
+def _run_cnc_cycle_via_supervisor(
+    session: Session,
+    settings: AppSettings,
+    remote_program: str,
+    *,
+    cycle_label: str,
+    timeout_seconds: float,
+    continue_check=None,
+    status_report=None,
+    completion_status: dict[str, object] | None = None,
+) -> bool:
+    """Run one program through the durable mill-originated supervisor."""
+    supervisor = mill_supervisor()
+    status = supervisor.status()
+    heartbeat_age = status.get("heartbeat_age_seconds")
+    freshness_limit = max(10.0, settings.mill_supervisor_heartbeat_seconds * 3)
+    if not (
+        settings.mill_supervisor_activation_verified
+        and status.get("connected")
+        and heartbeat_age is not None
+        and float(heartbeat_age) <= freshness_limit
+    ):
+        raise CncPreDispatchTelemetryError(
+            f"The mill supervisor was not fresh and connected before {cycle_label} dispatch."
+        )
+    if status.get("mill_last_sequence") != settings.mill_supervisor_last_sequence:
+        raise CncPreDispatchTelemetryError(
+            "The mill supervisor sequence does not match the durable command ledger. Reconcile before dispatch."
+        )
+    telemetry = status.get("telemetry") or {}
+    if telemetry.get("interp_state") != 1:
+        raise CncPreDispatchTelemetryError("PathPilot is not Idle; no supervisor command was sent.")
+    if telemetry.get("estop") is True or telemetry.get("enabled") is False:
+        raise CncPreDispatchTelemetryError("PathPilot is disabled or in E-stop; no supervisor command was sent.")
+
+    command = _new_mill_supervisor_command(
+        session,
+        "run_program",
+        {
+            "program": remote_program,
+            "require_a_axis_homed": settings.cnc_require_a_axis_homed,
+            "require_completion_status": bool(completion_status),
+        },
+    )
+    sent, detail = _dispatch_mill_supervisor_command(session, command)
+    if not sent:
+        raise CncProgramFault(
+            f"{cycle_label} has an uncertain supervisor dispatch result: {detail}. The program was not retried."
+        )
+    diagnostics().record(
+        "run_mode",
+        "cnc_supervisor_dispatch",
+        f"{cycle_label} was dispatched through the persistent mill supervisor.",
+        details={"program": remote_program, "sequence": command.sequence},
+    )
+
+    started = time.monotonic()
+    outage_started: float | None = None
+    last_report = 0.0
+    while time.monotonic() - started < timeout_seconds:
+        if continue_check and not continue_check():
+            command.status = "monitoring_released"
+            command.fault_detail = "Run Mode stopped while PathPilot retained ownership of the active program."
+            session.commit()
+            return False
+        event = supervisor.wait_for_event(
+            command.sequence,
+            {"completed", "faulted", "latched"},
+            min(2.0, max(0.1, timeout_seconds - (time.monotonic() - started))),
+        )
+        history = supervisor.events_for(command.sequence)
+        for item in history:
+            if item.name == "accepted":
+                command.accepted_at = command.accepted_at or item.received_at
+                if command.status in {"sent", "dispatching"}:
+                    command.status = "accepted"
+            elif item.name == "running":
+                command.started_at = command.started_at or item.received_at
+                command.status = "running"
+        if event:
+            command.completed_at = event.received_at
+            command.result_json = json.dumps(event.result or {}, sort_keys=True, separators=(",", ":"))
+            if event.name == "completed":
+                command.status = "completed"
+                command.fault_detail = None
+                session.commit()
+                if completion_status:
+                    complete, completion_detail = _mill_status_record(
+                        settings,
+                        str(completion_status["program"]),
+                        completion_status.get("previous_signature"),
+                        completion_status.get("previous_legacy_signature"),
+                    )
+                    if not complete:
+                        raise CncProgramFault(
+                            f"{cycle_label} returned to Idle without a valid completion record: {completion_detail}"
+                        )
+                diagnostics().record(
+                    "run_mode",
+                    "cnc_supervisor_completed",
+                    f"{cycle_label} completed through the persistent mill supervisor.",
+                    details={"program": remote_program, "sequence": command.sequence},
+                )
+                return True
+            command.status = event.name
+            command.fault_detail = event.detail or f"PathPilot reported {event.name}."
+            session.commit()
+            raise CncProgramFault(f"{cycle_label} stopped: {command.fault_detail}")
+        session.commit()
+        connection = supervisor.status()
+        if not connection.get("connected"):
+            now = time.monotonic()
+            outage_started = outage_started or now
+            if status_report and now - last_report >= _CNC_TELEMETRY_STATUS_INTERVAL_SECONDS:
+                status_report(
+                    "telemetry_unavailable",
+                    f"{cycle_label} remains under PathPilot control while its supervisor reconnects. No command will be retried.",
+                )
+                last_report = now
+        elif outage_started is not None:
+            if status_report:
+                status_report(
+                    "telemetry_restored",
+                    f"The mill supervisor reconnected after {int(time.monotonic() - outage_started)} seconds.",
+                )
+            outage_started = None
+    command.status = "uncertain"
+    command.completed_at = datetime.now(timezone.utc).isoformat()
+    command.fault_detail = (
+        f"No terminal supervisor result arrived within {round(timeout_seconds / 3600, 1)} hours. "
+        "The program was not retried and the pallet was not moved."
+    )
+    session.commit()
+    raise problem(504, command.fault_detail)
+
+
 def _run_cnc_cycle(
     settings: AppSettings,
     remote_program: str,
     *,
+    session: Session | None = None,
     cycle_label: str,
     timeout_seconds: float = _CNC_LONG_CYCLE_MAXIMUM_SECONDS,
     continue_check=None,
@@ -4620,6 +5708,19 @@ def _run_cnc_cycle(
     if settings.robot_connection_mode == "simulated":
         time.sleep(0.25)
         return continue_check() if continue_check else True
+    if settings.mill_supervisor_enabled:
+        if session is None:
+            raise CncPreDispatchTelemetryError("A durable database session is required for mill-supervisor dispatch.")
+        return _run_cnc_cycle_via_supervisor(
+            session,
+            settings,
+            remote_program,
+            cycle_label=cycle_label,
+            timeout_seconds=timeout_seconds,
+            continue_check=continue_check,
+            status_report=status_report,
+            completion_status=completion_status,
+        )
     connection = (
         settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
         settings.cnc_ssh_password, settings.cnc_timeout_seconds,
@@ -4776,11 +5877,12 @@ def _cnc_cycle_fault_detail(telemetry: dict[str, object]) -> str | None:
     return None
 
 
-def _run_manual_mill_load_position_cycle(settings: AppSettings) -> bool:
+def _run_manual_mill_load_position_cycle(session: Session, settings: AppSettings) -> bool:
     remote_program = _assert_mill_load_position_program_current(settings)
     return _run_cnc_cycle(
         settings,
         remote_program,
+        session=session,
         cycle_label="The mill loading-position program",
         timeout_seconds=5 * 60,
     )
@@ -4813,20 +5915,21 @@ def _run_mode_cnc_cycle(
 
     pre_dispatch_attempt = 0
     while True:
-        with session_factory() as session:
-            settings = get_settings(session)
-            if not _run_mode_token_is_active(settings, run_token):
-                return False
         try:
-            return _run_cnc_cycle(
-                settings,
-                remote_program,
-                cycle_label=cycle_label,
-                timeout_seconds=timeout_seconds,
-                continue_check=run_mode_is_enabled,
-                status_report=report_observation_state,
-                completion_status=completion_status,
-            )
+            with session_factory() as session:
+                settings = get_settings(session)
+                if not _run_mode_token_is_active(settings, run_token):
+                    return False
+                return _run_cnc_cycle(
+                    settings,
+                    remote_program,
+                    session=session,
+                    cycle_label=cycle_label,
+                    timeout_seconds=timeout_seconds,
+                    continue_check=run_mode_is_enabled,
+                    status_report=report_observation_state,
+                    completion_status=completion_status,
+                )
         except CncPreDispatchTelemetryError as exc:
             pre_dispatch_attempt += 1
             if pre_dispatch_attempt <= _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS:
@@ -4915,7 +6018,7 @@ def _run_mode_load_position_cycle(session_factory, run_token: str | None = None)
         if not _run_mode_token_is_active(settings, run_token):
             return False
         if settings.robot_connection_mode == "simulated":
-            remote_program = str(MILL_PROGRAM_DIRECTORY / MILL_LOAD_POSITION_PROGRAM_NAME)
+            remote_program = str(_mill_program_root(settings) / MILL_LOAD_POSITION_PROGRAM_NAME)
         else:
             remote_program = _assert_mill_load_position_program_current(settings)
     return _run_mode_cnc_cycle(
@@ -5054,6 +6157,7 @@ def _run_mode_machine_cycle(session_factory, pallet_id: str, run_token: str | No
         if not pallet or pallet.location != "machine" or not pallet.program_path:
             raise problem(409, "The run-mode pallet is no longer ready in the mill.")
         remote_program = _run_mode_program_path(
+            settings,
             pallet.program_path,
             set(json.loads(settings.mill_program_extensions)),
         )
@@ -5491,6 +6595,55 @@ def recover_pallet_motion(session: Session, motion_id: str, payload: RecoverPall
     bump(settings)
     commit_or_conflict(session)
 
+    # A 104 latch is emitted only after the robot's atomic dispatcher returned.
+    # The operator just confirmed the physical result, so clear only this exact
+    # matching application latch. It never moves the robot or restarts Run Mode.
+    link_loss_command = session.scalar(
+        select(RobotSupervisorCommand)
+        .where(
+            RobotSupervisorCommand.robot_motion_id == motion_id,
+            RobotSupervisorCommand.result_code == FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION,
+        )
+        .order_by(RobotSupervisorCommand.sequence.desc())
+    )
+    supervisor_status = robot_supervisor().status()
+    if not link_loss_command or not (
+        supervisor_status.get("connected")
+        and supervisor_status.get("latched")
+        and supervisor_status.get("robot_last_sequence") == link_loss_command.sequence
+    ):
+        return
+    try:
+        clear = _new_supervisor_command(
+            session,
+            motion=None,
+            operation="clear_latch",
+            opcode=OP_CLEAR_LATCH,
+        )
+        outcome, detail = _dispatch_supervisor_command(
+            session,
+            clear,
+            max(5.0, settings.robot_timeout_seconds * 4),
+            allow_pre_dispatch_fallback=False,
+        )
+        if outcome != "completed":
+            diagnostics().record(
+                "robot_supervisor",
+                "recovery_latch_clear_pending",
+                "Pallet location was reconciled, but the matching supervisor latch could not be cleared.",
+                severity="warning",
+                details={"motion_id": motion_id, "sequence": link_loss_command.sequence, "detail": detail},
+            )
+    except (HTTPException, RobotDashboardError, RobotFileAccessError) as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        diagnostics().record(
+            "robot_supervisor",
+            "recovery_latch_clear_error",
+            "Pallet location was reconciled, but automatic supervisor latch clearing failed.",
+            severity="warning",
+            details={"motion_id": motion_id, "sequence": link_loss_command.sequence, "detail": detail},
+        )
+
 
 def interrupt_active_pallet_motion(session: Session) -> None:
     motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
@@ -5688,6 +6841,8 @@ def queue_pallet(
             409,
             "A stored pallet must be returned to the Pool before it can be queued.",
         )
+    if payload.convert_completed_to_raw and pallet.content_status == "complete_parts":
+        pallet.content_status = "raw_stock"
 
     queue = session.scalars(
         select(Pallet)
@@ -5805,24 +6960,15 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     program_catalog_changed = (
         payload.source_folder is not None or payload.program_extensions is not None
     )
-    supervisor_script_changed = any(
-        value is not None
-        for value in (
-            payload.pool_slot_count,
-            payload.pool_locations,
-            payload.on_deck_enabled,
-            payload.dripping_enabled,
-            payload.on_deck_location,
-            payload.dripping_location,
-            payload.robot_mill_load_unload,
-            payload.robot_mill_safe_entry_exit,
-            payload.pallet_motion_generation,
-            payload.robot_supervisor_hostname,
-            payload.robot_supervisor_port,
-            payload.robot_supervisor_heartbeat_seconds,
-            payload.robot_supervisor_telemetry_hz,
-            payload.robot_supervisor_reconnect_limit_seconds,
-        )
+    # Generated motion script freshness is enforced separately by
+    # ``motion_scripts_need_rebuild``. Only a real transport change makes the
+    # live supervisor connection itself untrusted.
+    supervisor_transport_before = (
+        settings.robot_supervisor_hostname,
+        settings.robot_supervisor_port,
+        settings.robot_supervisor_heartbeat_seconds,
+        settings.robot_supervisor_telemetry_hz,
+        settings.robot_supervisor_reconnect_limit_seconds,
     )
     highest_occupied = session.scalar(
         select(Pallet.pool_slot_number)
@@ -5895,24 +7041,23 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.robot_supervisor_enabled = payload.robot_supervisor_enabled
     if payload.robot_supervisor_hostname is not None:
         settings.robot_supervisor_hostname = payload.robot_supervisor_hostname
-        settings.robot_supervisor_activation_verified = False
-        settings.robot_supervisor_enabled = False
     if payload.robot_supervisor_listen_host is not None:
-        settings.robot_supervisor_listen_host = payload.robot_supervisor_listen_host or "0.0.0.0"
-        settings.robot_supervisor_activation_verified = False
-        settings.robot_supervisor_enabled = False
-        supervisor_listener_changed = True
+        listen_host = payload.robot_supervisor_listen_host or "0.0.0.0"
+        if settings.robot_supervisor_listen_host != listen_host:
+            settings.robot_supervisor_listen_host = listen_host
+            supervisor_listener_changed = True
     if payload.robot_supervisor_port is not None:
-        settings.robot_supervisor_port = payload.robot_supervisor_port
-        settings.robot_supervisor_activation_verified = False
-        settings.robot_supervisor_enabled = False
-        supervisor_listener_changed = True
+        if settings.robot_supervisor_port != payload.robot_supervisor_port:
+            settings.robot_supervisor_port = payload.robot_supervisor_port
+            supervisor_listener_changed = True
     if payload.robot_supervisor_heartbeat_seconds is not None:
-        settings.robot_supervisor_heartbeat_seconds = payload.robot_supervisor_heartbeat_seconds
-        supervisor_listener_changed = True
+        if settings.robot_supervisor_heartbeat_seconds != payload.robot_supervisor_heartbeat_seconds:
+            settings.robot_supervisor_heartbeat_seconds = payload.robot_supervisor_heartbeat_seconds
+            supervisor_listener_changed = True
     if payload.robot_supervisor_telemetry_hz is not None:
-        settings.robot_supervisor_telemetry_hz = payload.robot_supervisor_telemetry_hz
-        supervisor_listener_changed = True
+        if settings.robot_supervisor_telemetry_hz != payload.robot_supervisor_telemetry_hz:
+            settings.robot_supervisor_telemetry_hz = payload.robot_supervisor_telemetry_hz
+            supervisor_listener_changed = True
     if payload.robot_supervisor_reconnect_limit_seconds is not None:
         settings.robot_supervisor_reconnect_limit_seconds = payload.robot_supervisor_reconnect_limit_seconds
     if payload.robot_supervisor_pre_dispatch_fallback is not None:
@@ -5958,6 +7103,22 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.cnc_timeout_seconds = payload.cnc_timeout_seconds
     if payload.cnc_require_a_axis_homed is not None:
         settings.cnc_require_a_axis_homed = payload.cnc_require_a_axis_homed
+    if payload.mill_supervisor_enabled is not None:
+        if payload.mill_supervisor_enabled != settings.mill_supervisor_enabled:
+            raise problem(409, "Use the guarded mill supervisor activation control to change command routing.")
+    if payload.mill_supervisor_hostname is not None:
+        settings.mill_supervisor_hostname = payload.mill_supervisor_hostname
+        settings.mill_supervisor_activation_verified = False
+    if payload.mill_supervisor_listen_host is not None:
+        settings.mill_supervisor_listen_host = payload.mill_supervisor_listen_host or "0.0.0.0"
+        settings.mill_supervisor_activation_verified = False
+    if payload.mill_supervisor_port is not None:
+        settings.mill_supervisor_port = payload.mill_supervisor_port
+        settings.mill_supervisor_activation_verified = False
+    if payload.mill_supervisor_heartbeat_seconds is not None:
+        settings.mill_supervisor_heartbeat_seconds = payload.mill_supervisor_heartbeat_seconds
+    if payload.mill_supervisor_telemetry_hz is not None:
+        settings.mill_supervisor_telemetry_hz = payload.mill_supervisor_telemetry_hz
     if payload.mill_file_directory is not None:
         settings.mill_file_directory = payload.mill_file_directory
     if payload.mill_program_extensions is not None:
@@ -6001,7 +7162,14 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.pallet_motion_generation = json.dumps(generation, separators=(",", ":"))
     if payload.debug_menu_enabled is False:
         settings.machine_state = "idle"
-    if supervisor_script_changed:
+    supervisor_transport_after = (
+        settings.robot_supervisor_hostname,
+        settings.robot_supervisor_port,
+        settings.robot_supervisor_heartbeat_seconds,
+        settings.robot_supervisor_telemetry_hz,
+        settings.robot_supervisor_reconnect_limit_seconds,
+    )
+    if supervisor_transport_before != supervisor_transport_after:
         settings.robot_supervisor_activation_verified = False
         settings.robot_supervisor_enabled = False
     # Settings like robot poses, display units, or I/O labels must never erase
@@ -6047,9 +7215,9 @@ def configure_debug_program(session: Session, payload: ConfigureDebugProgram) ->
 
 def _validate_mill_debug_program(settings: AppSettings, filename: str) -> str:
     path = PurePosixPath(filename)
-    root = MILL_PROGRAM_DIRECTORY
+    root = _mill_program_root(settings)
     if not path.is_absolute() or ".." in path.parts or not path.is_relative_to(root):
-        raise problem(422, "Mill program filename must be inside /home/operator/gcode/Gcode.")
+        raise problem(422, f"Mill program filename must be inside {root}.")
     if path.suffix.lower() not in set(json.loads(settings.mill_program_extensions)):
         raise problem(422, "Mill program filename does not match the configured Mill program extensions.")
     return str(path)
@@ -6165,7 +7333,7 @@ def mill_program_files(session: Session) -> list[str]:
         return list_robot_program_files(
             host=settings.cnc_host.strip(), port=settings.cnc_ssh_port,
             username=settings.cnc_ssh_username, password=settings.cnc_ssh_password,
-            directory=str(MILL_PROGRAM_DIRECTORY),
+            directory=str(_mill_program_root(settings)),
             extensions=set(json.loads(settings.mill_program_extensions)),
             timeout_seconds=settings.cnc_timeout_seconds,
         )
@@ -6378,12 +7546,12 @@ def refresh_programs(session: Session, expected_revision: int) -> dict[str, obje
             metadata_by_program[program_path] = read_assigned_program_metadata(settings, program_path)
         metadata = metadata_by_program[program_path]
         previous = (
-            pallet.program_tools_json, pallet.expected_cycle_seconds,
+            pallet.program_tools_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
             pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
         )
         _store_pallet_program_metadata(pallet, metadata)
         current = (
-            pallet.program_tools_json, pallet.expected_cycle_seconds,
+            pallet.program_tools_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
             pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
         )
         metadata_changed = metadata_changed or previous != current

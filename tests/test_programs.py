@@ -7,11 +7,12 @@ from app.robot_files import RobotFileAccessError
 from app.service import program_metadata
 
 
-def mps_program(*tools: int, cycle_seconds: float = 60) -> str:
+def mps_program(*tools: int, cycle_seconds: float = 60, wcs: tuple[str, ...] = ("G54",)) -> str:
     return (
         "%\n"
         "(MPS-METADATA-V1)\n"
         f"(MPS-TOOLS:{','.join(str(tool) for tool in tools)})\n"
+        f"(MPS-WCS:{','.join(wcs)})\n"
         f"(MPS-CYCLE-SECONDS:{cycle_seconds})\n"
         "(MPS-CYCLE-BASIS:FUSION-CUTTING-ESTIMATE)\n"
         "(MPS-STATUS-FILE:/home/operator/gcode/MongoProduction/mill-status.txt)\n"
@@ -65,6 +66,7 @@ def test_program_scan_assignment_and_missing_file_reconciliation(
     board = response.json()
     assert board["pallets"][0]["program_path"] == "jobs/part-a.nc"
     assert board["pallets"][0]["program_tools"] == ["T1", "T20", "T105"]
+    assert board["pallets"][0]["program_wcs"] == ["G54"]
     assert board["pallets"][0]["expected_cycle_seconds"] == 92
     assert board["pallets"][0]["program_metadata_state"] == "parsed"
 
@@ -136,6 +138,7 @@ def test_program_refresh_reloads_metadata_for_existing_assignments(client: TestC
     ).json()["board"]
 
     assert refreshed["pallets"][0]["program_tools"] == ["T2", "T9"]
+    assert refreshed["pallets"][0]["program_wcs"] == ["G54"]
     assert refreshed["pallets"][0]["expected_cycle_seconds"] == 125
 
 
@@ -219,6 +222,7 @@ def test_program_metadata_parser_validates_and_sorts_header_values() -> None:
     parsed = parse_program_metadata(mps_program(105, 1, 20, 20, cycle_seconds=91.2))
 
     assert parsed["program_tools"] == ["T1", "T20", "T105"]
+    assert parsed["program_wcs"] == ["G54"]
     assert parsed["expected_cycle_seconds"] == 92
     assert parsed["program_metadata_state"] == "parsed"
     assert parsed["program_cycle_basis"] == "FUSION-CUTTING-ESTIMATE"
@@ -233,8 +237,14 @@ def test_program_metadata_parser_validates_and_sorts_header_values() -> None:
     assert legacy["program_tools"] == ["T1", "T20"]
     assert legacy["expected_cycle_seconds"] == 92
 
+    fallback = parse_program_metadata(
+        "(MPS-METADATA-V1)\n(MPS-TOOLS:1)\n(MPS-CYCLE-SECONDS:60)\nG54\nG59.2\nG54.1 P10\n"
+    )
+    assert fallback["program_wcs"] == ["G54", "G59.2", "G54.1 P10"]
+
     missing = parse_program_metadata("%\nM30\n")
     assert missing["program_tools"] == []
+    assert missing["program_wcs"] == []
     assert missing["expected_cycle_seconds"] is None
     assert missing["program_metadata_state"] == "unavailable"
 
@@ -242,9 +252,10 @@ def test_program_metadata_parser_validates_and_sorts_header_values() -> None:
 def test_parsed_program_metadata_is_hidden_after_completion() -> None:
     completed = program_metadata(
         "jobs/part-a.nc", "complete_parts", ["T1", "T20"], 92,
-        "parsed", "Metadata read.", "FUSION-CUTTING-ESTIMATE",
+        "parsed", "Metadata read.", "FUSION-CUTTING-ESTIMATE", ["G54"],
     )
 
     assert completed["program_tools"] == []
+    assert completed["program_wcs"] == []
     assert completed["expected_cycle_seconds"] is None
     assert completed["program_metadata_state"] == "parsed"

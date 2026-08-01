@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import pytest
 
 from app.robot_supervisor import (
     EVENT_ACCEPTED,
     EVENT_COMPLETED,
+    EVENT_LATCHED,
     EVENT_RUNNING,
+    FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION,
     KIND_EVENT,
     FrameBuffer,
     DispatchReceipt,
@@ -18,8 +21,9 @@ from app.robot_supervisor import (
     encode_frame,
 )
 from app import service
+from app import main as application_main
 from app.models import RobotSupervisorCommand
-from app.schemas import StartPalletMotion
+from app.schemas import StartPalletMotion, SupervisorReconcile
 
 
 def event_frame(sequence: int, event: int) -> bytes:
@@ -72,6 +76,21 @@ def test_event_ordering_rejects_regression_but_allows_duplicate() -> None:
     manager._handle_frame(decode_frame(event_frame(4, EVENT_RUNNING)))
     with pytest.raises(SupervisorProtocolError, match="Out-of-order"):
         manager._handle_frame(decode_frame(event_frame(4, EVENT_ACCEPTED)))
+
+
+def test_robot_status_document_checkpoints_robot_event(tmp_path: Path) -> None:
+    document_path = tmp_path / "robot-supervisor-status.json"
+    manager = RobotSupervisorManager(status_document_path=document_path)
+
+    manager._handle_frame(decode_frame(event_frame(42, EVENT_COMPLETED)))
+
+    status = manager.status_document()
+    assert status["available"] is True
+    assert status["document"]["version"] == "MPS-ROBOT-STATUS-V1"
+    assert status["document"]["command"]["last_sequence"] == 42
+    assert status["document"]["command"]["last_event"] == "completed"
+    assert status["document"]["command"]["fault_code"] == 0
+    assert "telemetry" not in status["document"]
 
 
 def test_conflicting_terminal_events_are_rejected() -> None:
@@ -144,6 +163,35 @@ def test_supervisor_cannot_be_enabled_before_no_motion_handshake(client) -> None
     assert response.status_code == 409
 
 
+def test_unchanged_supervisor_settings_preserve_verified_connection(client) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+
+    board = client.get("/api/board").json()
+    settings = board["settings"]
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "robot_supervisor_enabled": True,
+            "robot_supervisor_hostname": settings["robot_supervisor_hostname"],
+            "robot_supervisor_listen_host": settings["robot_supervisor_listen_host"],
+            "robot_supervisor_port": settings["robot_supervisor_port"],
+            "robot_supervisor_heartbeat_seconds": settings["robot_supervisor_heartbeat_seconds"],
+            "robot_supervisor_telemetry_hz": settings["robot_supervisor_telemetry_hz"],
+            "robot_supervisor_reconnect_limit_seconds": settings["robot_supervisor_reconnect_limit_seconds"],
+        },
+    )
+
+    assert response.status_code == 200
+    refreshed = client.get("/api/board").json()["settings"]
+    assert refreshed["robot_supervisor_enabled"] is True
+    assert refreshed["robot_supervisor_activation_verified"] is True
+
+
 def test_live_supervisor_listener_prevents_legacy_telemetry_polling(client, monkeypatch) -> None:
     class ListeningSupervisor:
         def status(self):
@@ -168,6 +216,186 @@ def test_live_supervisor_listener_prevents_legacy_telemetry_polling(client, monk
     assert response.status_code == 200
     assert response.json()["source"] == "robot-supervisor"
     assert response.json()["revision"] == expected_revision
+
+
+def test_idle_supervisor_recovery_restarts_only_the_local_listener(client, monkeypatch) -> None:
+    class DisconnectedSupervisor:
+        def __init__(self):
+            self.stopped = 0
+            self.started = []
+
+        def status(self):
+            return {"connected": False}
+
+        def stop(self):
+            self.stopped += 1
+
+        def start(self, *args):
+            self.started.append(args)
+
+    supervisor = DisconnectedSupervisor()
+    monkeypatch.setattr(service, "robot_supervisor", lambda: supervisor)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+        assert service.recover_robot_supervisor_connection(session, trigger="test") is True
+    assert supervisor.stopped == 1
+    assert supervisor.started
+
+
+def test_supervisor_recovery_refuses_active_run_mode(client, monkeypatch) -> None:
+    class DisconnectedSupervisor:
+        def status(self):
+            return {"connected": False}
+
+        def stop(self):
+            raise AssertionError("must not reset during Run Mode")
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: DisconnectedSupervisor())
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        settings.run_mode_enabled = True
+        session.commit()
+        assert service.recover_robot_supervisor_connection(session, trigger="test") is False
+
+
+def test_manual_program_recovery_refuses_to_replace_a_loaded_controller_program(client, monkeypatch) -> None:
+    class DisconnectedSupervisor:
+        def status(self):
+            return {"connected": False}
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: DisconnectedSupervisor())
+    monkeypatch.setattr(
+        service,
+        "robot_program_status",
+        lambda *_args: {"running": False, "loaded_program": "/programs/operator-job.urp"},
+    )
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.48"
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+        with pytest.raises(Exception, match="controller program selected"):
+            service.recover_robot_supervisor_program(session, trigger="test")
+
+
+def test_manual_program_recovery_bootstraps_only_when_dashboard_is_idle(client, monkeypatch) -> None:
+    class DisconnectedSupervisor:
+        def status(self):
+            return {"connected": False}
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: DisconnectedSupervisor())
+    monkeypatch.setattr(service, "robot_program_status", lambda *_args: {"running": False, "loaded_program": None})
+    expected = {"connected": True, "reconciliation_required": True}
+    monkeypatch.setattr(service, "bootstrap_robot_supervisor", lambda _session: expected)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.48"
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+        assert service.recover_robot_supervisor_program(session, trigger="test") == expected
+
+
+def test_manual_program_recovery_api_uses_the_guarded_service(client, monkeypatch) -> None:
+    monkeypatch.setattr(
+        application_main,
+        "recover_robot_supervisor_program",
+        lambda _session, *, trigger: {"connected": True, "trigger": trigger},
+    )
+
+    response = client.post("/api/debug/robot-supervisor/recover", json={})
+
+    assert response.status_code == 200
+    assert response.json() == {"connected": True, "trigger": "operator"}
+
+
+def test_auto_controller_recovery_leaves_live_supervisors_untouched(client, monkeypatch) -> None:
+    class ConnectedSupervisor:
+        def status(self):
+            return {"connected": True, "telemetry_age_seconds": 0.1}
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: ConnectedSupervisor())
+    monkeypatch.setattr(service, "mill_supervisor", lambda: ConnectedSupervisor())
+    monkeypatch.setattr(service, "robot_dashboard_health", lambda *_args: {"ok": True})
+    monkeypatch.setattr(service, "read_linuxcnc_cycle_state", lambda *_args: {"interp_state": 1})
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        settings.mill_supervisor_enabled = True
+        settings.mill_supervisor_activation_verified = True
+        session.commit()
+
+        result = service.auto_recover_controller_connections(session)
+
+    assert result["results"] == [
+        {"controller": "Mongo", "action": "Healthy", "detail": "Supervisor connection and telemetry are live."},
+        {"controller": "Mongo", "action": "Dashboard checked", "detail": "Dashboard responded."},
+        {"controller": "Mill", "action": "PathPilot checked", "detail": "PathPilot reports Idle."},
+        {"controller": "Mill", "action": "Healthy", "detail": "Mill supervisor connection and telemetry are live."},
+    ]
+
+
+def test_supervisor_latch_cannot_clear_an_unconfirmed_command(client, monkeypatch) -> None:
+    fake = CompletedSupervisor()
+    monkeypatch.setattr(service, "robot_supervisor", lambda: fake)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+        command = service._new_supervisor_command(
+            session,
+            motion=None,
+            operation="load_mill",
+            opcode=1,
+        )
+        command.status = "uncertain"
+        session.commit()
+
+        with pytest.raises(Exception, match="Confirm whether the physical operation completed"):
+            service.reconcile_robot_supervisor(
+                session,
+                SupervisorReconcile(
+                    expected_revision=service.get_settings(session).revision,
+                    sequence=command.sequence,
+                    resolution="clear_latch",
+                ),
+            )
+
+        service.reconcile_robot_supervisor(
+            session,
+            SupervisorReconcile(
+                expected_revision=service.get_settings(session).revision,
+                sequence=command.sequence,
+                resolution="accept_completed",
+            ),
+        )
+        assert session.get(RobotSupervisorCommand, command.id).status == "operator_completed"
+
+
+def test_explicit_listener_restart_refuses_active_run_mode(client, monkeypatch) -> None:
+    class Supervisor:
+        def stop(self):
+            raise AssertionError("must not restart during Run Mode")
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: Supervisor())
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        settings.run_mode_enabled = True
+        session.commit()
+        with pytest.raises(Exception, match="Stop Run Mode"):
+            service.restart_robot_supervisor_listener(session, trigger="test")
 
 
 class CompletedSupervisor:
@@ -201,6 +429,49 @@ class CompletedSupervisor:
             SupervisorEvent(sequence, EVENT_ACCEPTED, robot_session=9001),
             SupervisorEvent(sequence, EVENT_RUNNING, robot_session=9001),
             SupervisorEvent(sequence, EVENT_COMPLETED, robot_session=9001),
+        ]
+
+
+class CompletedLinkLossSupervisor(CompletedSupervisor):
+    """Reports a completed atomic step followed by a recoverable 104 latch."""
+
+    def __init__(self):
+        super().__init__()
+        self.latched = False
+        self.link_loss_sequence = 0
+
+    def status(self):
+        result = super().status()
+        result["latched"] = self.latched
+        result["robot_last_sequence"] = self.sequence
+        result["robot_last_event"] = "latched" if self.latched else "completed"
+        return result
+
+    def dispatch(self, sequence, *_args, **_kwargs):
+        self.sequence = sequence
+        if self.link_loss_sequence == 0:
+            self.link_loss_sequence = sequence
+            self.latched = True
+        else:
+            self.latched = False
+        return DispatchReceipt(sequence, attempted=True, sent=True)
+
+    def wait_for_event(self, sequence, _timeout, **_kwargs):
+        if sequence == self.link_loss_sequence:
+            return SupervisorEvent(sequence, EVENT_LATCHED, FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION, robot_session=9001)
+        return SupervisorEvent(sequence, EVENT_COMPLETED, robot_session=9001)
+
+    def events_for(self, sequence):
+        terminal = EVENT_LATCHED if sequence == self.link_loss_sequence else EVENT_COMPLETED
+        return [
+            SupervisorEvent(sequence, EVENT_ACCEPTED, robot_session=9001),
+            SupervisorEvent(sequence, EVENT_RUNNING, robot_session=9001),
+            SupervisorEvent(
+                sequence,
+                terminal,
+                FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION if terminal == EVENT_LATCHED else 0,
+                robot_session=9001,
+            ),
         ]
 
 
@@ -254,6 +525,20 @@ def test_matching_completed_event_updates_board_once_and_persists_ledger(client,
         assert ledger.attempted is True
         assert ledger.accepted_at is not None
         assert ledger.started_at is not None
+
+
+def test_completed_link_loss_is_cleared_before_applying_the_known_motion_result(client, monkeypatch) -> None:
+    pallet, motion_id = _supervisor_motion(client, monkeypatch, CompletedLinkLossSupervisor())
+
+    service.execute_pallet_motion(client.app.state.session_factory, motion_id)
+
+    result = client.get("/api/board").json()
+    moved = next(item for item in result["pallets"] if item["id"] == pallet["id"])
+    assert moved["location"] == "robot_held"
+    with client.app.state.session_factory() as session:
+        ledger = session.query(RobotSupervisorCommand).order_by(RobotSupervisorCommand.sequence).all()
+        assert [item.status for item in ledger] == ["completed_link_lost", "completed"]
+        assert ledger[0].result_code == FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION
 
 
 def test_uncertain_supervisor_send_faults_without_legacy_fallback(client, monkeypatch) -> None:

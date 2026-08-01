@@ -76,6 +76,14 @@ class AppSettings(Base):
     cnc_ssh_password: Mapped[str] = mapped_column(String(500), default="")
     cnc_timeout_seconds: Mapped[float] = mapped_column(Float, default=2.0)
     cnc_require_a_axis_homed: Mapped[bool] = mapped_column(Boolean, default=False)
+    mill_supervisor_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mill_supervisor_activation_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    mill_supervisor_hostname: Mapped[str] = mapped_column(String(255), default="DESKTOP-KF5I73N.lan")
+    mill_supervisor_listen_host: Mapped[str] = mapped_column(String(255), default="0.0.0.0")
+    mill_supervisor_port: Mapped[int] = mapped_column(Integer, default=50011)
+    mill_supervisor_heartbeat_seconds: Mapped[float] = mapped_column(Float, default=5.0)
+    mill_supervisor_telemetry_hz: Mapped[float] = mapped_column(Float, default=1.0)
+    mill_supervisor_last_sequence: Mapped[int] = mapped_column(Integer, default=0)
     run_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     run_mode_safety_confirm: Mapped[bool] = mapped_column(Boolean, default=True)
     run_mode_state: Mapped[str] = mapped_column(String(30), default="idle")
@@ -166,6 +174,7 @@ class Pallet(Base):
     content_status: Mapped[str] = mapped_column(String(30))
     program_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     program_tools_json: Mapped[str] = mapped_column(String, default="[]")
+    program_wcs_json: Mapped[str] = mapped_column(String, default="[]")
     expected_cycle_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     program_metadata_state: Mapped[str] = mapped_column(String(20), default="unavailable")
     program_metadata_detail: Mapped[str] = mapped_column(String(500), default="")
@@ -230,6 +239,30 @@ class RobotSupervisorCommand(Base):
     started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     result_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fault_detail: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class MillSupervisorCommand(Base):
+    __tablename__ = "mill_supervisor_commands"
+    __table_args__ = (
+        Index("uq_mill_supervisor_sequence", "sequence", unique=True),
+        Index("ix_mill_supervisor_status", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    mill_session: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    app_session: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operation: Mapped[str] = mapped_column(String(40), nullable=False)
+    arguments_json: Mapped[str] = mapped_column(String, default="{}")
+    status: Mapped[str] = mapped_column(String(20), default="created")
+    attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    sent_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    accepted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    result_json: Mapped[str] = mapped_column(String, default="{}")
     fault_detail: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 

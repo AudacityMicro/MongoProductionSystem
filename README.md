@@ -186,6 +186,17 @@ pauses the queue before the pallet is moved or marked complete. The operator
 can rerun the assigned program, confirm manual completion and unload, or leave
 the pallet in the mill.
 
+## Staged Mill Supervisor
+
+The repository includes a controller-resident, PathPilot-originated mill
+supervisor prepared for a later rollout. It uses a separate outbound TCP port
+(`50011` by default) and a Python 3.4-compatible agent to reduce repeated SSH
+telemetry and command traffic. It is intentionally disabled by default: the
+application does not upload or start the agent, install a firewall rule, open a
+listener, or change the current SSH workflow automatically. Activation must be
+performed later through the explicit firewall and telemetry-only handshake
+steps in Settings, after a controlled soak test.
+
 When action confirmation is enabled, the operator must approve loading,
 machining, and unloading. Stopping Run Mode prevents the next workflow step;
 it does not abort a controller program that has already been dispatched. Use

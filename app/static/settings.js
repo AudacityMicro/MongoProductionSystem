@@ -44,6 +44,18 @@ const ui = {
   cncRequireAAxisHomed: document.querySelector("#cnc-require-a-axis-homed"),
   testCncTelemetry: document.querySelector("#test-cnc-telemetry"),
   cncTelemetryStatus: document.querySelector("#cnc-telemetry-status"),
+  millSupervisorHostname: document.querySelector("#mill-supervisor-hostname"),
+  millSupervisorListenHost: document.querySelector("#mill-supervisor-listen-host"),
+  millSupervisorPort: document.querySelector("#mill-supervisor-port"),
+  millSupervisorHeartbeatSeconds: document.querySelector("#mill-supervisor-heartbeat-seconds"),
+  millSupervisorTelemetryHz: document.querySelector("#mill-supervisor-telemetry-hz"),
+  installMillSupervisorFirewall: document.querySelector("#install-mill-supervisor-firewall"),
+  bootstrapMillSupervisor: document.querySelector("#bootstrap-mill-supervisor"),
+  updateMillSupervisorAgent: document.querySelector("#update-mill-supervisor-agent"),
+  activateMillSupervisor: document.querySelector("#activate-mill-supervisor"),
+  deactivateMillSupervisor: document.querySelector("#deactivate-mill-supervisor"),
+  testMillSupervisorCommand: document.querySelector("#test-mill-supervisor-command"),
+  millSupervisorStatus: document.querySelector("#mill-supervisor-status"),
   debugProgramButtonCount: document.querySelector("#debug-program-button-count"),
   debugMillProgramButtonCount: document.querySelector("#debug-mill-program-button-count"),
   robotFileAccessEnabled: document.querySelector("#robot-file-access-enabled"),
@@ -583,6 +595,12 @@ function settingsDraft() {
     cnc_ssh_password: ui.cncSshPassword.value,
     cnc_timeout_seconds: fieldNumber(ui.cncTimeoutSeconds, board.settings.cnc_timeout_seconds || 2),
     cnc_require_a_axis_homed: ui.cncRequireAAxisHomed.checked,
+    mill_supervisor_enabled: board.settings.mill_supervisor_enabled === true,
+    mill_supervisor_hostname: ui.millSupervisorHostname.value.trim() || "DESKTOP-KF5I73N.lan",
+    mill_supervisor_listen_host: ui.millSupervisorListenHost.value.trim() || "0.0.0.0",
+    mill_supervisor_port: fieldNumber(ui.millSupervisorPort, 50011),
+    mill_supervisor_heartbeat_seconds: fieldNumber(ui.millSupervisorHeartbeatSeconds, 5),
+    mill_supervisor_telemetry_hz: fieldNumber(ui.millSupervisorTelemetryHz, 1),
     debug_program_button_count: fieldNumber(ui.debugProgramButtonCount, board.settings.debug_program_button_count || 4),
     debug_mill_program_button_count: fieldNumber(ui.debugMillProgramButtonCount, board.settings.debug_mill_program_button_count || 4),
     robot_file_access_enabled: ui.robotFileAccessEnabled.checked,
@@ -702,6 +720,19 @@ async function loadSettings() {
     ui.cncSshPassword.value = board.settings.cnc_ssh_password || "";
     ui.cncTimeoutSeconds.value = board.settings.cnc_timeout_seconds || 2;
     ui.cncRequireAAxisHomed.checked = Boolean(board.settings.cnc_require_a_axis_homed);
+    ui.millSupervisorHostname.value = board.settings.mill_supervisor_hostname || "DESKTOP-KF5I73N.lan";
+    ui.millSupervisorListenHost.value = board.settings.mill_supervisor_listen_host || "0.0.0.0";
+    ui.millSupervisorPort.value = board.settings.mill_supervisor_port || 50011;
+    ui.millSupervisorHeartbeatSeconds.value = board.settings.mill_supervisor_heartbeat_seconds ?? 5;
+    ui.millSupervisorTelemetryHz.value = board.settings.mill_supervisor_telemetry_hz ?? 1;
+    ui.millSupervisorStatus.textContent = board.settings.mill_supervisor_activation_verified
+      ? board.settings.mill_supervisor_enabled
+        ? "Persistent mill supervisor command routing is active."
+        : "Telemetry-only handshake verified. Supervisor commands remain disabled."
+      : "Inactive. No connection will be started automatically.";
+    ui.activateMillSupervisor.disabled = !board.settings.mill_supervisor_activation_verified || board.settings.mill_supervisor_enabled;
+    ui.deactivateMillSupervisor.disabled = !board.settings.mill_supervisor_enabled;
+    ui.testMillSupervisorCommand.disabled = !board.settings.mill_supervisor_enabled;
     ui.runModeSafetyConfirm.checked = board.settings.run_mode_safety_confirm !== false;
     ui.runModeSafetyConfirm.disabled = Boolean(board.run_mode?.enabled);
     ui.debugProgramButtonCount.value = board.settings.debug_program_button_count || 4;
@@ -855,6 +886,137 @@ ui.testCncTelemetry.addEventListener("click", async () => {
   } finally {
     ui.testCncTelemetry.disabled = false;
     ui.testCncTelemetry.textContent = originalLabel;
+  }
+});
+
+ui.installMillSupervisorFirewall.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save the staged mill supervisor settings before installing its firewall rule.", "error");
+    return;
+  }
+  ui.installMillSupervisorFirewall.disabled = true;
+  try {
+    const result = await api("/api/debug/cnc/supervisor/firewall", {method: "POST", body: "{}"});
+    ui.millSupervisorStatus.textContent = `${result.message} Approve the Windows prompt. The mill remains on its existing SSH workflow.`;
+  } catch (error) {
+    ui.millSupervisorStatus.textContent = error.message;
+  } finally {
+    ui.installMillSupervisorFirewall.disabled = false;
+  }
+});
+
+ui.bootstrapMillSupervisor.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save the staged mill supervisor settings before its telemetry-only handshake.", "error");
+    return;
+  }
+  if (await window.mpsConfirm({
+    eyebrow: "Staged mill supervisor",
+    title: "Start telemetry-only agent?",
+    message: "It will not load, stop, or run any PathPilot program.",
+    tone: "warning",
+    primaryLabel: "Start telemetry agent",
+  }) !== "primary") return;
+  const label = ui.bootstrapMillSupervisor.textContent;
+  ui.bootstrapMillSupervisor.disabled = true;
+  ui.bootstrapMillSupervisor.textContent = "Waiting for PathPilot...";
+  ui.millSupervisorStatus.textContent = "Deploying the telemetry-only agent. No mill program will be changed.";
+  try {
+    const status = await api("/api/debug/cnc/supervisor/bootstrap", {method: "POST", body: "{}"});
+    ui.millSupervisorStatus.textContent = status.connected
+      ? "Telemetry-only handshake verified. Supervisor commands remain disabled."
+      : "Agent deployment finished without a connection.";
+    board = await api("/api/board", {cache: "no-store"});
+  } catch (error) {
+    ui.millSupervisorStatus.textContent = error.message;
+  } finally {
+    ui.bootstrapMillSupervisor.disabled = false;
+    ui.bootstrapMillSupervisor.textContent = label;
+  }
+});
+
+ui.updateMillSupervisorAgent.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) return showToast("Save or discard Settings changes before updating the mill agent.", "error");
+  if (await window.mpsConfirm({
+    eyebrow: "Mill supervisor",
+    title: "Update the mill-side agent?",
+    message: "PathPilot must be Idle and Run Mode stopped. This replaces and restarts only the mill supervisor helper; it does not load, start, stop, or alter a G-code program.",
+    tone: "warning",
+    primaryLabel: "Update agent",
+  }) !== "primary") return;
+  ui.updateMillSupervisorAgent.disabled = true;
+  try {
+    const current = await api("/api/board", {cache: "no-store"});
+    const status = await api("/api/debug/cnc/supervisor/update-agent", {
+      method: "PUT",
+      body: JSON.stringify({expected_revision: current.revision, enabled: current.settings.mill_supervisor_enabled, confirmed: true}),
+    });
+    board = await api("/api/board", {cache: "no-store"});
+    ui.millSupervisorStatus.textContent = status.enabled
+      ? "Mill agent updated and command routing restored."
+      : "Mill agent updated in telemetry-only mode.";
+    showToast("Mill-side supervisor agent updated.");
+  } catch (error) {
+    ui.millSupervisorStatus.textContent = error.message;
+  } finally {
+    ui.updateMillSupervisorAgent.disabled = false;
+  }
+});
+
+async function changeMillSupervisorActivation(enabled) {
+  if (hasUnsavedChanges()) {
+    showToast("Save or discard Settings changes before changing mill supervisor routing.", "error");
+    return;
+  }
+  if (await window.mpsConfirm({
+    eyebrow: "Mill supervisor",
+    title: enabled ? "Activate persistent mill control?" : "Return to telemetry-only mode?",
+    message: enabled
+      ? "PathPilot must be Idle. Future scheduler and mill-loading programs will use the durable controller-resident command ledger instead of per-cycle SSH commands."
+      : "PathPilot must be Idle. Future mill commands will return to the existing SSH workflow.",
+    tone: enabled ? "warning" : "info",
+    primaryLabel: enabled ? "Activate routing" : "Use telemetry only",
+  }) !== "primary") return;
+  ui.activateMillSupervisor.disabled = true;
+  ui.deactivateMillSupervisor.disabled = true;
+  try {
+    const current = await api("/api/board", {cache: "no-store"});
+    const status = await api("/api/debug/cnc/supervisor/activation", {
+      method: "PUT",
+      body: JSON.stringify({
+        expected_revision: current.revision,
+        enabled,
+        confirmed: true,
+      }),
+    });
+    board = await api("/api/board", {cache: "no-store"});
+    initialSettings = settingsDraft();
+    ui.millSupervisorStatus.textContent = enabled
+      ? "Persistent mill supervisor command routing is active."
+      : "Telemetry-only handshake verified. Command routing is disabled.";
+    ui.activateMillSupervisor.disabled = status.enabled;
+    ui.deactivateMillSupervisor.disabled = !status.enabled;
+    showToast(enabled ? "Mill supervisor command routing activated." : "Mill supervisor returned to telemetry-only mode.");
+  } catch (error) {
+    ui.millSupervisorStatus.textContent = error.message;
+    board = await api("/api/board", {cache: "no-store"});
+    ui.activateMillSupervisor.disabled = !board.settings.mill_supervisor_activation_verified || board.settings.mill_supervisor_enabled;
+    ui.deactivateMillSupervisor.disabled = !board.settings.mill_supervisor_enabled;
+  }
+}
+
+ui.activateMillSupervisor.addEventListener("click", () => changeMillSupervisorActivation(true));
+ui.deactivateMillSupervisor.addEventListener("click", () => changeMillSupervisorActivation(false));
+ui.testMillSupervisorCommand.addEventListener("click", async () => {
+  ui.testMillSupervisorCommand.disabled = true;
+  try {
+    const result = await api("/api/debug/cnc/supervisor/test-command", {method: "POST", body: "{}"});
+    ui.millSupervisorStatus.textContent = `${result.message} Sequence ${result.sequence}.`;
+    showToast("No-motion mill supervisor command passed.");
+  } catch (error) {
+    ui.millSupervisorStatus.textContent = error.message;
+  } finally {
+    ui.testMillSupervisorCommand.disabled = !board.settings.mill_supervisor_enabled;
   }
 });
 
@@ -1219,7 +1381,13 @@ ui.fusionToolLibraryUpload.addEventListener("change", async () => {
 
 ui.fusionToolLibraryList.addEventListener("click", async event => {
   const button = event.target.closest("[data-fusion-library-path]");
-  if (!button || !window.confirm("Remove this uploaded Fusion tool library?")) return;
+  if (!button || await window.mpsConfirm({
+    eyebrow: "Tool library",
+    title: "Remove uploaded library?",
+    message: "This removes the uploaded Fusion tool library from the application.",
+    tone: "danger",
+    primaryLabel: "Remove library",
+  }) !== "primary") return;
   try {
     await api(`/api/tool-libraries?path=${encodeURIComponent(button.dataset.fusionLibraryPath)}`, {method: "DELETE"});
     showToast("Fusion tool library removed.");

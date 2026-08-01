@@ -26,6 +26,23 @@ _SSH_RETRY_AFTER = 0.0
 _SSH_FAILURE_COUNT = 0
 _SSH_SUSPENDED = False
 
+# PathPilot's ordinary SSH shell does not include the controller's LinuxCNC
+# module or NML configuration. Keep every controller-side Python invocation
+# on the same environment used by the established telemetry adapter.
+_PATHPILOT_LINUXCNC_ENVIRONMENT = (
+    "export PYTHONPATH=/home/operator/tmc/python:/home/operator/tmc/lib/python:"
+    "/home/operator/tmc/python/config_picker:${PYTHONPATH:-}; "
+    "export LD_LIBRARY_PATH=/home/operator/tmc/lib:${LD_LIBRARY_PATH:-}; "
+    "export NML_FILE=${NML_FILE:-/home/operator/tmc/configs/common/linuxcnc.nml}; "
+    "for env_script in "
+    "/home/operator/tmc/scripts/rip_environment.sh "
+    "/home/operator/tmc/scripts/rip_enviroment.sh "
+    "/home/operator/tmc/script/rip_environment.sh "
+    "/home/operator/tmc/script/rip_enviroment.sh; do "
+    "if [ -r \"$env_script\" ]; then . \"$env_script\"; break; fi; "
+    "done; "
+)
+
 
 # This runs on the controller and intentionally creates only a linuxcnc.stat()
 # object. Do not add linuxcnc.command() calls to this telemetry adapter.
@@ -396,22 +413,7 @@ print("MONGO_CNC_CYCLE=" + json.dumps({
 
 def _remote_command(remote_script: str, timeout_seconds: float) -> str:
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
-    # PathPilot's ordinary SSH shell does not include its LinuxCNC module or
-    # NML_FILE. Source either spelling and directory used by PathPilot builds.
-    script = (
-        "export PYTHONPATH=/home/operator/tmc/python:/home/operator/tmc/lib/python:"
-        "/home/operator/tmc/python/config_picker:${PYTHONPATH:-}; "
-        "export LD_LIBRARY_PATH=/home/operator/tmc/lib:${LD_LIBRARY_PATH:-}; "
-        "export NML_FILE=${NML_FILE:-/home/operator/tmc/configs/common/linuxcnc.nml}; "
-        "for env_script in "
-        "/home/operator/tmc/scripts/rip_environment.sh "
-        "/home/operator/tmc/scripts/rip_enviroment.sh "
-        "/home/operator/tmc/script/rip_environment.sh "
-        "/home/operator/tmc/script/rip_enviroment.sh; do "
-        "if [ -r \"$env_script\" ]; then . \"$env_script\"; break; fi; "
-        "done; "
-        f"exec python -c \"import base64;exec(base64.b64decode('{encoded}'))\""
-    )
+    script = _PATHPILOT_LINUXCNC_ENVIRONMENT + f"exec python -c \"import base64;exec(base64.b64decode('{encoded}'))\""
     # Bound the process on PathPilot itself. Closing an SSH channel does not
     # reliably terminate its remote child, which can otherwise leave a stale
     # telemetry or command process behind after a network timeout.
@@ -540,6 +542,96 @@ def resume_cnc_connections() -> None:
         _SSH_RETRY_AFTER = 0.0
 
 
+def start_mill_supervisor_agent(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+    script_path: str,
+    config_path: str,
+    pid_path: str,
+) -> None:
+    """Start the staged PathPilot agent only after an explicit operator request."""
+    agent_command = _PATHPILOT_LINUXCNC_ENVIRONMENT + "exec python {script} {config}".format(
+        script=shlex.quote(script_path), config=shlex.quote(config_path)
+    )
+    command = (
+        "if [ -f {pid} ] && kill -0 $(cat {pid}) 2>/dev/null; then exit 0; fi; "
+        "nohup bash -lc {agent} >/tmp/mps-mill-supervisor.log 2>&1 & echo $! > {pid}"
+    ).format(
+        pid=shlex.quote(pid_path),
+        agent=shlex.quote(agent_command),
+    )
+    with _SSH_LOCK:
+        client = _persistent_ssh_client(host, port, username, password, timeout)
+        try:
+            _stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            exit_status = stdout.channel.recv_exit_status()
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            _close_ssh_client()
+            _record_ssh_failure()
+            raise CncTelemetryError(f"Could not start the mill supervisor agent: {exc}") from exc
+    if exit_status != 0:
+        raise CncTelemetryError(f"Could not start the mill supervisor agent: {detail or 'remote shell returned a failure.'}")
+
+
+def stop_mill_supervisor_agent(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+    pid_path: str,
+) -> None:
+    """Stop only the MPS helper process; never touch LinuxCNC or PathPilot."""
+    command = (
+        "if [ -f {pid} ]; then "
+        "pid=$(cat {pid}); if kill -0 $pid 2>/dev/null; then kill $pid; fi; "
+        "rm -f {pid}; fi"
+    ).format(pid=shlex.quote(pid_path))
+    with _SSH_LOCK:
+        client = _persistent_ssh_client(host, port, username, password, timeout)
+        try:
+            _stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            exit_status = stdout.channel.recv_exit_status()
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            _close_ssh_client()
+            _record_ssh_failure()
+            raise CncTelemetryError(f"Could not stop the mill supervisor agent: {exc}") from exc
+    if exit_status != 0:
+        raise CncTelemetryError(f"Could not stop the mill supervisor agent: {detail or 'remote shell returned a failure.'}")
+
+
+def test_mill_supervisor_runtime(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+) -> None:
+    """Verify the exact PathPilot Python runtime before deploying its agent."""
+    with _SSH_LOCK:
+        client = _persistent_ssh_client(host, port, username, password, timeout)
+        try:
+            _stdin, stdout, stderr = client.exec_command(
+                _remote_command("import linuxcnc; print('MPS_RUNTIME=ok')", timeout), timeout=timeout
+            )
+            exit_status = stdout.channel.recv_exit_status()
+            output = stdout.read().decode("utf-8", errors="replace")
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            _close_ssh_client()
+            _record_ssh_failure()
+            raise CncTelemetryError(f"Could not verify the PathPilot Python runtime: {exc}") from exc
+    if exit_status != 0 or "MPS_RUNTIME=ok" not in output:
+        raise CncTelemetryError(
+            "PathPilot's python runtime cannot import linuxcnc: " + (detail or "remote check failed.")
+        )
+
+
 def read_linuxcnc_snapshot(host: str, port: int, username: str, password: str, timeout: float) -> dict:
     return _read_remote_payload(host, port, username, password, timeout, _REMOTE_STATUS_SCRIPT, "MONGO_CNC=")
 
@@ -552,6 +644,73 @@ def read_linuxcnc_cycle_state(host: str, port: int, username: str, password: str
 def read_linuxcnc_io_labels(host: str, port: int, username: str, password: str, timeout: float) -> dict:
     """Read PathPilot's static HAL signal-to-channel labels."""
     return _read_remote_payload(host, port, username, password, timeout, _REMOTE_IO_LABELS_SCRIPT, "MONGO_CNC_LABELS=")
+
+
+def run_linuxcnc_network_ping_matrix(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+    targets: list[dict[str, str]],
+    count: int = 5,
+) -> list[dict]:
+    """Run bounded ICMP probes on PathPilot without touching LinuxCNC state."""
+    safe_count = max(1, min(int(count), 10))
+    remote_script = f'''import json
+import re
+import subprocess
+
+targets = {targets!r}
+count = {safe_count!r}
+paths = []
+for target in targets:
+    destination = target.get("host", "")
+    label = target.get("label", destination)
+    if not destination:
+        continue
+    try:
+        process = subprocess.Popen(
+            ["ping", "-c", str(count), "-W", "1", destination],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        stdout, stderr = process.communicate()
+        output = (stdout + b"\\n" + stderr).decode("utf-8", "replace")
+        times = [float(value) for value in re.findall(r"time[=<]([0-9.]+)\\s*ms", output)]
+        summary = re.search(r"(\\d+) packets transmitted, (\\d+) (?:packets )?received", output)
+        received = int(summary.group(2)) if summary else len(times)
+        sent = int(summary.group(1)) if summary else count
+        paths.append({{
+            "source": "Mill",
+            "target": label,
+            "host": destination,
+            "method": "icmp",
+            "supported": True,
+            "sent": sent,
+            "received": received,
+            "packet_loss_percent": round((sent - received) * 100.0 / sent, 1) if sent else 100.0,
+            "minimum_ms": min(times) if times else None,
+            "average_ms": round(sum(times) / len(times), 3) if times else None,
+            "maximum_ms": max(times) if times else None,
+            "transit_times_ms": times,
+        }})
+    except Exception as exc:
+        paths.append({{
+            "source": "Mill", "target": label, "host": destination, "method": "icmp",
+            "supported": True, "error": str(exc), "sent": count, "received": 0,
+            "packet_loss_percent": 100.0, "minimum_ms": None, "average_ms": None,
+            "maximum_ms": None, "transit_times_ms": [],
+        }})
+print("MONGO_CNC_NETWORK=" + json.dumps({{"paths": paths}}))
+'''
+    payload = _read_remote_payload(
+        host, port, username, password, max(float(timeout), safe_count * len(targets) + 8),
+        remote_script, "MONGO_CNC_NETWORK=",
+    )
+    paths = payload.get("paths")
+    if not isinstance(paths, list):
+        raise CncTelemetryError("PathPilot returned an invalid network-test result.")
+    return paths
 
 
 def run_linuxcnc_program(
@@ -567,13 +726,12 @@ def run_linuxcnc_program(
     remote_script = f'''import json
 import linuxcnc
 import os
-import shutil
 import subprocess
 import time
 
 filename = {filename!r}
 require_a_axis_homed = {require_a_axis_homed!r}
-pathpilot_program = "/tmp/very-unlikely-pathpilot-gcode.file"
+selected_program = os.path.realpath(filename)
 status = linuxcnc.stat()
 errors = linuxcnc.error_channel()
 
@@ -657,6 +815,8 @@ def raise_if_motion_locked_out():
         )
 
 status.poll()
+if not os.path.isfile(selected_program):
+    raise RuntimeError("Requested program does not exist on PathPilot: " + filename)
 if getattr(status, "estop", False):
     raise RuntimeError("PathPilot is in E-stop.")
 if not getattr(status, "enabled", False):
@@ -680,24 +840,26 @@ if homed and (len(homed) < required_axes or not all(bool(value) for value in hom
 command = linuxcnc.command()
 # Match PathPilot's own loader. Switching through MDI clears the interpreter's
 # file pointer without program_close(), which PathPilot avoids because it also
-# resets modal interpreter state. LinuxCNC runs a private immutable copy while
-# resolving relative paths from the selected program's original directory.
+# resets modal interpreter state. Open the selected file itself so PathPilot
+# keeps its display name, preview, and relative-file directory intact.
 wait_for_mode(command, linuxcnc.MODE_MDI, "MDI")
 wait_for_mode(command, linuxcnc.MODE_AUTO, "Auto")
-shutil.copy2(filename, pathpilot_program)
-command.program_open(pathpilot_program, os.path.dirname(filename))
+# LinuxCNC's supported command interface takes only the selected filename.
+# Passing PathPilot-specific extra arguments can run the interpreter without
+# updating the operator UI's normal file name and preview state.
+command.program_open(selected_program)
 command.wait_complete()
-# PathPilot may acknowledge program_open() before status reports the private
-# working copy as selected.
+# PathPilot may acknowledge program_open() before status reports the selected
+# file as active.
 load_deadline = time.time() + 5.0
 while time.time() < load_deadline:
     status.poll()
-    if (getattr(status, "file", "") or "") == pathpilot_program:
+    if os.path.realpath(getattr(status, "file", "") or "") == selected_program:
         break
     time.sleep(0.05)
 status.poll()
 loaded_program = getattr(status, "file", "") or ""
-if loaded_program != pathpilot_program:
+if os.path.realpath(loaded_program) != selected_program:
     raise RuntimeError(
         "PathPilot did not finish loading the requested program. "
         "Requested: " + filename + "; controller selected: " + (loaded_program or "none")

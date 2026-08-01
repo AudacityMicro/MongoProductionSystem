@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260723-04">
-    <script src="/static/app.js?v=20260723-01" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260726-13">
+    <script src="/static/popup.js?v=20260726-01" defer></script>
+    <script src="/static/app.js?v=20260726-13" defer></script>
   </head>
   <body class="schedule-page">
     <header class="topbar">
@@ -44,16 +45,24 @@
         </div>
       </section>
 
-      <div class="notice dismissible-notice hidden" id="program-warning" role="status">
-        <span id="program-warning-message"></span>
-        <button class="notice-dismiss" id="dismiss-program-warning" type="button">Dismiss</button>
-      </div>
-      <section class="run-mode-status" id="run-mode-status" aria-live="polite"></section>
-      <section class="robot-motion-status hidden" id="robot-motion-status" aria-live="polite">
-        <div id="robot-motion-summary"></div>
-        <div class="status-actions">
-          <button class="button danger hidden" type="button" id="recover-robot-motion">Recover</button>
-          <button class="notice-dismiss" id="dismiss-robot-motion" type="button">Dismiss</button>
+      <section class="notification-center hidden" id="schedule-notifications" aria-live="polite" aria-label="Operations notifications">
+        <header>
+          <p class="eyebrow">Operations</p>
+          <h2>Cell notifications</h2>
+        </header>
+        <div class="notification-list">
+          <section class="run-mode-status" id="run-mode-status"></section>
+          <div class="notice dismissible-notice hidden" id="program-warning" role="status">
+            <span id="program-warning-message"></span>
+            <button class="notice-dismiss" id="dismiss-program-warning" type="button">Dismiss</button>
+          </div>
+          <section class="robot-motion-status hidden" id="robot-motion-status">
+            <div id="robot-motion-summary"></div>
+            <div class="status-actions">
+              <button class="button danger hidden" type="button" id="recover-robot-motion">Recover</button>
+              <button class="notice-dismiss" id="dismiss-robot-motion" type="button">Dismiss</button>
+            </div>
+          </section>
         </div>
       </section>
 

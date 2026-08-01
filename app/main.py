@@ -27,6 +27,8 @@ from app.schemas import (
     ClearRobotFault,
     CncTelemetryConnectionTest,
     MovePallet,
+    MillSupervisorActivation,
+    MillSupervisorReconcile,
     ManualReturnPallet,
     RecoverPalletMotion,
     RecoverRunMode,
@@ -60,6 +62,16 @@ from app.service import (
     cnc_io_labels_snapshot,
     test_cnc_telemetry_connection,
     test_mill_status_file_access,
+    bootstrap_mill_supervisor,
+    set_mill_supervisor_activation,
+    update_mill_supervisor_agent,
+    test_mill_supervisor_command_path,
+    reconcile_mill_supervisor_command,
+    mill_supervisor_status,
+    start_mill_supervisor_listener,
+    start_mill_supervisor_recovery_watchdog,
+    stop_mill_supervisor_recovery_watchdog,
+    stop_mill_supervisor_listener,
     add_fusion_tool_library,
     dashboard_snapshot,
     tools_snapshot,
@@ -111,6 +123,7 @@ from app.service import (
     execute_run_mode,
     start_run_mode,
     stop_run_mode,
+    cancel_run_mode_recovery,
     set_run_mode_safety,
     confirm_run_mode_action,
     dismiss_run_mode_alert,
@@ -120,11 +133,17 @@ from app.service import (
     rebuild_pallet_motion_scripts,
     rebuild_mill_load_position_program,
     bootstrap_robot_supervisor,
+    auto_recover_controller_connections,
+    recover_robot_supervisor_program,
     reconcile_robot_supervisor,
+    restart_robot_supervisor_listener,
     robot_supervisor_status,
+    robot_supervisor_status_document,
     set_robot_supervisor_maintenance,
     start_robot_supervisor_listener,
     stop_robot_supervisor_listener,
+    start_robot_supervisor_recovery_watchdog,
+    stop_robot_supervisor_recovery_watchdog,
     diagnostic_snapshot,
     robot_reliability_status,
     start_robot_reliability_test,
@@ -191,6 +210,15 @@ def queue_supervisor_firewall_setup(port: int) -> None:
     )
 
 
+def queue_mill_supervisor_firewall_setup(port: int) -> None:
+    helper = PROJECT_ROOT / "install_mill_supervisor_firewall.ps1"
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(helper), "-Port", str(port)],
+        cwd=str(PROJECT_ROOT),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
 def resolve_editor_command(command: str) -> list[str]:
     parts = shlex.split(command, posix=False)
     if not parts:
@@ -222,6 +250,9 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
             interrupt_run_mode(session)
             if external_services:
                 start_robot_supervisor_listener(session)
+                start_robot_supervisor_recovery_watchdog(application.state.session_factory)
+                start_mill_supervisor_listener(session)
+                start_mill_supervisor_recovery_watchdog(application.state.session_factory)
         diagnostics().record(
             "application",
             "started",
@@ -240,6 +271,9 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
             # Tests do not start external services, but individual test cases can
             # still create cached clients. Always tear those resources down.
             stop_robot_supervisor_listener()
+            stop_robot_supervisor_recovery_watchdog()
+            stop_mill_supervisor_recovery_watchdog()
+            stop_mill_supervisor_listener()
             suspend_cnc_connections()
             suspend_robot_connections()
             engine.dispose()
@@ -382,6 +416,14 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
         session: Session = Depends(get_session),
     ) -> dict:
         stop_run_mode(session, payload.expected_revision)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/recovery/cancel")
+    def cancel_production_recovery(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        cancel_run_mode_recovery(session, payload.expected_revision)
         return board_snapshot(session)
 
     @application.post("/api/run-mode/safety")
@@ -744,9 +786,25 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def get_robot_supervisor_status(session: Session = Depends(get_session)) -> dict:
         return robot_supervisor_status(session)
 
+    @application.get("/api/debug/robot-supervisor/status-document")
+    def get_robot_supervisor_status_document() -> dict[str, object]:
+        return robot_supervisor_status_document()
+
     @application.post("/api/debug/robot-supervisor/bootstrap")
     def bootstrap_robot_supervisor_connection(session: Session = Depends(get_session)) -> dict:
         return bootstrap_robot_supervisor(session)
+
+    @application.post("/api/debug/robot-supervisor/recover")
+    def recover_robot_supervisor_connection_program(session: Session = Depends(get_session)) -> dict:
+        return recover_robot_supervisor_program(session, trigger="operator")
+
+    @application.post("/api/debug/controllers/auto-recover")
+    def auto_recover_controllers(session: Session = Depends(get_session)) -> dict:
+        return auto_recover_controller_connections(session)
+
+    @application.post("/api/debug/robot-supervisor/restart-listener")
+    def restart_robot_supervisor_connection(session: Session = Depends(get_session)) -> dict:
+        return restart_robot_supervisor_listener(session, trigger="operator")
 
     @application.post("/api/debug/robot-supervisor/reconcile")
     def reconcile_robot_supervisor_connection(
@@ -778,8 +836,8 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
         return current_robot_pose(session)
 
     @application.post("/api/debug/network-test")
-    def run_network_test() -> dict:
-        return network_diagnostic()
+    def run_network_test(session: Session = Depends(get_session)) -> dict:
+        return network_diagnostic(get_settings(session))
 
     @application.get("/api/debug/network-test")
     def get_network_test_status() -> dict:
@@ -840,6 +898,45 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.post("/api/debug/cnc/status-file-test")
     def test_cnc_status_file(session: Session = Depends(get_session)) -> dict:
         return test_mill_status_file_access(get_settings(session))
+
+    @application.get("/api/debug/cnc/supervisor")
+    def get_mill_supervisor_status(session: Session = Depends(get_session)) -> dict:
+        return mill_supervisor_status(session)
+
+    @application.post("/api/debug/cnc/supervisor/firewall", status_code=status.HTTP_202_ACCEPTED)
+    def install_mill_supervisor_firewall(session: Session = Depends(get_session)) -> dict[str, object]:
+        application_settings = get_settings(session)
+        queue_mill_supervisor_firewall_setup(application_settings.mill_supervisor_port)
+        return {"message": "Opening the staged mill-supervisor firewall rule.", "port": application_settings.mill_supervisor_port}
+
+    @application.post("/api/debug/cnc/supervisor/bootstrap")
+    def bootstrap_staged_mill_supervisor(session: Session = Depends(get_session)) -> dict:
+        return bootstrap_mill_supervisor(session)
+
+    @application.put("/api/debug/cnc/supervisor/activation")
+    def change_mill_supervisor_activation(
+        payload: MillSupervisorActivation,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return set_mill_supervisor_activation(session, payload)
+
+    @application.put("/api/debug/cnc/supervisor/update-agent")
+    def update_active_mill_supervisor_agent(
+        payload: MillSupervisorActivation,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return update_mill_supervisor_agent(session, payload)
+
+    @application.post("/api/debug/cnc/supervisor/test-command")
+    def test_active_mill_supervisor_command(session: Session = Depends(get_session)) -> dict:
+        return test_mill_supervisor_command_path(session)
+
+    @application.post("/api/debug/cnc/supervisor/reconcile")
+    def reconcile_active_mill_supervisor_command(
+        payload: MillSupervisorReconcile,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return reconcile_mill_supervisor_command(session, payload)
 
     @application.post("/api/debug/io/toggle")
     def toggle_debug_io_value(
@@ -1114,6 +1211,8 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.post("/api/system/relaunch", status_code=status.HTTP_202_ACCEPTED)
     def relaunch_system(session: Session = Depends(get_session)) -> dict[str, str]:
         assert_system_relaunch_ready(session)
+        stop_robot_supervisor_listener()
+        stop_mill_supervisor_listener()
         queue_backend_relaunch()
         suspend_cnc_connections()
         suspend_robot_connections()
@@ -1126,6 +1225,8 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.post("/api/system/prepare-shutdown")
     def prepare_system_shutdown(session: Session = Depends(get_session)) -> dict[str, str]:
         assert_system_relaunch_ready(session)
+        stop_robot_supervisor_listener()
+        stop_mill_supervisor_listener()
         suspend_cnc_connections()
         suspend_robot_connections()
         return {"status": "ready", "message": "Controller connections were closed cleanly."}

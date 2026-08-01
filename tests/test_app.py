@@ -25,9 +25,9 @@ Packets: Sent = 20, Received = 2, Lost = 18 (90% loss),
     result = service.network_diagnostic()
 
     assert result["target"] == "8.8.8.8"
-    assert result["sent"] == 20
+    assert result["sent"] == 5
     assert result["received"] == 2
-    assert result["packet_loss_percent"] == 90.0
+    assert result["packet_loss_percent"] == 60.0
     assert result["minimum_ms"] == 1.0
     assert result["maximum_ms"] == 12.0
     assert result["transit_times_ms"] == [12.0, 1.0]
@@ -61,6 +61,37 @@ def test_network_diagnostic_returns_full_loss_result(monkeypatch) -> None:
     assert result["received"] == 0
     assert result["packet_loss_percent"] == 100.0
     assert result["average_ms"] is None
+
+
+def test_network_diagnostic_builds_desktop_and_mill_matrix(client: TestClient, monkeypatch) -> None:
+    class ConnectedSupervisor:
+        def status(self):
+            return {"connected": True}
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: ConnectedSupervisor())
+    monkeypatch.setattr(
+        service,
+        "_desktop_ping_path",
+        lambda label, host: {"source": "Desktop", "target": label, "host": host, "method": "icmp", "supported": True, "sent": 5, "received": 5, "packet_loss_percent": 0.0, "minimum_ms": 1.0, "average_ms": 1.0, "maximum_ms": 1.0, "transit_times_ms": [1.0]},
+    )
+    monkeypatch.setattr(
+        service,
+        "run_linuxcnc_network_ping_matrix",
+        lambda *_args: [{"source": "Mill", "target": "Mongo", "host": "192.168.86.48", "method": "icmp", "supported": True, "sent": 5, "received": 5, "packet_loss_percent": 0.0, "minimum_ms": 2.0, "average_ms": 2.0, "maximum_ms": 2.0, "transit_times_ms": [2.0]}],
+    )
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_host = "192.168.86.48"
+        settings.cnc_host = "192.168.86.42"
+        settings.cnc_ssh_username = "operator"
+        settings.robot_supervisor_hostname = "192.168.86.36"
+        session.commit()
+        result = service._run_network_diagnostic(settings)
+
+    assert result["version"] == "MPS-NETWORK-MATRIX-V1"
+    assert {path["source"] for path in result["paths"]} == {"Desktop", "Mill", "Mongo"}
+    assert any(path["source"] == "Mongo" and path["method"] == "supervisor-tcp" and path["connected"] for path in result["paths"])
+    assert any(path["source"] == "Mongo" and path["supported"] is False for path in result["paths"])
 
 
 def test_network_diagnostic_manual_rate_limit(monkeypatch) -> None:
@@ -126,7 +157,7 @@ def test_health_and_pages(client: TestClient) -> None:
     assert "Debugging" in debugging_page
     assert "Mongo controller" in debugging_page
     assert "Tormach 1500MX / PathPilot" in debugging_page
-    assert 'id="retry-mongo-connection"' in debugging_page
+    assert 'id="debug-auto-recover"' in debugging_page
     assert 'id="clear-mongo-fault"' in debugging_page
     settings_page = client.get("/settings").text
     assert "System settings" in settings_page
@@ -186,8 +217,11 @@ def test_pathpilot_program_run_uses_halui_remote_start(monkeypatch) -> None:
     assert "command.program_close()" not in captured["script"]
     assert 'wait_for_mode(command, linuxcnc.MODE_MDI, "MDI")' in captured["script"]
     assert 'wait_for_mode(command, linuxcnc.MODE_AUTO, "Auto")' in captured["script"]
-    assert "shutil.copy2(filename, pathpilot_program)" in captured["script"]
-    assert "command.program_open(pathpilot_program, os.path.dirname(filename))" in captured["script"]
+    assert "shutil.copy2" not in captured["script"]
+    assert "pathpilot_program" not in captured["script"]
+    assert "selected_program = os.path.realpath(filename)" in captured["script"]
+    assert "command.program_open(selected_program)" in captured["script"]
+    assert "command.program_open(selected_program, os.path.dirname(selected_program))" not in captured["script"]
     assert 'active_axes = int(getattr(status, "axes", 0) or 0)' in captured["script"]
     assert 'axis_mask = int(getattr(status, "axis_mask", 0) or 0)' in captured["script"]
     assert "command.auto(" not in captured["script"]
@@ -201,7 +235,7 @@ def test_pathpilot_program_run_uses_halui_remote_start(monkeypatch) -> None:
     assert captured["script"].count('set_hal_pin("halui.mode.auto", False)') >= 2
     assert "def motion_lockout_active():" in captured["script"]
     assert "Restore the probe and press Reset on PathPilot" in captured["script"]
-    assert 'if (getattr(status, "file", "") or "") == pathpilot_program' in captured["script"]
+    assert 'os.path.realpath(getattr(status, "file", "") or "") == selected_program' in captured["script"]
     assert 'PathPilot did not finish loading the requested program' in captured["script"]
     assert 'if last_interp_state != linuxcnc.INTERP_IDLE' in captured["script"]
     assert 'interpreter never left Idle' in captured["script"]
@@ -1305,6 +1339,38 @@ def test_mill_status_file_access_creates_reads_and_removes_temporary_file(client
 
     assert result["path"].endswith("MongoProduction/mill-status.txt")
     assert [call[0] for call in calls] == ["write", "delete"]
+
+
+def test_staged_mill_supervisor_defaults_disabled_and_does_not_start_listener(client: TestClient) -> None:
+    board = client.get("/api/board").json()
+    assert board["settings"]["mill_supervisor_enabled"] is False
+    assert board["settings"]["mill_supervisor_port"] == 50011
+    status = client.get("/api/debug/cnc/supervisor")
+    assert status.status_code == 200
+    assert status.json()["listening"] is False
+    assert status.json()["staged"] is True
+
+
+def test_staged_mill_supervisor_cannot_be_enabled_before_rollout(client: TestClient) -> None:
+    board = client.get("/api/board").json()
+    response = client.put("/api/settings", json={
+        "expected_revision": board["revision"],
+        "mill_supervisor_enabled": True,
+    })
+    assert response.status_code == 409
+    assert "guarded" in response.json()["detail"].lower()
+
+
+def test_staged_mill_supervisor_command_ledger_allocates_without_dispatch(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        command = service._new_mill_supervisor_command(
+            session, "run_program", {"path": "/home/operator/gcode/Gcode/job.nc"}
+        )
+        assert command.sequence == 1
+        assert command.status == "created"
+        assert command.attempted is False
+        assert settings.mill_supervisor_last_sequence == 1
 
 
 def test_stale_run_mode_fault_can_be_cleared_without_changing_queue(client: TestClient) -> None:

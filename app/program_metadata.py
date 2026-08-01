@@ -13,17 +13,34 @@ _CYCLE_RE = re.compile(
 )
 _BASIS_RE = re.compile(r"^\s*\(\s*MPS-CYCLE-BASIS\s*:?\s*([^\r\n)]*)\)\s*$", re.IGNORECASE | re.MULTILINE)
 _STATUS_FILE_RE = re.compile(r"^\s*\(\s*MPS-STATUS-FILE\s*:?\s*([^\r\n)]*)\)\s*$", re.IGNORECASE | re.MULTILINE)
+_WCS_RE = re.compile(r"^\s*\(\s*MPS-WCS\s*:?\s*([^\r\n)]*)\)\s*$", re.IGNORECASE | re.MULTILINE)
+_WCS_VALUE_RE = re.compile(r"^G(?:5[4-9]|59\.[1-3]|54\.1\s+P(?:[1-9]\d{0,2}|[1-4]\d{3}|500))$", re.IGNORECASE)
+_GCODE_WCS_RE = re.compile(
+    r"(?<![A-Z0-9.])(G(?:5[4-9]|59\.[1-3]|54\.1\s+P(?:[1-9]\d{0,2}|[1-4]\d{3}|500)))(?![A-Z0-9.])",
+    re.IGNORECASE,
+)
 
 
 def unavailable_program_metadata(detail: str) -> dict[str, object]:
     return {
         "program_tools": [],
+        "program_wcs": [],
         "expected_cycle_seconds": None,
         "program_metadata_state": "unavailable",
         "program_metadata_detail": detail,
         "program_cycle_basis": None,
         "mill_status_file": None,
     }
+
+
+def _work_coordinate_systems(text: str, header_match: re.Match[str] | None) -> list[str]:
+    values = header_match.group(1).split(",") if header_match else _GCODE_WCS_RE.findall(text)
+    systems: list[str] = []
+    for value in values:
+        normalized = re.sub(r"\s+", " ", value.strip().upper())
+        if normalized and _WCS_VALUE_RE.fullmatch(normalized) and normalized not in systems:
+            systems.append(normalized)
+    return systems
 
 
 def parse_program_metadata(text: str) -> dict[str, object]:
@@ -48,8 +65,10 @@ def parse_program_metadata(text: str) -> dict[str, object]:
 
     basis_match = _BASIS_RE.search(text)
     status_file_match = _STATUS_FILE_RE.search(text)
+    wcs_match = _WCS_RE.search(text)
     return {
         "program_tools": [f"T{tool}" for tool in tools],
+        "program_wcs": _work_coordinate_systems(text, wcs_match),
         "expected_cycle_seconds": int(math.ceil(cycle_seconds)),
         "program_metadata_state": "parsed",
         "program_metadata_detail": "Metadata read from the assigned G-code header.",

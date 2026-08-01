@@ -120,6 +120,7 @@ class ManualReturnPallet(RevisionRequest):
 
 class QueuePallet(RevisionRequest):
     queue_index: int | None = Field(default=None, ge=0)
+    convert_completed_to_raw: bool = False
 
 
 class ReorderQueue(RevisionRequest):
@@ -364,6 +365,12 @@ class SettingsUpdate(RevisionRequest):
     cnc_ssh_password: str | None = Field(default=None, max_length=500)
     cnc_timeout_seconds: float | None = Field(default=None, gt=0, le=15)
     cnc_require_a_axis_homed: bool | None = None
+    mill_supervisor_enabled: bool | None = None
+    mill_supervisor_hostname: str | None = Field(default=None, max_length=255)
+    mill_supervisor_listen_host: str | None = Field(default=None, max_length=255)
+    mill_supervisor_port: int | None = Field(default=None, ge=1, le=65535)
+    mill_supervisor_heartbeat_seconds: float | None = Field(default=None, ge=1, le=60)
+    mill_supervisor_telemetry_hz: float | None = Field(default=None, ge=0.1, le=10)
     mill_file_directory: str | None = Field(default=None, max_length=500)
     mill_program_extensions: list[str] | None = Field(default=None, min_length=1)
     mill_programs_page_enabled: bool | None = None
@@ -371,7 +378,7 @@ class SettingsUpdate(RevisionRequest):
     mill_editor_command: str | None = Field(default=None, max_length=500)
     mill_status_file_path: str | None = Field(default=None, max_length=500)
 
-    @field_validator("robot_host", "robot_supervisor_hostname", "robot_supervisor_listen_host")
+    @field_validator("robot_host", "robot_supervisor_hostname", "robot_supervisor_listen_host", "mill_supervisor_hostname", "mill_supervisor_listen_host")
     @classmethod
     def strip_robot_host(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
@@ -421,6 +428,16 @@ class SupervisorReconcile(RevisionRequest):
 
 class SupervisorMaintenance(RevisionRequest):
     enabled: bool
+
+
+class MillSupervisorActivation(RevisionRequest):
+    enabled: bool
+    confirmed: bool = False
+
+
+class MillSupervisorReconcile(RevisionRequest):
+    sequence: int = Field(ge=1)
+    resolution: Literal["accept_completed", "mark_faulted"]
 
 
 

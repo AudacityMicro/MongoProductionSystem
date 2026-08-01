@@ -7,7 +7,7 @@ const ui = {
   source: document.querySelector("#debug-source"),
   machineState: document.querySelector("#debug-machine-state"),
   timestamp: document.querySelector("#debug-timestamp"),
-  retryMongoConnection: document.querySelector("#retry-mongo-connection"),
+  autoRecover: document.querySelector("#debug-auto-recover"),
   clearMongoFault: document.querySelector("#clear-mongo-fault"),
   networkTest: document.querySelector("#run-network-test"),
   networkTestResult: document.querySelector("#network-test-result"),
@@ -15,7 +15,6 @@ const ui = {
   supervisorStatusGrid: document.querySelector("#robot-supervisor-status-grid"),
   supervisorDetail: document.querySelector("#robot-supervisor-detail"),
   supervisorCommandRows: document.querySelector("#robot-supervisor-command-rows"),
-  supervisorBootstrap: document.querySelector("#debug-supervisor-bootstrap"),
   supervisorMaintenance: document.querySelector("#debug-supervisor-maintenance"),
   supervisorClearLatch: document.querySelector("#debug-supervisor-clear-latch"),
   summaryMachinePallet: document.querySelector("#summary-machine-pallet"),
@@ -62,6 +61,9 @@ const ui = {
   cncConnectionLight: document.querySelector("#cnc-connection-light"),
   cncConnectionLabel: document.querySelector("#cnc-connection-label"),
   cncNotes: document.querySelector("#cnc-notes"),
+  millSupervisorGrid: document.querySelector("#mill-supervisor-grid"),
+  millSupervisorDetail: document.querySelector("#mill-supervisor-detail"),
+  reconcileMillSupervisor: document.querySelector("#reconcile-mill-supervisor"),
   cncControllerState: document.querySelector("#cnc-controller-state"),
   cncProgram: document.querySelector("#cnc-program"),
   cncSpindle: document.querySelector("#cnc-spindle"),
@@ -84,6 +86,7 @@ const ui = {
 };
 
 let supervisorState = null;
+let millSupervisorState = null;
 
 function organizeDebuggingPage() {
   const grid = document.querySelector("#debug-robot .debug-grid");
@@ -126,11 +129,41 @@ function organizeDebuggingPage() {
   });
 
   const cnc = document.querySelector(".cnc-debug-section");
+  const connectionDeck = document.querySelector("#debug-connection-deck");
+  const systemOverview = document.querySelector("#debug-system .debug-overview");
+  // Promote the immediately useful system cards ahead of controller detail.
+  // The diagnostic timeline remains in the System section below.
+  if (systemOverview) {
+    [...systemOverview.children].slice(0, 3).forEach(card => {
+      card.classList.add("debug-connection-card");
+      connectionDeck.append(card);
+    });
+  }
+  const robotConnection = articles.get("Persistent robot-originated connection");
+  if (robotConnection) {
+    robotConnection.classList.remove("debug-section-wide");
+    robotConnection.classList.add("debug-connection-card");
+    connectionDeck.append(robotConnection);
+  }
+  const millConnectionHeading = [...cnc.querySelectorAll(":scope > .cnc-subsection-heading")]
+    .find(heading => heading.querySelector("h3")?.textContent.trim() === "Mill supervisor");
+  if (millConnectionHeading) {
+    const millConnection = document.createElement("article");
+    millConnection.className = "debug-connection-card mill-connection-card";
+    connectionDeck.append(millConnection);
+    let node = millConnectionHeading;
+    while (node) {
+      const next = node.nextSibling;
+      millConnection.append(node);
+      if (next?.classList?.contains("cnc-subsection-heading")) break;
+      node = next;
+    }
+  }
   [...cnc.querySelectorAll(":scope > .cnc-subsection-heading")].forEach((heading, index) => {
     const title = heading.querySelector("h3")?.textContent.trim() || "Details";
     const details = document.createElement("details");
     details.className = "debug-disclosure";
-    details.open = index < 2;
+    details.open = ["Health and limits", "Execution and modes", "Motion and offsets"].includes(title);
     const summary = document.createElement("summary");
     summary.className = "cnc-subsection-heading";
     while (heading.firstChild) summary.append(heading.firstChild);
@@ -257,6 +290,13 @@ function formatValue(value) {
   return String(value);
 }
 
+function hasReportedValue(value) {
+  if (value === null || value === undefined || value === "") return false;
+  if (typeof value === "string" && value.trim().toLowerCase() === "unavailable") return false;
+  if (Array.isArray(value)) return value.some(hasReportedValue);
+  return true;
+}
+
 function tableEmpty(columns, label) {
   return `<tr><td colspan="${columns}" class="debug-table-empty">${escapeHtml(label)}</td></tr>`;
 }
@@ -264,11 +304,14 @@ function tableEmpty(columns, label) {
 function cncAxisRow(row) {
   const home = row.homed === null || row.homed === undefined ? "Unavailable" : (row.homed ? "Homed" : "Not homed");
   const limit = row.limit === null || row.limit === undefined ? "Unavailable" : (Number(row.limit) === 0 ? "Clear" : `Active (${formatValue(row.limit)})`);
-  return `<tr><td>${escapeHtml(row.axis)}</td><td>${escapeHtml(formatValue(row.position))}</td><td>${escapeHtml(formatValue(row.commanded))}</td><td>${escapeHtml(formatValue(row.velocity))}</td><td>${escapeHtml(formatValue(row.distance_to_go))}</td><td>${escapeHtml(formatValue(row.following_error))}</td><td>${escapeHtml(home)}</td><td>${escapeHtml(limit)}</td></tr>`;
+  return `<tr><td>${escapeHtml(row.axis)}</td><td>${escapeHtml(formatValue(row.position))}</td><td>${escapeHtml(formatValue(row.commanded))}</td><td>${escapeHtml(formatValue(row.velocity))}</td><td>${escapeHtml(formatValue(row.distance_to_go))}</td><td>${escapeHtml(home)}</td><td>${escapeHtml(limit)}</td></tr>`;
 }
 
 function cncDataGrid(values) {
-  return values.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatValue(value))}</strong></article>`).join("");
+  const reported = values.filter(([, value]) => hasReportedValue(value));
+  return reported.length
+    ? reported.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatValue(value))}</strong></article>`).join("")
+    : '<p class="debug-table-empty">This controller does not report values for this group.</p>';
 }
 
 function boolState(value, on, off) {
@@ -321,24 +364,33 @@ function cncDigitalTiles(values, labels, prefix) {
 
 function cncAnalogRows(values, labels, prefix) {
   if (!Array.isArray(values) || !values.length) return tableEmpty(3, "No channel values reported.");
-  return values.map((value, index) => `<tr><td>${prefix}${String(index).padStart(2, "0")}</td><td>${escapeHtml(humanizeIoSignal(ioLabel(labels, index)))}</td><td>${escapeHtml(formatValue(value))}</td></tr>`).join("");
+  const reported = values.map((value, index) => [value, index]).filter(([value]) => hasReportedValue(value));
+  return reported.length
+    ? reported.map(([value, index]) => `<tr><td>${prefix}${String(index).padStart(2, "0")}</td><td>${escapeHtml(humanizeIoSignal(ioLabel(labels, index)))}</td><td>${escapeHtml(formatValue(value))}</td></tr>`).join("")
+    : tableEmpty(3, "No channel values reported.");
 }
 
 function renderCnc(snapshot) {
   ui.cncConnectionLight.className = `debug-connection-light ${snapshot.connected ? "active" : "unknown"}`;
   ui.cncConnectionLabel.textContent = snapshot.connection_label;
   ui.cncNotes.textContent = snapshot.notes;
-  ui.cncControllerState.textContent = snapshot.controller_state;
-  ui.cncProgram.textContent = snapshot.program;
-  ui.cncSpindle.textContent = snapshot.spindle;
-  ui.cncCoolant.textContent = snapshot.coolant;
-  ui.cncFeedOverride.textContent = snapshot.feed_override;
-  ui.cncTimestamp.textContent = new Date(snapshot.timestamp).toLocaleString();
+  const summaryValues = [
+    [ui.cncControllerState, snapshot.controller_state],
+    [ui.cncProgram, snapshot.program],
+    [ui.cncSpindle, snapshot.spindle],
+    [ui.cncCoolant, snapshot.coolant],
+    [ui.cncFeedOverride, snapshot.feed_override],
+    [ui.cncTimestamp, snapshot.timestamp ? new Date(snapshot.timestamp).toLocaleString() : null],
+  ];
+  summaryValues.forEach(([element, value]) => {
+    element.textContent = formatValue(value);
+    element.closest("article").hidden = !hasReportedValue(value);
+  });
   renderMillProgramControls(snapshot);
   const axisRows = snapshot.axis_rows || [];
   ui.cncAxisRows.innerHTML = axisRows.length
     ? axisRows.map(cncAxisRow).join("")
-    : tableEmpty(8, "Axis telemetry will appear after the PathPilot/LinuxCNC connection is configured.");
+    : tableEmpty(7, "Axis telemetry will appear after the PathPilot/LinuxCNC connection is configured.");
   const health = snapshot.health || {};
   const motion = snapshot.motion || {};
   const coordinates = snapshot.coordinates || {};
@@ -415,15 +467,15 @@ function renderCnc(snapshot) {
   ]);
   const atc = snapshot.atc || {};
   const atcValues = [
-    ["ATC position", atc.current_position ?? "Unavailable"],
-    ["HAL carousel value", atc.carousel_slot ?? "Unavailable"],
-    ["Spindle tool", atc.tool_number ? `T${atc.tool_number}` : "No tool"],
-    ["Prepared tool", atc.prepared_tool ? `T${atc.prepared_tool}` : "None"],
-    ["Tool change", atc.change_in_progress ? "In progress" : "Idle"],
-    ["Tray", atc.tray_in ? "In" : "Out / unknown"],
-    ["ATC device", atc.device_ready ? "Ready" : "Unavailable"],
-    ["Tray reference", atc.tray_referenced ? "Referenced" : "Not referenced"],
-    ["Air pressure", atc.pressure_ok ? "OK" : "Not OK"],
+    ["ATC position", atc.current_position],
+    ["HAL carousel value", atc.carousel_slot],
+    ["Spindle tool", atc.tool_number == null ? null : (atc.tool_number ? `T${atc.tool_number}` : "No tool")],
+    ["Prepared tool", atc.prepared_tool == null ? null : (atc.prepared_tool ? `T${atc.prepared_tool}` : "None")],
+    ["Tool change", atc.change_in_progress == null ? null : (atc.change_in_progress ? "In progress" : "Idle")],
+    ["Tray", atc.tray_in == null ? null : (atc.tray_in ? "In" : "Out")],
+    ["ATC device", atc.device_ready == null ? null : (atc.device_ready ? "Ready" : "Not ready")],
+    ["Tray reference", atc.tray_referenced == null ? null : (atc.tray_referenced ? "Referenced" : "Not referenced")],
+    ["Air pressure", atc.pressure_ok == null ? null : (atc.pressure_ok ? "OK" : "Not OK")],
     ["Drawbar", boolState(atc.drawbar_engaged, "Engaged", "Released")],
     ["ATC lock", boolState(atc.lock_engaged, "Engaged", "Released")],
     ["ATC VFD", boolState(atc.vfd_status, "Active", "Idle")],
@@ -431,7 +483,7 @@ function renderCnc(snapshot) {
     ["ATC return code", atc.return_code],
     ["Tray capacity", atc.tray_capacity],
   ];
-  ui.cncAtcGrid.innerHTML = atcValues.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
+  ui.cncAtcGrid.innerHTML = cncDataGrid(atcValues);
   const slots = atc.slots || [];
   ui.cncAtcSlots.innerHTML = slots.length
     ? slots.map(slot => {
@@ -715,15 +767,16 @@ function renderSupervisorStatus(status) {
     ["App session", status.app_session ?? "Unavailable"],
     ["Robot session", status.robot_session ?? "Unavailable"],
     ["Sequence", `${status.robot_last_sequence ?? "?"} / expected ${status.expected_sequence ?? "?"}`],
-    ["Last event", status.robot_last_event ?? "Unavailable"],
+    ["Last event", status.robot_last_event && status.robot_last_event !== 0 ? status.robot_last_event : null],
+    ["Status document", status.status_document?.written_at ? `Updated ${new Date(status.status_document.written_at).toLocaleTimeString()}` : status.status_document?.error],
     ["State", supervisorMode],
-  ];
+  ].filter(([label, value]) => label === "Connection" || label === "State" || hasReportedValue(value));
   ui.supervisorStatusGrid.innerHTML = fields.map(([label, value]) => `
     <article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>
   `).join("");
   ui.supervisorDetail.className = `network-test-result ${status.reconciliation_required ? "error" : status.connected ? "healthy" : "warning"}`;
   ui.supervisorDetail.textContent = status.reconciliation_required
-    ? "Reconciliation required. Inspect the physical result and recover the pallet motion before clearing the supervisor latch."
+    ? "Reconciliation required. Use Reconcile command to record the observed physical result. If the pallet location differs from the board, use the Schedule page recovery dialog next."
     : status.connected
       ? `Supervisor handshake is live${status.enabled ? " and commands are enabled" : ", but command routing is not enabled"}.`
       : (status.last_disconnect_detail || "Mongo has not connected to the backend listener.");
@@ -739,6 +792,7 @@ function renderSupervisorStatus(status) {
   `).join("") : tableEmpty(5, "No supervisor commands have been dispatched.");
   ui.supervisorMaintenance.textContent = status.maintenance_mode ? "Exit Maintenance Mode" : "Enter Maintenance Mode";
   ui.supervisorMaintenance.disabled = !status.activation_verified && !status.maintenance_mode;
+  ui.supervisorClearLatch.textContent = status.reconciliation_required ? "Reconcile command" : "Clear supervisor latch";
   ui.supervisorClearLatch.disabled = !status.latched && !status.reconciliation_required;
 }
 
@@ -815,7 +869,13 @@ async function loadReliabilityTest() {
 
 ui.reliabilityStart.addEventListener("click", async () => {
   if (!snapshotState) return;
-  if (!window.confirm("Run the current queue as a robot reliability test? Each pallet will be picked, moved only to the outer mill staging waypoint, and returned to the same Pool position. The mill door and Erowa will not be operated.")) return;
+  if (await window.mpsConfirm({
+    eyebrow: "Robot validation",
+    title: "Start reliability test?",
+    message: "Each queued pallet will be picked, moved only to the outer mill staging waypoint, and returned to the same Pool position. The mill door and Erowa will not be operated.",
+    tone: "warning",
+    primaryLabel: "Start test",
+  }) !== "primary") return;
   ui.reliabilityStart.disabled = true;
   try {
     renderReliabilityTest(await api("/api/debug/reliability-test", {
@@ -840,24 +900,16 @@ ui.reliabilityCancel.addEventListener("click", async () => {
   }
 });
 
-ui.supervisorBootstrap.addEventListener("click", async () => {
-  ui.supervisorBootstrap.disabled = true;
-  ui.supervisorBootstrap.textContent = "Waiting for Mongo...";
-  try {
-    renderSupervisorStatus(await api("/api/debug/robot-supervisor/bootstrap", {method: "POST", body: "{}"}));
-    showToast("No-motion supervisor handshake verified.");
-  } catch (error) {
-    showToast(error.message, "error");
-  } finally {
-    ui.supervisorBootstrap.disabled = false;
-    ui.supervisorBootstrap.textContent = "No-motion bootstrap";
-  }
-});
-
 ui.supervisorMaintenance.addEventListener("click", async () => {
   if (!supervisorState) return;
   const enabling = !supervisorState.maintenance_mode;
-  if (enabling && !window.confirm("Enter Maintenance Mode? Scheduled supervisor commands will be unavailable until the supervisor is restarted and re-handshakes.")) return;
+  if (enabling && await window.mpsConfirm({
+    eyebrow: "Robot supervisor",
+    title: "Enter Maintenance Mode?",
+    message: "Scheduled supervisor commands will be unavailable until the supervisor is restarted and completes a new handshake.",
+    tone: "warning",
+    primaryLabel: "Enter Maintenance Mode",
+  }) !== "primary") return;
   ui.supervisorMaintenance.disabled = true;
   try {
     const board = await api("/api/board", {cache: "no-store"});
@@ -873,18 +925,66 @@ ui.supervisorMaintenance.addEventListener("click", async () => {
   }
 });
 
-ui.supervisorClearLatch.addEventListener("click", async () => {
-  if (!supervisorState) return;
-  const candidate = (supervisorState.commands || []).find(command => ["latched", "uncertain", "operator_completed", "operator_faulted"].includes(command.status));
-  if (!candidate) return showToast("No ledger command is available to reconcile.", "error");
-  if (!window.confirm(`Clear the Mongo supervisor latch for sequence ${candidate.sequence}? Reconcile the physical pallet-motion fault first.`)) return;
+function supervisorCandidate(status = supervisorState) {
+  return status?.reconciliation || (status?.commands || [])
+    .find(command => ["latched", "uncertain", "faulted", "dispatching", "sent", "accepted", "running"].includes(command.status));
+}
+
+async function reconcileSupervisorCandidate(candidate) {
+  if (!candidate) return showToast("No supervisor command is awaiting physical confirmation.", "error");
+  const pallet = candidate.pallet_name ? ` for pallet ${candidate.pallet_name}` : "";
+  const outcome = await window.mpsConfirm({
+    eyebrow: "Supervisor recovery",
+    title: `Did ${candidate.operation} complete?`,
+    message: `Sequence ${candidate.sequence}${pallet} did not receive a confirmed terminal result. Inspect the cell before continuing. Select Completed only if the physical operation finished exactly as intended. Select Failed if it did not complete or you are not certain.`,
+    tone: "warning",
+    primaryLabel: "Completed",
+    secondaryLabel: "Failed / uncertain",
+    cancelLabel: "Leave locked",
+  });
+  if (!outcome) return;
   try {
     const board = await api("/api/board", {cache: "no-store"});
     renderSupervisorStatus(await api("/api/debug/robot-supervisor/reconcile", {
       method: "POST",
-      body: JSON.stringify({expected_revision: board.revision, sequence: candidate.sequence, resolution: "clear_latch"}),
+      body: JSON.stringify({
+        expected_revision: board.revision,
+        sequence: candidate.sequence,
+        resolution: outcome === "primary" ? "accept_completed" : "mark_faulted",
+      }),
     }));
-    showToast("Supervisor latch cleared after operator reconciliation.");
+    if (outcome === "secondary" && candidate.motion_id) {
+      showToast("Robot command marked failed. Use the Schedule page recovery dialog to record the observed pallet location.", "warning");
+    } else {
+      showToast("Robot command outcome recorded. The supervisor is ready once no separate pallet-location recovery is pending.");
+    }
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+  await loadSupervisorDebugging();
+}
+
+ui.supervisorClearLatch.addEventListener("click", async () => {
+  if (!supervisorState) return;
+  const candidate = supervisorCandidate();
+  if (candidate) return reconcileSupervisorCandidate(candidate);
+  if (await window.mpsConfirm({
+    eyebrow: "Supervisor recovery",
+    title: "Clear supervisor latch?",
+    message: "This sends a no-motion reset command to Mongo. Use it only after all prior commands have been reconciled.",
+    tone: "warning",
+    primaryLabel: "Clear latch",
+  }) !== "primary") return;
+  try {
+    const board = await api("/api/board", {cache: "no-store"});
+    const status = await api("/api/debug/robot-supervisor", {cache: "no-store"});
+    const resolved = (status.commands || []).find(command => ["operator_completed", "operator_faulted", "completed"].includes(command.status));
+    if (!resolved) throw new Error("No reconciled supervisor command is available to clear.");
+    renderSupervisorStatus(await api("/api/debug/robot-supervisor/reconcile", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, sequence: resolved.sequence, resolution: "clear_latch"}),
+    }));
+    showToast("Supervisor latch cleared.");
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -960,19 +1060,27 @@ async function loadDebugging() {
   }
 }
 
-ui.retryMongoConnection.addEventListener("click", async () => {
-  ui.retryMongoConnection.disabled = true;
-  ui.retryMongoConnection.textContent = "Retrying...";
+ui.autoRecover.addEventListener("click", async () => {
+  if (await window.mpsConfirm({
+    eyebrow: "Controller recovery",
+    title: "Run automatic recovery?",
+    message: "This checks Dashboard and PathPilot read-only health, refreshes stale local transports, restores missing idle supervisors, and reports every action. It never clears a robot fault, guesses a pallet location, interrupts a controller program, or restarts a helper while PathPilot is running.",
+    tone: "warning",
+    primaryLabel: "Auto recover",
+  }) !== "primary") return;
+  ui.autoRecover.disabled = true;
+  ui.autoRecover.textContent = "Recovering...";
   try {
-    const result = await api("/api/debug/robot-io/retry", {method: "POST", body: "{}"});
-    showToast(result.message);
-    await new Promise(resolve => window.setTimeout(resolve, 300));
-    await loadDebugging();
+    const result = await api("/api/debug/controllers/auto-recover", {method: "POST", body: "{}"});
+    const summary = (result.results || []).map(item => `${item.controller}: ${item.action}`).join(" | ");
+    showToast(summary || "Recovery check completed.", (result.results || []).some(item => item.action === "Deferred" || item.action.includes("unavailable")) ? "warning" : "success");
+    await Promise.all([loadDebugging(), loadSupervisorDebugging(), loadCncDebugging(), loadMillSupervisor()]);
+    if (result.reconciliation) await reconcileSupervisorCandidate(result.reconciliation);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
-    ui.retryMongoConnection.disabled = false;
-    ui.retryMongoConnection.textContent = "Retry Mongo connection";
+    ui.autoRecover.disabled = false;
+    ui.autoRecover.textContent = "Auto recover";
   }
 });
 
@@ -981,10 +1089,13 @@ ui.clearMongoFault.addEventListener("click", async () => {
     showToast("Robot status is not loaded yet.", "error");
     return;
   }
-  const confirmed = window.confirm(
-    "Inspect the cell and identify the cause before clearing the fault. This will not release an E-stop, power the arm, resume a program, or move the robot. Continue?",
-  );
-  if (!confirmed) return;
+  if (await window.mpsConfirm({
+    eyebrow: "Robot fault",
+    title: "Clear recorded fault?",
+    message: "Inspect the cell and identify the cause first. This will not release an E-stop, power the arm, resume a program, or move the robot.",
+    tone: "danger",
+    primaryLabel: "Clear fault",
+  }) !== "primary") return;
   ui.clearMongoFault.disabled = true;
   ui.clearMongoFault.textContent = "Clearing...";
   try {
@@ -1003,11 +1114,38 @@ ui.clearMongoFault.addEventListener("click", async () => {
 });
 
 function renderNetworkTest(result) {
-  const times = result.transit_times_ms.length
-    ? result.transit_times_ms.map(value => `${value} ms`).join(", ")
-    : "No replies";
-  ui.networkTestResult.className = `network-test-result ${result.packet_loss_percent > 0 ? "warning" : "healthy"}`;
-  ui.networkTestResult.innerHTML = `<strong>${result.sent} sent / ${result.received} received / ${result.packet_loss_percent}% loss</strong><span>Latency: ${result.minimum_ms ?? "-"} / ${result.average_ms ?? "-"} / ${result.maximum_ms ?? "-"} ms (min / avg / max)</span><small>Reply times: ${escapeHtml(times)}</small>`;
+  const paths = result.paths || [];
+  const statusFor = path => {
+    if (path.supported === false) return {label: "NOT AVAILABLE", tone: "neutral"};
+    if (path.method === "supervisor-tcp") return path.connected
+      ? {label: "CONNECTED", tone: "healthy"}
+      : {label: "DISCONNECTED", tone: "error"};
+    if (path.error || Number(path.received ?? 0) === 0) return {label: "FAILED", tone: "error"};
+    if (Number(path.packet_loss_percent || 0) > 0 || Number(path.average_ms || 0) >= 100) return {label: "DEGRADED", tone: "warning"};
+    return {label: "OK", tone: "healthy"};
+  };
+  const statuses = paths.map(statusFor);
+  const failures = statuses.filter(status => status.tone === "error").length;
+  const degraded = statuses.filter(status => status.tone === "warning").length;
+  ui.networkTestResult.className = `network-test-result network-matrix-result ${failures ? "error" : degraded ? "warning" : "healthy"}`;
+  const rows = paths.map((path, index) => {
+    const status = statuses[index];
+    const route = `${path.source || "Unknown"} -> ${path.target || "Unknown"}`;
+    const replies = path.method === "icmp" && path.supported !== false ? `${path.received ?? 0}/${path.sent ?? 0}` : "-";
+    const loss = path.method === "icmp" && path.supported !== false ? `${path.packet_loss_percent ?? 100}%` : "-";
+    const latency = path.method === "icmp" && path.supported !== false
+      ? `${path.minimum_ms ?? "-"} / ${path.average_ms ?? "-"} / ${path.maximum_ms ?? "-"} ms`
+      : path.method === "supervisor-tcp" ? "Supervisor TCP" : "Not supported";
+    const detail = path.error || path.detail || path.host || "";
+    return `<tr class="network-path-${status.tone}">
+      <td><strong>${escapeHtml(route)}</strong><small>${escapeHtml(detail)}</small></td>
+      <td><span class="network-status network-status-${status.tone}">${escapeHtml(status.label)}</span></td>
+      <td>${escapeHtml(replies)}</td><td>${escapeHtml(loss)}</td><td>${escapeHtml(latency)}</td>
+    </tr>`;
+  }).join("");
+  ui.networkTestResult.innerHTML = `
+    <div class="network-matrix-summary"><strong>${failures ? `${failures} failed path${failures === 1 ? "" : "s"}` : degraded ? `${degraded} degraded path${degraded === 1 ? "" : "s"}` : "All supported paths healthy"}</strong><span>${escapeHtml(String(result.packet_count || 0))} ICMP packets per supported path. Latency is min / average / max.</span></div>
+    <div class="network-matrix-shell"><table class="network-matrix-table"><thead><tr><th>Path</th><th>Status</th><th>Replies</th><th>Loss</th><th>Latency</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 async function loadNetworkTestStatus() {
@@ -1015,7 +1153,7 @@ async function loadNetworkTestStatus() {
     const status = await api("/api/debug/network-test");
     if (status.active) {
       ui.networkTestResult.className = "network-test-result";
-      ui.networkTestResult.textContent = "Automatic network test running after robot telemetry loss. This can take up to 20 seconds.";
+      ui.networkTestResult.textContent = "Automatic network test running after robot telemetry loss. This can take up to one minute.";
       return;
     }
     if (!status.latest) return;
@@ -1034,7 +1172,7 @@ ui.networkTest.addEventListener("click", async () => {
   ui.networkTest.disabled = true;
   ui.networkTest.textContent = "Testing network...";
   ui.networkTestResult.className = "network-test-result";
-  ui.networkTestResult.textContent = "Sending 20 packets to 8.8.8.8. This can take up to 20 seconds when packets are timing out.";
+  ui.networkTestResult.textContent = "Testing Desktop and Mill network paths. This can take up to one minute when packets are timing out.";
   try {
     renderNetworkTest(await api("/api/debug/network-test", {method: "POST", body: "{}"}));
   } catch (error) {
@@ -1042,7 +1180,7 @@ ui.networkTest.addEventListener("click", async () => {
     ui.networkTestResult.textContent = error.message;
   } finally {
     ui.networkTest.disabled = false;
-    ui.networkTest.textContent = "Run 20-packet test";
+    ui.networkTest.textContent = "Run network matrix";
   }
 });
 
@@ -1056,6 +1194,67 @@ async function loadCncDebugging() {
     ui.cncNotes.textContent = `CNC debug data is unavailable: ${error.message}`;
   }
 }
+
+function renderMillSupervisor(status) {
+  millSupervisorState = status;
+  const fields = [
+    ["Rollout", status.enabled ? "Active command routing" : "Telemetry only"],
+    ["Listener", status.listening ? `${status.listen_host}:${status.listen_port}` : null],
+    ["Connection", status.connected ? `Session ${status.mill_session}` : "Disconnected"],
+    ["Heartbeat", status.heartbeat_age_seconds == null ? null : `${status.heartbeat_age_seconds}s`],
+    ["Telemetry", status.telemetry_age_seconds == null ? null : `${status.telemetry_age_seconds}s`],
+    ["Sequence", `${status.mill_last_sequence ?? "?"} / expected ${status.expected_sequence ?? "?"}`],
+    ["Last result", status.last_result?.event],
+  ].filter(([label, value]) => label === "Connection" || hasReportedValue(value));
+  ui.millSupervisorGrid.innerHTML = fields.map(([label, value]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></article>`).join("");
+  ui.millSupervisorDetail.className = `network-test-result ${status.reconciliation_required ? "error" : status.connected ? "healthy" : ""}`;
+  ui.millSupervisorDetail.textContent = status.reconciliation_required
+    ? "Mill supervisor reconciliation would be required before command routing. Existing SSH control remains unchanged while this rollout is inactive."
+    : status.connected
+    ? status.enabled
+      ? "Persistent mill supervisor connected. Scheduler commands use the durable controller-resident ledger."
+      : "Telemetry-only agent connected. Program commands remain disabled."
+    : (status.last_disconnect_detail || "No staged mill-supervisor connection is started automatically.");
+  ui.reconcileMillSupervisor.disabled = !status.reconciliation_required;
+}
+
+async function loadMillSupervisor() {
+  try {
+    renderMillSupervisor(await api("/api/debug/cnc/supervisor", {cache: "no-store"}));
+  } catch (error) {
+    ui.millSupervisorDetail.textContent = error.message;
+  }
+}
+
+ui.reconcileMillSupervisor.addEventListener("click", async () => {
+  const candidate = millSupervisorState?.recent_commands?.find(command =>
+    ["latched", "faulted", "uncertain", "monitoring_released"].includes(command.status));
+  if (!candidate) return showToast("No mill command is awaiting reconciliation.", "error");
+  const resolution = await window.mpsConfirm({
+    eyebrow: "Mill command ledger",
+    title: `Reconcile sequence ${candidate.sequence}?`,
+    message: "This updates only the durable ledger. It will not load, start, stop, or retry a PathPilot program.",
+    tone: "warning",
+    primaryLabel: "Accept completed",
+    secondaryLabel: "Mark faulted",
+  });
+  if (!resolution) return;
+  try {
+    const board = await api("/api/board", {cache: "no-store"});
+    renderMillSupervisor(await api("/api/debug/cnc/supervisor/reconcile", {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: board.revision,
+        sequence: candidate.sequence,
+        resolution: resolution === "primary" ? "accept_completed" : "mark_faulted",
+      }),
+    }));
+    showToast("Mill supervisor ledger reconciled. No controller command was sent.");
+  } catch (error) {
+    showToast(error.message, "error");
+    await loadMillSupervisor();
+  }
+});
 
 async function loadCncIoLabels() {
   try {
@@ -1149,7 +1348,14 @@ document.addEventListener("click", async event => {
   const renameButton = event.target.closest("[data-rename-debug-io]");
   if (renameButton && snapshotState) {
     const currentLabel = renameButton.dataset.debugLabel || "";
-    const nextLabel = window.prompt("Enter a label for this I/O port. Leave blank to reset to the hardware name.", currentLabel);
+    const nextLabel = await window.mpsPrompt({
+      eyebrow: "I/O configuration",
+      title: "Rename I/O port",
+      message: "Leave the label blank to reset to the hardware name.",
+      label: "Display label",
+      value: currentLabel,
+      submitLabel: "Save label",
+    });
     if (nextLabel === null) return;
     try {
       const updated = await api("/api/debug/io/label", {
@@ -1298,7 +1504,7 @@ async function pollRobotDebugging() {
 }
 
 async function pollCncDebugging() {
-  if (!document.hidden) await loadCncDebugging();
+  if (!document.hidden) await Promise.all([loadCncDebugging(), loadMillSupervisor()]);
   window.setTimeout(pollCncDebugging, 5000);
 }
 
@@ -1306,9 +1512,11 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   loadDebugging();
   loadCncDebugging();
+  loadMillSupervisor();
 });
 
 pollRobotDebugging();
+loadMillSupervisor();
 async function pollSupervisorDebugging() {
   if (!document.hidden) await loadSupervisorDebugging();
   window.setTimeout(pollSupervisorDebugging, 2000);

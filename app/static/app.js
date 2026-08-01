@@ -19,6 +19,7 @@ const ui = {
   warning: document.querySelector("#program-warning"),
   warningMessage: document.querySelector("#program-warning-message"),
   warningDismiss: document.querySelector("#dismiss-program-warning"),
+  notificationCenter: document.querySelector("#schedule-notifications"),
   palletProgramHelp: document.querySelector("#pallet-program-help"),
   toast: document.querySelector("#toast"),
   palletDialog: document.querySelector("#pallet-dialog"),
@@ -243,6 +244,7 @@ function palletCard(pallet, position = null) {
     ? ""
     : pallet.program_metadata_state === "parsed"
       ? `<div><dt>Tools</dt><dd>${escapeHtml(pallet.program_tools.join(", ") || "None")}</dd></div>
+         <div><dt>WCS</dt><dd>${escapeHtml((pallet.program_wcs || []).join(", ") || "None")}</dd></div>
          <div><dt>Cycle</dt><dd>${displayCycleTime(pallet.expected_cycle_seconds)}</dd></div>`
       : `<div><dt>Metadata</dt><dd title="${escapeHtml(pallet.program_metadata_detail || "Program metadata unavailable")}">Unavailable</dd></div>`;
   return `
@@ -349,6 +351,7 @@ function renderBoard() {
   if (runAlert !== dismissedProgramWarning) dismissedProgramWarning = null;
   ui.warning.classList.toggle("hidden", !runAlert || dismissedProgramWarning === runAlert);
   ui.warningMessage.textContent = runAlert;
+  renderNotificationCenter();
   ui.state.classList.add("online");
   ui.state.lastChild.textContent = ` Online · rev ${board.revision}`;
   ui.debugPanel.classList.toggle("hidden", !board.settings.debug_menu_enabled);
@@ -406,15 +409,24 @@ function renderRobotMotionStatus() {
   ui.robotMotionSummary.innerHTML = `<strong>${status}: ${escapeHtml(motion.pallet_name || "Pallet")}</strong><span>${escapeHtml(motion.operation)} ${target} | ${escapeHtml(motion.program_path)}${motion.failure_detail ? ` | ${escapeHtml(motion.failure_detail)}` : ""}</span>`;
   ui.robotMotionRecover.classList.toggle("hidden", motion.status !== "faulted");
   if (motion.status === "faulted") {
+    const linkLostAfterCompletion = motion.failure_detail?.includes("atomic") && motion.failure_detail?.includes("finished before latching");
     const options = motion.operation === "pick"
-      ? [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]]
+      ? (linkLostAfterCompletion
+        ? [["robot_held", "Robot-held (recommended)"], ["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`]]
+        : [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]])
       : motion.operation === "put"
-        ? [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
+        ? (linkLostAfterCompletion
+          ? [["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")} (recommended)`], ["robot_held", "Robot-held"]]
+          : [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]])
       : motion.operation === "load_mill"
-          ? (motion.source_slot
-            ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
-            : [["robot_held", "Robot-held"], ["machine", "Mill"]])
-          : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]];
+          ? (linkLostAfterCompletion
+            ? [["machine", "Mill (recommended)"], ["robot_held", "Robot-held"], ["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`]]
+            : (motion.source_slot
+              ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
+              : [["robot_held", "Robot-held"], ["machine", "Mill"]]))
+          : (linkLostAfterCompletion
+            ? [["robot_held", "Robot-held (recommended)"], ["machine", "Mill"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
+            : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]);
     document.querySelector("#motion-recovery-message").textContent = `${motion.failure_detail || "Movement fault."} Verify the actual pallet location before saving.`;
     document.querySelector("#motion-recovery-resolution").innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
     if (!ui.motionRecoveryDialog.open) ui.motionRecoveryDialog.showModal();
@@ -428,6 +440,7 @@ ui.toast.addEventListener("click", event => {
 ui.warningDismiss.addEventListener("click", async () => {
   dismissedProgramWarning = board?.run_mode?.alert || null;
   ui.warning.classList.add("hidden");
+  renderNotificationCenter();
   try {
     board = await api("/api/run-mode/alert/dismiss", {method: "POST", body: "{}"});
     renderBoard();
@@ -448,6 +461,7 @@ ui.robotMotionDismiss.addEventListener("click", () => {
     motion.operation === "pick" && board.pallets.some(pallet => pallet.id === motion.pallet_id && pallet.location === "robot_held"),
   ]) : null;
   ui.robotMotionStatus.classList.add("hidden");
+  renderNotificationCenter();
 });
 
 function renderRunMode() {
@@ -478,6 +492,7 @@ function renderRunMode() {
         <button class="button secondary" type="button" data-recover-run-mode="manual_complete_and_unload">Mark complete and unload</button>
         <button class="button secondary" type="button" data-recover-run-mode="retry_robot_only">Retry robot unload only</button>
         <button class="button ghost" type="button" data-recover-run-mode="reposition_and_retry">Reposition mill, then retry</button>
+        <button class="button danger" type="button" data-cancel-run-mode-recovery>Cancel and stop</button>
       </div>`
     : "";
   const clearStatus = !run.enabled && ["faulted", "interrupted"].includes(run.state)
@@ -513,6 +528,28 @@ function renderRunMode() {
 }
 
 ui.runModeStatus.addEventListener("click", async event => {
+  const cancelRecovery = event.target.closest("[data-cancel-run-mode-recovery]");
+  if (cancelRecovery && board) {
+    if (await window.mpsConfirm({
+      eyebrow: "Run mode recovery",
+      title: "Cancel recovery and stop?",
+      message: "No further automated action will start. The mill program will not be stopped and the pallet location will not change.",
+      tone: "danger",
+      primaryLabel: "Cancel and stop",
+    }) !== "primary") return;
+    cancelRecovery.disabled = true;
+    try {
+      board = await api("/api/run-mode/recovery/cancel", {
+        method: "POST",
+        body: JSON.stringify({expected_revision: board.revision}),
+      });
+      renderBoard();
+      showToast("Recovery cancelled. Run Mode is stopped.");
+    } catch (error) {
+      showToast(`Could not cancel recovery: ${error.message}`, "error");
+    }
+    return;
+  }
   const recoveryButton = event.target.closest("[data-recover-run-mode]");
   if (recoveryButton && board) {
     const strategy = recoveryButton.dataset.recoverRunMode;
@@ -523,7 +560,14 @@ ui.runModeStatus.addEventListener("click", async event => {
       : strategy === "retry_robot_only"
       ? "Confirm the mill is still at its loading position. Retry only the robot unload?"
       : "Move the mill to its loading position again, then retry the robot unload?";
-    if (!window.confirm(prompt)) return;
+    const choice = await window.mpsConfirm({
+      eyebrow: "Run mode recovery",
+      title: "Start recovery?",
+      message: prompt,
+      tone: "warning",
+      primaryLabel: "Start recovery",
+    });
+    if (choice !== "primary") return;
     document.querySelectorAll("[data-recover-run-mode]").forEach(item => { item.disabled = true; });
     recoveryButton.textContent = "Starting recovery...";
     try {
@@ -651,11 +695,33 @@ async function savePallet(event) {
   }
 }
 
-function askConfirmation(title, message, callback) {
-  document.querySelector("#confirm-title").textContent = title;
-  document.querySelector("#confirm-message").textContent = message;
-  confirmCallback = callback;
-  ui.confirmDialog.showModal();
+function askConfirmation(title, message, callback, options = {}) {
+  void window.mpsConfirm({
+    eyebrow: options.eyebrow || "Confirm action",
+    title,
+    message,
+    tone: options.tone || "warning",
+    primaryLabel: options.primaryLabel || "Continue",
+    secondaryLabel: options.secondaryLabel || "",
+    cancelLabel: options.cancelLabel || "Cancel",
+  }).then(async choice => {
+    if (choice === "primary") await callback();
+    if (choice === "secondary" && options.secondaryCallback) await options.secondaryCallback();
+  });
+}
+
+function renderNotificationCenter() {
+  const run = board?.run_mode || {};
+  const runNeedsAttention = !run.enabled && [
+    "faulted", "interrupted", "stopped", "telemetry_unavailable", "telemetry_restored",
+    "recovering_startup_telemetry", "recovering_cnc_telemetry", "recovering_robot_telemetry",
+  ].includes(run.state);
+  const visible = Boolean(
+    run.enabled || runNeedsAttention
+      || !ui.warning.classList.contains("hidden")
+      || !ui.robotMotionStatus.classList.contains("hidden"),
+  );
+  ui.notificationCenter.classList.toggle("hidden", !visible);
 }
 
 async function mutate(url, options, successMessage) {
@@ -679,14 +745,52 @@ async function movePallet(id, destination, poolSlotNumber = null) {
   }, `Moved ${palletById(id)?.name || "pallet"}.`);
 }
 
-async function queuePallet(id, queueIndex = null) {
-  await mutate(`/api/pallets/${id}/queue`, {
-    method: "POST",
-    body: JSON.stringify({
-      expected_revision: board.revision,
-      queue_index: queueIndex,
-    }),
-  }, `Queued ${palletById(id)?.name || "pallet"}.`);
+async function queuePallet(id, queueIndex = null, convertCompletedToRaw = null) {
+  const pallet = palletById(id);
+  if (pallet?.content_status === "complete_parts" && convertCompletedToRaw === null) {
+    askConfirmation(
+      "Completed pallet",
+      `${pallet.name} is marked as containing completed parts. Choose how it should enter the production queue.`,
+      () => queuePallet(id, queueIndex, true),
+      {
+        eyebrow: "Queue preparation",
+        tone: "warning",
+        primaryLabel: "Change to Raw stock",
+        secondaryLabel: "Queue as completed",
+        secondaryCallback: () => queuePallet(id, queueIndex, false),
+      },
+    );
+    return;
+  }
+  try {
+    board = await api(`/api/pallets/${id}/queue`, {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: board.revision,
+        queue_index: queueIndex,
+        convert_completed_to_raw: Boolean(convertCompletedToRaw),
+      }),
+    });
+    const queuedPallet = board.pallets.find(item => item.id === id);
+    // Older live backends ignore the new queue flag. Keep the confirmation
+    // useful without requiring an immediate production-service restart.
+    if (convertCompletedToRaw && queuedPallet?.content_status === "complete_parts") {
+      board = await api(`/api/pallets/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          expected_revision: board.revision,
+          workholding: queuedPallet.workholding,
+          weight_kg: queuedPallet.weight_kg,
+          content_status: "raw_stock",
+          program_path: queuedPallet.program_path,
+        }),
+      });
+    }
+    renderBoard();
+    showToast(`${pallet?.name || "Pallet"} queued${convertCompletedToRaw ? " as Raw stock" : ""}.`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
 }
 
 function toolList(values) {
@@ -1135,20 +1239,31 @@ document.addEventListener("drop", async event => {
   }
   if (destination === "machine" && palletById(draggedPalletId)?.location === "pool") {
     const pallet = palletById(draggedPalletId);
-    const useMongo = window.confirm(`Use Mongo to move ${pallet.name} from Pool ${String(pallet.pool_slot_number).padStart(2, "0")} into the mill?\n\nOK: run the physical pick and mill-load sequence.\nCancel: update the schedule only.`);
-    if (useMongo) {
+    const choice = await window.mpsConfirm({
+      eyebrow: "Mill transfer",
+      title: `Load ${pallet.name} into the mill?`,
+      message: `Use Mongo to move this pallet from Pool ${String(pallet.pool_slot_number).padStart(2, "0")} into the mill.`,
+      tone: "warning",
+      primaryLabel: "Use Mongo",
+      secondaryLabel: "Update schedule only",
+    });
+    if (choice === "primary") {
       await startMillTransfer("load", pallet.id);
-    } else {
+    } else if (choice === "secondary") {
       await movePallet(draggedPalletId, destination);
     }
     return;
   }
   if (destination === "machine" && palletById(draggedPalletId)?.location === "robot_held") {
     const pallet = palletById(draggedPalletId);
-    const useMongo = window.confirm(
-      `Load the Robot-held pallet ${pallet.name} into the mill?\n\nMongo will first run the mill loading-position program, then load the held pallet.`,
-    );
-    if (useMongo) await startMillTransfer("load", pallet.id);
+    const choice = await window.mpsConfirm({
+      eyebrow: "Mill transfer",
+      title: `Load ${pallet.name} into the mill?`,
+      message: "Mongo will first run the mill loading-position program, then load the Robot-held pallet.",
+      tone: "warning",
+      primaryLabel: "Use Mongo",
+    });
+    if (choice === "primary") await startMillTransfer("load", pallet.id);
     return;
   }
   await movePallet(
