@@ -55,6 +55,56 @@ variables use the `MPS_` prefix.
 | `MPS_PORT` | `8000` | Dashboard port |
 | `MPS_LOG_LEVEL` | `info` | Server log level |
 | `MPS_DATABASE_URL` | Project-root `mongo-production.db` | Optional SQLAlchemy database URL override |
+| `MPS_BACKUP_ENABLED` | `false` | Enable portable database snapshots |
+| `MPS_BACKUP_DIRECTORY` | `runtime/backups` | Local, removable-drive, or trusted network folder for `.mps` files |
+| `MPS_BACKUP_INTERVAL_SECONDS` | `900` | Periodic backup interval; successful API mutations are also coalesced into a backup |
+| `MPS_BACKUP_DEBOUNCE_SECONDS` | `15` | Delay used to coalesce several successful API mutations into one snapshot |
+
+### Portable backups and recovery
+
+Backups contain a SQLite-aware snapshot of the complete application database,
+including entered pallets, queue state, settings, and controller ledgers. They
+are unencrypted `.mps` files intended for a trusted local folder, removable
+drive, or protected network share. Configure the system once from PowerShell in
+the project folder:
+
+```powershell
+.\configure_portable_backup.ps1
+```
+
+Settings provides **Back up now**, a backup list, and guarded recovery. To move
+a backup from another computer, create a standalone file with:
+
+```powershell
+.venv\Scripts\python.exe -m app.backup_cli create --output D:\Transfer\mps-backup.mps --reason cross-computer
+```
+
+Copy the `.mps` file into this computer's configured backup directory, or use
+the import command:
+
+```powershell
+.venv\Scripts\python.exe -m app.backup_cli import --backup-file D:\Transfer\mps-backup.mps
+```
+
+The import validates the SQLite snapshot before storing it. Recovery validates
+it again, refuses to run during motion or Run Mode, stops the backend, archives
+the current database under `runtime/restore-backups/`, restores the snapshot,
+and restarts MPS. Because these files are not encrypted, protect the backup
+folder and transfer media.
+
+### GitHub update deployment
+
+Settings can queue **Deploy GitHub update**, or an operator can run:
+
+```powershell
+.\deploy_from_github.ps1
+```
+
+Deployment requires a healthy idle system, no active robot motion, a clean
+working tree, a fast-forward update from `origin/main`, and a successful
+pre-update backup. It installs dependencies and restarts the backend only after
+the update is downloaded. `-SkipBackup` is available for emergency maintenance
+only when the operator has an independent recovery point.
 
 ## Operator workflow
 

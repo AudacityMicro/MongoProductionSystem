@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from app import __version__
+from app.backup import BackupError, BackupManager
 from app.database import (
     create_database_engine,
     create_session_factory,
@@ -39,6 +40,7 @@ from app.schemas import (
     RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
+    BackupRestoreRequest,
     RobotFileAction,
     SettingsUpdate,
     SetRunModeSafety,
@@ -151,6 +153,7 @@ from app.service import (
     execute_robot_reliability_test,
 )
 from app.diagnostics import diagnostics
+from app.cameras import camera_manager, discover_cameras
 from app.robot_files import (
     RobotFileAccessError,
     RobotFileConflict,
@@ -188,6 +191,40 @@ def queue_backend_relaunch() -> None:
         cwd=PROJECT_ROOT,
         # A separate process group survives the current Uvicorn worker. Using
         # DETACHED_PROCESS here prevented PowerShell from executing on Windows.
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+
+
+def queue_backend_restore(backup_ref: str) -> None:
+    helper = PROJECT_ROOT / "restore_mps_backup.ps1"
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+            "-BackupRef",
+            backup_ref,
+        ],
+        cwd=PROJECT_ROOT,
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+
+
+def queue_github_deployment() -> None:
+    helper = PROJECT_ROOT / "deploy_from_github.ps1"
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+        ],
+        cwd=PROJECT_ROOT,
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
     )
 
@@ -244,10 +281,13 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
         engine = create_database_engine(url)
         application.state.engine = engine
         application.state.session_factory = create_session_factory(engine)
+        application.state.backup_manager = BackupManager(url)
+        application.state.backup_manager.start()
         with application.state.session_factory() as session:
             interrupt_active_pallet_motion(session)
             interrupt_robot_reliability_test(session)
             interrupt_run_mode(session)
+            camera_manager().apply(get_settings(session))
             if external_services:
                 start_robot_supervisor_listener(session)
                 start_robot_supervisor_recovery_watchdog(application.state.session_factory)
@@ -274,6 +314,8 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
             stop_robot_supervisor_recovery_watchdog()
             stop_mill_supervisor_recovery_watchdog()
             stop_mill_supervisor_listener()
+            camera_manager().stop()
+            application.state.backup_manager.stop()
             suspend_cnc_connections()
             suspend_robot_connections()
             engine.dispose()
@@ -320,6 +362,14 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
                 },
             )
         response.headers["X-Correlation-ID"] = correlation_id
+        if (
+            response.status_code < 400
+            and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith("/api/system/backup")
+            and not request.url.path.startswith("/api/system/update")
+        ):
+            request.app.state.backup_manager.request_backup("api-mutation")
         return response
 
     @application.middleware("http")
@@ -473,6 +523,78 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.get("/api/dashboard")
     def get_dashboard(session: Session = Depends(get_session)) -> dict:
         return dashboard_snapshot(session)
+
+    @application.get("/api/cameras")
+    def get_cameras(session: Session = Depends(get_session)) -> dict:
+        return camera_manager().snapshot(get_settings(session))
+
+    @application.get("/api/cameras/discover")
+    def discover_usb_cameras() -> dict:
+        return {"cameras": discover_cameras()}
+
+    @application.get("/api/cameras/{camera_id}/stream")
+    def stream_camera(camera_id: str, session: Session = Depends(get_session)) -> StreamingResponse:
+        snapshot = camera_manager().snapshot(get_settings(session))
+        if not any(item["id"] == camera_id for item in snapshot["cameras"]):
+            raise HTTPException(status_code=404, detail="Camera is not configured or enabled.")
+        try:
+            stream = camera_manager().stream(camera_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Camera is not configured or enabled.") from exc
+        return StreamingResponse(
+            stream,
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    @application.get("/api/system/backups")
+    def get_backup_status(request: Request) -> dict[str, object]:
+        manager: BackupManager = request.app.state.backup_manager
+        result = manager.status()
+        result["backups"] = manager.list_backups() if manager.config.configured else []
+        return result
+
+    @application.post("/api/system/backups", status_code=status.HTTP_202_ACCEPTED)
+    def request_backup(request: Request) -> dict[str, object]:
+        manager: BackupManager = request.app.state.backup_manager
+        return manager.request_backup("manual")
+
+    @application.post("/api/system/backups/restore", status_code=status.HTTP_202_ACCEPTED)
+    def restore_backup(
+        payload: BackupRestoreRequest,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        assert_system_relaunch_ready(session)
+        manager: BackupManager = request.app.state.backup_manager
+        if not manager.config.configured:
+            raise HTTPException(status_code=409, detail="Configure portable backups before recovery.")
+        try:
+            manager.extract_backup(payload.backup_ref, PROJECT_ROOT / "runtime" / "restore-validation.db")
+        except BackupError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        queue_backend_restore(payload.backup_ref)
+        return {
+            "status": "restoring",
+            "message": "The selected portable snapshot is valid. The backend will stop, restore it, and restart safely.",
+            "backup_ref": payload.backup_ref,
+        }
+
+    @application.get("/api/system/update")
+    def get_update_status() -> dict[str, object]:
+        status_path = PROJECT_ROOT / "runtime" / "deployment-status.json"
+        if not status_path.is_file():
+            return {"status": "unknown", "message": "No GitHub deployment has been attempted yet."}
+        try:
+            return json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"status": "unknown", "message": "Deployment status is unavailable."}
+
+    @application.post("/api/system/update", status_code=status.HTTP_202_ACCEPTED)
+    def deploy_update(session: Session = Depends(get_session)) -> dict[str, object]:
+        assert_system_relaunch_ready(session)
+        queue_github_deployment()
+        return {"status": "deploying", "message": "GitHub update deployment was queued after safety checks."}
 
     @application.get("/api/tools")
     def get_tools(session: Session = Depends(get_session)) -> dict:

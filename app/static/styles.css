@@ -429,11 +429,28 @@ p {
 .tool-chip-list { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.75rem; }
 .tool-chip { display: inline-block; padding: 0.2rem 0.42rem; border: 1px solid var(--ink); background: #dcebd7; font: 0.72rem "DM Mono", Consolas, monospace; }
 .dashboard-queue-zone { border: 1px solid var(--ink); background: var(--surface); }
+.dashboard-camera-zone { margin: 1.5rem 0; border: 1px solid var(--ink); background: var(--surface); }
+.camera-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; padding: 1rem; }
+.camera-tile { border: 2px solid var(--line); background: #101715; color: #eef2e6; overflow: hidden; }
+.camera-tile.active { border-color: var(--healthy); box-shadow: 0 0 0 3px rgba(115, 169, 66, 0.2); }
+.camera-tile.offline { border-color: var(--warning, #b8792a); }
+.camera-tile header { display: flex; justify-content: space-between; gap: 1rem; padding: 0.7rem 0.8rem; font-size: 0.85rem; }
+.camera-tile header span { color: #b8c3b4; font-size: 0.75rem; text-transform: uppercase; }
+.camera-frame { aspect-ratio: 16 / 9; display: grid; place-items: center; background: #1a2420; }
+.camera-frame img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.camera-offline { padding: 1rem; color: #d6b98a; text-align: center; }
+.camera-device-list { display: grid; gap: 0.7rem; margin: 1rem 0; }
+.camera-device-row { display: grid; grid-template-columns: minmax(12rem, 1fr) 8rem auto minmax(8rem, 1fr); gap: 0.7rem; align-items: end; padding: 0.7rem; border: 1px solid var(--line); background: var(--surface-muted, #f2f3ec); }
+.camera-device-row .checkbox-control { margin-bottom: 0.45rem; }
+.backup-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 0.75rem; padding: 0.65rem 0; border-bottom: 1px solid var(--line); }
+.backup-row code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dashboard-queue-list { display: grid; }
 .dashboard-queue-item { display: grid; grid-template-columns: 2.5rem minmax(11rem, 1fr) minmax(12rem, 2fr) 5rem; gap: 0.8rem; align-items: center; padding: 0.8rem 1rem; border-bottom: 1px solid var(--line); }
 .dashboard-queue-item small { display: block; margin-top: 0.25rem; color: var(--muted); overflow-wrap: anywhere; }
 .dashboard-queue-item .tool-chip-list { margin: 0; }
 @media (max-width: 900px) { .dashboard-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dashboard-queue-item { grid-template-columns: 2.5rem minmax(0, 1fr); } .dashboard-queue-item > :nth-child(3), .dashboard-queue-item > :nth-child(4) { grid-column: 2; } }
+@media (max-width: 700px) { .camera-device-row { grid-template-columns: 1fr 1fr; } .camera-device-row .field-help { grid-column: 1 / -1; } }
+@media (max-width: 700px) { .backup-row { grid-template-columns: 1fr auto; } .backup-row code { grid-column: 1 / -1; } }
 
 .file-manager {
   border: 1px solid var(--ink);
