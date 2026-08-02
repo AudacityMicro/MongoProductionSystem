@@ -103,6 +103,17 @@ class AppSettings(Base):
     mill_status_file_path: Mapped[str] = mapped_column(
         String(500), default="/home/operator/gcode/MongoProduction/mill-status.txt"
     )
+    camera_devices_json: Mapped[str] = mapped_column(String, default="[]")
+    camera_idle_id: Mapped[str] = mapped_column(String(100), default="")
+    camera_loading_id: Mapped[str] = mapped_column(String(100), default="")
+    camera_machining_id: Mapped[str] = mapped_column(String(100), default="")
+    camera_recording_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    camera_recording_path: Mapped[str] = mapped_column(String(1000), default="data/camera-recordings")
+    camera_recording_retention_days: Mapped[int] = mapped_column(Integer, default=7)
+    camera_width: Mapped[int] = mapped_column(Integer, default=1920)
+    camera_height: Mapped[int] = mapped_column(Integer, default=1080)
+    camera_fps: Mapped[int] = mapped_column(Integer, default=30)
+    camera_segment_seconds: Mapped[int] = mapped_column(Integer, default=300)
     pool_location_positions: Mapped[str] = mapped_column(String, default="[]")
     on_deck_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')
     dripping_location_position: Mapped[str] = mapped_column(String, default='{"x_mm":0,"y_mm":0,"z_mm":0}')

@@ -116,6 +116,18 @@ const ui = {
   workholdingLibraryList: document.querySelector("#workholding-library-list"),
   fusionToolLibraryUpload: document.querySelector("#fusion-tool-library-upload"),
   fusionToolLibraryList: document.querySelector("#fusion-tool-library-list"),
+  discoverCameras: document.querySelector("#discover-cameras"),
+  cameraDiscoveryStatus: document.querySelector("#camera-discovery-status"),
+  cameraDeviceList: document.querySelector("#camera-device-list"),
+  cameraIdleId: document.querySelector("#camera-idle-id"),
+  cameraLoadingId: document.querySelector("#camera-loading-id"),
+  cameraMachiningId: document.querySelector("#camera-machining-id"),
+  cameraRecordingEnabled: document.querySelector("#camera-recording-enabled"),
+  cameraRecordingPath: document.querySelector("#camera-recording-path"),
+  cameraRecordingRetentionDays: document.querySelector("#camera-recording-retention-days"),
+  cameraWidth: document.querySelector("#camera-width"),
+  cameraHeight: document.querySelector("#camera-height"),
+  cameraFps: document.querySelector("#camera-fps"),
   openRobotDirectory: document.querySelector("#open-robot-directory"),
   robotFileAccessStatus: document.querySelector("#robot-file-access-status"),
   robotDirectoryModal: document.querySelector("#robot-directory-modal"),
@@ -127,6 +139,11 @@ const ui = {
   appVersion: document.querySelector("#app-version"),
   relaunchSystem: document.querySelector("#relaunch-system"),
   relaunchStatus: document.querySelector("#relaunch-status"),
+  backupNow: document.querySelector("#backup-now"),
+  deployGithubUpdate: document.querySelector("#deploy-github-update"),
+  backupStatus: document.querySelector("#backup-status"),
+  backupList: document.querySelector("#backup-list"),
+  updateStatus: document.querySelector("#update-status"),
   poseCaptureModal: document.querySelector("#pose-capture-modal"),
   poseCaptureMessage: document.querySelector("#pose-capture-message"),
   poseCaptureCancel: document.querySelector("#pose-capture-cancel"),
@@ -156,6 +173,7 @@ let afterScriptRebuildPrompt = null;
 let suppressNextPopstatePrompt = false;
 let workholdingLibrary = [];
 let pendingPoseCaptureButton = null;
+let cameraDevicesDraft = [];
 
 function organizeSettingsPage() {
   const groups = [
@@ -164,7 +182,7 @@ function organizeSettingsPage() {
       eyebrow: "General",
       title: "Production and display",
       description: "Shared scheduling, pallet, workholding, and operator display settings.",
-      panels: ["Display", "Pallet pool", "Workflow stations", "Workholding library"],
+      panels: ["Display", "Cameras", "Pallet pool", "Workflow stations", "Workholding library"],
       openPanels: ["Display"],
       widePanels: ["Workholding library"],
     },
@@ -191,9 +209,9 @@ function organizeSettingsPage() {
       eyebrow: "System",
       title: "Application and diagnostics",
       description: "Diagnostic access, test controls, saving, and backend lifecycle actions.",
-      panels: ["Debugging controls"],
-      openPanels: ["Debugging controls"],
-      widePanels: ["Debugging controls"],
+      panels: ["Debugging controls", "Backup & updates"],
+      openPanels: ["Debugging controls", "Backup & updates"],
+      widePanels: ["Debugging controls", "Backup & updates"],
     },
   ];
   const actions = ui.form.querySelector(".settings-actions");
@@ -307,6 +325,48 @@ function setRelaunchStatus(message, kind = "working") {
   ui.relaunchStatus.className = `relaunch-status ${kind}`;
 }
 
+function renderBackupState(data) {
+  if (!data.configured) {
+    ui.backupStatus.textContent = "Backups are not configured. Add MPS_BACKUP_ENABLED=true and MPS_BACKUP_DIRECTORY to .env.";
+    ui.backupList.innerHTML = "";
+  } else {
+    const success = data.last_success ? `Last successful backup: ${new Date(data.last_success).toLocaleString()}.` : "No successful backup recorded since this backend started.";
+    ui.backupStatus.textContent = data.last_error ? `Backup error: ${data.last_error}` : success;
+    ui.backupList.innerHTML = (data.backups || []).slice(0, 30).map(item => `
+      <div class="backup-row">
+        <code>${escapeHtml(item.reference)}</code>
+        <span>${Math.round((item.size_bytes || 0) / 1024)} KB</span>
+        <button class="button ghost" type="button" data-backup-restore="${escapeHtml(item.reference)}">Recover</button>
+      </div>`).join("") || `<p class="field-help">No portable backups are present in the configured folder.</p>`;
+  }
+  ui.backupList.querySelectorAll("[data-backup-restore]").forEach(button => button.addEventListener("click", async () => {
+    const backupRef = button.dataset.backupRestore;
+    if (!backupRef || !window.confirm(`Recover MPS from this portable snapshot?\n\n${backupRef}\n\nRun Mode and robot motion must remain stopped.`)) return;
+    button.disabled = true;
+    try {
+      await api("/api/system/backups/restore", {method: "POST", body: JSON.stringify({backup_ref: backupRef})});
+      showToast("Recovery queued. The backend will restart from the selected snapshot.");
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message, "error");
+    }
+  }));
+}
+
+async function loadBackupState() {
+  try {
+    renderBackupState(await api("/api/system/backups"));
+  } catch (error) {
+    ui.backupStatus.textContent = `Backup status unavailable: ${error.message}`;
+  }
+  try {
+    const update = await api("/api/system/update");
+    ui.updateStatus.textContent = update.message || update.status || "No update status available.";
+  } catch (error) {
+    ui.updateStatus.textContent = `Update status unavailable: ${error.message}`;
+  }
+}
+
 function syncRobotModeUi() {
   const isPhysical = ui.robotConnectionMode.value === "physical";
   ui.robotConnectionHelp.textContent = isPhysical
@@ -326,6 +386,58 @@ function fieldNumber(input, fallback) {
   if (input.value.trim() === "") return fallback;
   return Number(input.value);
 }
+
+function renderCameraAssignments() {
+  const options = [{id: "", name: "No camera assigned"}, ...cameraDevicesDraft];
+  for (const [select, selected] of [[ui.cameraIdleId, ui.cameraIdleId.value], [ui.cameraLoadingId, ui.cameraLoadingId.value], [ui.cameraMachiningId, ui.cameraMachiningId.value]]) {
+    const current = selected;
+    select.innerHTML = options.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
+    select.value = options.some(item => item.id === current) ? current : "";
+  }
+}
+
+function renderCameraDevices() {
+  ui.cameraDeviceList.innerHTML = cameraDevicesDraft.length
+    ? cameraDevicesDraft.map(camera => `<div class="camera-device-row" data-camera-id="${escapeHtml(camera.id)}">
+        <label>Name<input data-camera-field="name" value="${escapeHtml(camera.name)}" maxlength="100"></label>
+        <label>USB index<input data-camera-field="device_index" type="number" min="0" max="64" value="${camera.device_index}"></label>
+        <label class="checkbox-control"><input data-camera-field="enabled" type="checkbox" ${camera.enabled ? "checked" : ""}><span>Enabled</span></label>
+        <span class="field-help">${escapeHtml(camera.id)}</span>
+      </div>`).join("")
+    : `<p class="field-help">No cameras configured. Discover USB cameras, then save their assignments.</p>`;
+  renderCameraAssignments();
+}
+
+function updateCameraDraftFromEvent(event) {
+  const row = event.target.closest("[data-camera-id]");
+  const field = event.target.dataset.cameraField;
+  if (!row || !field) return;
+  const camera = cameraDevicesDraft.find(item => item.id === row.dataset.cameraId);
+  if (!camera) return;
+  camera[field] = field === "enabled" ? event.target.checked : field === "device_index" ? fieldNumber(event.target, camera.device_index) : event.target.value.trim();
+  renderCameraAssignments();
+  refreshDirtyState();
+}
+
+ui.cameraDeviceList.addEventListener("input", updateCameraDraftFromEvent);
+ui.cameraDeviceList.addEventListener("change", updateCameraDraftFromEvent);
+
+ui.discoverCameras.addEventListener("click", async () => {
+  ui.discoverCameras.disabled = true;
+  ui.cameraDiscoveryStatus.textContent = "Scanning USB indexes...";
+  try {
+    const result = await api("/api/cameras/discover");
+    const existing = new Map(cameraDevicesDraft.map(item => [item.device_index, item]));
+    cameraDevicesDraft = result.cameras.map(camera => ({...camera, ...(existing.get(camera.device_index) || {})}));
+    renderCameraDevices();
+    ui.cameraDiscoveryStatus.textContent = `${result.cameras.length} camera${result.cameras.length === 1 ? "" : "s"} detected. Save settings to keep the configuration.`;
+    refreshDirtyState();
+  } catch (error) {
+    ui.cameraDiscoveryStatus.textContent = error.message;
+  } finally {
+    ui.discoverCameras.disabled = false;
+  }
+});
 
 function programExtensions() {
   const values = ui.extensions.value.split(",").map(value => value.trim()).filter(Boolean);
@@ -567,6 +679,16 @@ function settingsDraft() {
     on_deck_enabled: ui.onDeckEnabled.checked,
     dripping_enabled: ui.drippingEnabled.checked,
     run_mode_safety_confirm: ui.runModeSafetyConfirm.checked,
+    camera_devices: cameraDevicesDraft,
+    camera_idle_id: ui.cameraIdleId.value,
+    camera_loading_id: ui.cameraLoadingId.value,
+    camera_machining_id: ui.cameraMachiningId.value,
+    camera_recording_enabled: ui.cameraRecordingEnabled.checked,
+    camera_recording_path: ui.cameraRecordingPath.value.trim() || "data/camera-recordings",
+    camera_recording_retention_days: fieldNumber(ui.cameraRecordingRetentionDays, 7),
+    camera_width: fieldNumber(ui.cameraWidth, 1920),
+    camera_height: fieldNumber(ui.cameraHeight, 1080),
+    camera_fps: fieldNumber(ui.cameraFps, 30),
     pool_locations: poolLocationsDraft(),
     on_deck_location: readLocation("on_deck"),
     dripping_location: readLocation("dripping"),
@@ -694,6 +816,20 @@ async function loadSettings() {
     ui.poolSlotCount.value = board.settings.pool_slot_count;
     ui.onDeckEnabled.checked = board.settings.on_deck_enabled !== false;
     ui.drippingEnabled.checked = board.settings.dripping_enabled !== false;
+    cameraDevicesDraft = [...(board.settings.camera_devices || [])].map(camera => ({...camera}));
+    ui.cameraIdleId.value = board.settings.camera_idle_id || "";
+    ui.cameraLoadingId.value = board.settings.camera_loading_id || "";
+    ui.cameraMachiningId.value = board.settings.camera_machining_id || "";
+    ui.cameraRecordingEnabled.checked = board.settings.camera_recording_enabled === true;
+    ui.cameraRecordingPath.value = board.settings.camera_recording_path || "data/camera-recordings";
+    ui.cameraRecordingRetentionDays.value = board.settings.camera_recording_retention_days || 7;
+    ui.cameraWidth.value = board.settings.camera_width || 1920;
+    ui.cameraHeight.value = board.settings.camera_height || 1080;
+    ui.cameraFps.value = board.settings.camera_fps || 30;
+    renderCameraDevices();
+    ui.cameraIdleId.value = board.settings.camera_idle_id || "";
+    ui.cameraLoadingId.value = board.settings.camera_loading_id || "";
+    ui.cameraMachiningId.value = board.settings.camera_machining_id || "";
     renderLocationFields();
     ui.debugMenuEnabled.checked = board.settings.debug_menu_enabled;
     ui.manualIoControlEnabled.checked = board.settings.manual_io_control_enabled;
@@ -1552,6 +1688,33 @@ ui.relaunchSystem.addEventListener("click", async () => {
   showToast("Relaunch timed out. If the backend did restart, refresh this page once.", "error");
 });
 
+ui.backupNow.addEventListener("click", async () => {
+  ui.backupNow.disabled = true;
+  try {
+    await api("/api/system/backups", {method: "POST"});
+    showToast("Portable backup scheduled in the configured backup folder.");
+    window.setTimeout(loadBackupState, 2000);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.backupNow.disabled = false;
+  }
+});
+
+ui.deployGithubUpdate.addEventListener("click", async () => {
+  if (!window.confirm("Deploy the fast-forward update from GitHub? MPS must be idle and the local working tree must be clean.")) return;
+  ui.deployGithubUpdate.disabled = true;
+  try {
+    await api("/api/system/update", {method: "POST"});
+    ui.updateStatus.textContent = "Deployment queued. The backend will restart if the GitHub update passes all checks.";
+    showToast("GitHub deployment queued.");
+    window.setTimeout(loadBackupState, 3000);
+  } catch (error) {
+    showToast(error.message, "error");
+    ui.deployGithubUpdate.disabled = false;
+  }
+});
+
 ui.openRobotDirectory.addEventListener("click", async () => {
   if (hasUnsavedChanges()) {
     showToast("Save the Robot file access settings before opening the controller directory.", "error");
@@ -1587,4 +1750,4 @@ ui.robotDirectoryModal.addEventListener("click", event => {
   if (event.target === ui.robotDirectoryModal) closeRobotDirectory();
 });
 
-loadSettings().then(loadSupervisorStatus);
+loadSettings().then(() => Promise.all([loadSupervisorStatus(), loadBackupState()]));

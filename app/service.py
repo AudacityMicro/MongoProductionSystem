@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.diagnostics import diagnostics
+from app.cameras import camera_manager, parse_camera_devices
 from app.program_metadata import parse_program_metadata, unavailable_program_metadata, PROGRAM_METADATA_PREFIX_BYTES
 from app.models import AppSettings, MillSupervisorCommand, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
@@ -1688,6 +1689,17 @@ def board_snapshot(session: Session) -> dict:
             "mill_programs_filter_enabled": settings.mill_programs_filter_enabled,
             "mill_editor_command": settings.mill_editor_command,
             "mill_status_file_path": settings.mill_status_file_path,
+            "camera_devices": parse_camera_devices(settings.camera_devices_json),
+            "camera_idle_id": settings.camera_idle_id,
+            "camera_loading_id": settings.camera_loading_id,
+            "camera_machining_id": settings.camera_machining_id,
+            "camera_recording_enabled": settings.camera_recording_enabled,
+            "camera_recording_path": settings.camera_recording_path,
+            "camera_recording_retention_days": settings.camera_recording_retention_days,
+            "camera_width": settings.camera_width,
+            "camera_height": settings.camera_height,
+            "camera_fps": settings.camera_fps,
+            "camera_segment_seconds": settings.camera_segment_seconds,
             "fusion_tool_library_path": settings.fusion_tool_library_path,
             "fusion_tool_libraries": [{"path": path, "name": Path(path).name} for path in fusion_tool_library_paths(settings)],
         },
@@ -2010,6 +2022,7 @@ def dashboard_snapshot(session: Session) -> dict:
     machine_item = serialize_pallet(machine) if machine else None
     telemetry, atc_source = _configured_cnc_telemetry(settings)
     atc_slots = _atc_inventory(telemetry)
+    cameras = camera_manager().snapshot(settings)
     return {
         "revision": settings.revision,
         "queue": queue_items,
@@ -2019,6 +2032,7 @@ def dashboard_snapshot(session: Session) -> dict:
         "current_cycle_seconds": machine_item["expected_cycle_seconds"] if machine_item else None,
         "atc_tools": [slot["tool"] for slot in atc_slots if slot["tool"]],
         "atc_source": atc_source,
+        "cameras": cameras,
         "summary": _board_summary(settings, pallets),
     }
 
@@ -7134,6 +7148,34 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.mill_editor_command = payload.mill_editor_command
     if payload.mill_status_file_path is not None:
         settings.mill_status_file_path = payload.mill_status_file_path
+    if payload.camera_devices is not None:
+        normalized_devices = parse_camera_devices(payload.camera_devices)
+        if len(normalized_devices) != len(payload.camera_devices):
+            raise problem(422, "Camera definitions must have unique IDs and valid USB device indexes.")
+        settings.camera_devices_json = json.dumps(normalized_devices, separators=(",", ":"))
+    for field_name in ("camera_idle_id", "camera_loading_id", "camera_machining_id"):
+        value = getattr(payload, field_name)
+        if value is not None:
+            setattr(settings, field_name, value)
+    camera_ids = {item["id"] for item in parse_camera_devices(settings.camera_devices_json)}
+    for field_name in ("camera_idle_id", "camera_loading_id", "camera_machining_id"):
+        selected = getattr(settings, field_name)
+        if selected and selected not in camera_ids:
+            raise problem(422, f"{field_name} must refer to a configured camera.")
+    if payload.camera_recording_enabled is not None:
+        settings.camera_recording_enabled = payload.camera_recording_enabled
+    if payload.camera_recording_path is not None:
+        settings.camera_recording_path = payload.camera_recording_path
+    if payload.camera_recording_retention_days is not None:
+        settings.camera_recording_retention_days = payload.camera_recording_retention_days
+    if payload.camera_width is not None:
+        settings.camera_width = payload.camera_width
+    if payload.camera_height is not None:
+        settings.camera_height = payload.camera_height
+    if payload.camera_fps is not None:
+        settings.camera_fps = payload.camera_fps
+    if payload.camera_segment_seconds is not None:
+        settings.camera_segment_seconds = payload.camera_segment_seconds
     _mill_status_file_path(settings)
     if payload.fusion_tool_library_path is not None:
         settings.fusion_tool_library_path = payload.fusion_tool_library_path
@@ -7179,6 +7221,7 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     cleared = reconcile_programs(session, settings) if program_catalog_changed else []
     bump(settings)
     commit_or_conflict(session)
+    camera_manager().apply(settings)
     if supervisor_listener_changed:
         robot_supervisor().start(
             settings.robot_supervisor_listen_host,

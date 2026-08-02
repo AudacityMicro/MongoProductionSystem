@@ -42,6 +42,10 @@ class RevisionRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class BackupRestoreRequest(BaseModel):
+    backup_ref: str = Field(min_length=20, max_length=500)
+
+
 class CncTelemetryConnectionTest(BaseModel):
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(default=22, ge=1, le=65535)
@@ -377,10 +381,26 @@ class SettingsUpdate(RevisionRequest):
     mill_programs_filter_enabled: bool | None = None
     mill_editor_command: str | None = Field(default=None, max_length=500)
     mill_status_file_path: str | None = Field(default=None, max_length=500)
+    camera_devices: list[dict] | None = Field(default=None, max_length=32)
+    camera_idle_id: str | None = Field(default=None, max_length=100)
+    camera_loading_id: str | None = Field(default=None, max_length=100)
+    camera_machining_id: str | None = Field(default=None, max_length=100)
+    camera_recording_enabled: bool | None = None
+    camera_recording_path: str | None = Field(default=None, max_length=1000)
+    camera_recording_retention_days: int | None = Field(default=None, ge=1, le=30)
+    camera_width: int | None = Field(default=None, ge=320, le=3840)
+    camera_height: int | None = Field(default=None, ge=240, le=2160)
+    camera_fps: int | None = Field(default=None, ge=1, le=60)
+    camera_segment_seconds: int | None = Field(default=None, ge=30, le=3600)
 
     @field_validator("robot_host", "robot_supervisor_hostname", "robot_supervisor_listen_host", "mill_supervisor_hostname", "mill_supervisor_listen_host")
     @classmethod
     def strip_robot_host(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @field_validator("camera_idle_id", "camera_loading_id", "camera_machining_id", "camera_recording_path")
+    @classmethod
+    def strip_camera_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
 
     @field_validator(

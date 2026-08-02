@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260726-13">
+    <link rel="stylesheet" href="/static/styles.css?v=20260801-1">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/settings.js?v=20260726-13" defer></script>
+    <script src="/static/settings.js?v=20260801-1" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -38,7 +38,7 @@
       </section>
 
       <nav class="settings-category-nav" aria-label="Settings categories">
-        <a href="#settings-general">General</a>
+            <a href="#settings-general">General</a>
         <a href="#settings-robot">Robot</a>
         <a href="#settings-mill">Mill</a>
         <a href="#settings-system">System</a>
@@ -98,6 +98,40 @@
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">03</p>
+            <h2>Cameras</h2>
+            <p>Monitor USB webcams from the Dashboard and keep rolling phase-tagged clips on the server.</p>
+          </div>
+          <div class="panel-fields">
+            <div class="inline-actions">
+              <button class="button secondary" id="discover-cameras" type="button">Discover USB cameras</button>
+              <span class="field-help" id="camera-discovery-status" role="status" aria-live="polite">No discovery run yet.</span>
+            </div>
+            <div id="camera-device-list" class="camera-device-list"></div>
+            <div class="form-row">
+              <label>Idle camera<select id="camera-idle-id"></select></label>
+              <label>Loading camera<select id="camera-loading-id"></select></label>
+              <label>Machining camera<select id="camera-machining-id"></select></label>
+            </div>
+            <label class="checkbox-control">
+              <input id="camera-recording-enabled" type="checkbox">
+              <span>Record rolling clips<small>Clips are saved locally in five-minute segments and deleted after the retention period. Camera loss never pauses production.</small></span>
+            </label>
+            <div class="form-row">
+              <label>Recording folder<input id="camera-recording-path" maxlength="1000" placeholder="data/camera-recordings"></label>
+              <label>Retention days<input id="camera-recording-retention-days" type="number" min="1" max="30" step="1"></label>
+            </div>
+            <div class="form-row">
+              <label>Width<input id="camera-width" type="number" min="320" max="3840" step="1"></label>
+              <label>Height<input id="camera-height" type="number" min="240" max="2160" step="1"></label>
+              <label>Frame rate<input id="camera-fps" type="number" min="1" max="60" step="1"></label>
+            </div>
+            <p class="field-help">The live dashboard shows all enabled cameras. The current phase camera is highlighted; if it is offline, the first available camera is highlighted as a fallback.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">04</p>
             <h2>Robot connection</h2>
             <p>Choose whether the UI talks to a physical robot or the built-in simulator.</p>
           </div>
@@ -537,6 +571,24 @@
             <label class="button secondary file-upload-label">Upload Fusion tool libraries<input id="fusion-tool-library-upload" type="file" accept=".tools,.json,application/json" multiple hidden></label>
             <div class="managed-library-list" id="fusion-tool-library-list"></div>
             <p class="field-help">Upload one or more <code>.tools</code> or JSON libraries. The server stores them locally and merges their tool numbers into the Tools page.</p>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">12</p>
+            <h2>Backup &amp; updates</h2>
+            <p>Save entered production data as portable snapshots and deploy approved fast-forward updates.</p>
+          </div>
+          <div class="panel-fields">
+            <div class="inline-actions">
+              <button class="button secondary" id="backup-now" type="button">Back up now</button>
+              <button class="button secondary" id="deploy-github-update" type="button">Deploy GitHub update</button>
+              <span class="field-help" id="backup-status" role="status" aria-live="polite">Checking backup configuration...</span>
+            </div>
+            <div class="managed-library-list backup-list" id="backup-list"></div>
+            <p class="field-help">Backups are unencrypted portable <code>.mps</code> files in the configured backup folder. Copy a snapshot from another computer into that folder, then refresh this page to import it. Updates refuse to run during Run Mode, robot motion, or with local code changes.</p>
+            <div class="field-help" id="update-status" role="status" aria-live="polite">No update deployment has been attempted.</div>
           </div>
         </section>
 

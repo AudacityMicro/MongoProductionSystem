@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
+    "opencv-python-headless>=4.10,<5",
     "paramiko>=3.5,<4",
     "python-multipart>=0.0.20,<1",
     "sqlalchemy>=2.0,<3",

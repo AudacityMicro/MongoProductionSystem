@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Dashboard | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260719-11">
-    <script src="/static/dashboard.js?v=20260712-1" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260801-1">
+    <script src="/static/dashboard.js?v=20260801-1" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -29,6 +29,10 @@
         <article><p class="section-number">Current part</p><strong id="current-cycle">--</strong><span id="current-pallet">No pallet in Mill</span></article>
         <article><p class="section-number">Queued tools</p><div class="tool-chip-list" id="queue-tools"></div></article>
         <article><p class="section-number">Tools in ATC</p><div class="tool-chip-list" id="atc-tools"></div></article>
+      </section>
+      <section class="dashboard-camera-zone">
+        <header class="zone-heading"><div><p class="section-number">Live cell view</p><h2>Camera feeds</h2></div><span class="zone-count" id="camera-phase">Idle</span></header>
+        <div class="camera-grid" id="camera-grid"><p class="debug-table-empty">No cameras configured.</p></div>
       </section>
       <section class="dashboard-queue-zone">
         <header class="zone-heading"><div><p class="section-number">Upcoming work</p><h2>Production queue</h2></div><span class="zone-count" id="dashboard-updated">Loading</span></header>
