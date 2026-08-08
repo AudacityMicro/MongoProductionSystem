@@ -7,16 +7,14 @@ const ui = {
   source: document.querySelector("#debug-source"),
   machineState: document.querySelector("#debug-machine-state"),
   timestamp: document.querySelector("#debug-timestamp"),
-  autoRecover: document.querySelector("#debug-auto-recover"),
-  clearMongoFault: document.querySelector("#clear-mongo-fault"),
   networkTest: document.querySelector("#run-network-test"),
   networkTestResult: document.querySelector("#network-test-result"),
   diagnosticEventList: document.querySelector("#diagnostic-event-list"),
   supervisorStatusGrid: document.querySelector("#robot-supervisor-status-grid"),
   supervisorDetail: document.querySelector("#robot-supervisor-detail"),
   supervisorCommandRows: document.querySelector("#robot-supervisor-command-rows"),
+  supervisorReconnect: document.querySelector("#debug-supervisor-reconnect"),
   supervisorMaintenance: document.querySelector("#debug-supervisor-maintenance"),
-  supervisorClearLatch: document.querySelector("#debug-supervisor-clear-latch"),
   summaryMachinePallet: document.querySelector("#summary-machine-pallet"),
   summaryQueueCount: document.querySelector("#summary-queue-count"),
   summaryPoolCount: document.querySelector("#summary-pool-count"),
@@ -177,6 +175,25 @@ function organizeDebuggingPage() {
     }
     summary.setAttribute("aria-label", `${title} details`);
   });
+
+  const tabs = [...document.querySelectorAll("[data-debug-tab]")];
+  const categories = tabs
+    .map(tab => document.querySelector(`#${tab.dataset.debugTab}`))
+    .filter(Boolean);
+  function activateTab(id, updateHash = true) {
+    const selected = categories.some(category => category.id === id) ? id : "debug-recovery";
+    categories.forEach(category => { category.hidden = category.id !== selected; });
+    tabs.forEach(tab => {
+      const active = tab.dataset.debugTab === selected;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+    });
+    if (updateHash && window.location.hash !== `#${selected}`) history.replaceState(null, "", `#${selected}`);
+  }
+  tabs.forEach(tab => tab.addEventListener("click", () => activateTab(tab.dataset.debugTab)));
+  window.addEventListener("hashchange", () => activateTab(window.location.hash.slice(1), false));
+  activateTab(window.location.hash.slice(1), false);
 }
 
 organizeDebuggingPage();
@@ -792,8 +809,9 @@ function renderSupervisorStatus(status) {
   `).join("") : tableEmpty(5, "No supervisor commands have been dispatched.");
   ui.supervisorMaintenance.textContent = status.maintenance_mode ? "Exit Maintenance Mode" : "Enter Maintenance Mode";
   ui.supervisorMaintenance.disabled = !status.activation_verified && !status.maintenance_mode;
-  ui.supervisorClearLatch.textContent = status.reconciliation_required ? "Reconcile command" : "Clear supervisor latch";
-  ui.supervisorClearLatch.disabled = !status.latched && !status.reconciliation_required;
+  const reconnectAvailable = status.manual_reconnect_available === true;
+  ui.supervisorReconnect.classList.toggle("hidden", !reconnectAvailable);
+  ui.supervisorReconnect.disabled = !reconnectAvailable;
 }
 
 function renderDiagnosticTimeline(snapshot) {
@@ -925,6 +943,18 @@ ui.supervisorMaintenance.addEventListener("click", async () => {
   }
 });
 
+ui.supervisorReconnect.addEventListener("click", async () => {
+  ui.supervisorReconnect.disabled = true;
+  try {
+    const result = await api("/api/debug/robot-supervisor/reconnect", {method: "POST", body: "{}"});
+    showToast(result.message || "Mongo reconnect requested.");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    await loadSupervisorDebugging();
+  }
+});
+
 function supervisorCandidate(status = supervisorState) {
   return status?.reconciliation || (status?.commands || [])
     .find(command => ["latched", "uncertain", "faulted", "dispatching", "sent", "accepted", "running"].includes(command.status));
@@ -963,32 +993,6 @@ async function reconcileSupervisorCandidate(candidate) {
   }
   await loadSupervisorDebugging();
 }
-
-ui.supervisorClearLatch.addEventListener("click", async () => {
-  if (!supervisorState) return;
-  const candidate = supervisorCandidate();
-  if (candidate) return reconcileSupervisorCandidate(candidate);
-  if (await window.mpsConfirm({
-    eyebrow: "Supervisor recovery",
-    title: "Clear supervisor latch?",
-    message: "This sends a no-motion reset command to Mongo. Use it only after all prior commands have been reconciled.",
-    tone: "warning",
-    primaryLabel: "Clear latch",
-  }) !== "primary") return;
-  try {
-    const board = await api("/api/board", {cache: "no-store"});
-    const status = await api("/api/debug/robot-supervisor", {cache: "no-store"});
-    const resolved = (status.commands || []).find(command => ["operator_completed", "operator_faulted", "completed"].includes(command.status));
-    if (!resolved) throw new Error("No reconciled supervisor command is available to clear.");
-    renderSupervisorStatus(await api("/api/debug/robot-supervisor/reconcile", {
-      method: "POST",
-      body: JSON.stringify({expected_revision: board.revision, sequence: resolved.sequence, resolution: "clear_latch"}),
-    }));
-    showToast("Supervisor latch cleared.");
-  } catch (error) {
-    showToast(error.message, "error");
-  }
-});
 
 function render(snapshot) {
   snapshotState = snapshot;
@@ -1059,59 +1063,6 @@ async function loadDebugging() {
     }
   }
 }
-
-ui.autoRecover.addEventListener("click", async () => {
-  if (await window.mpsConfirm({
-    eyebrow: "Controller recovery",
-    title: "Run automatic recovery?",
-    message: "This checks Dashboard and PathPilot read-only health, refreshes stale local transports, restores missing idle supervisors, and reports every action. It never clears a robot fault, guesses a pallet location, interrupts a controller program, or restarts a helper while PathPilot is running.",
-    tone: "warning",
-    primaryLabel: "Auto recover",
-  }) !== "primary") return;
-  ui.autoRecover.disabled = true;
-  ui.autoRecover.textContent = "Recovering...";
-  try {
-    const result = await api("/api/debug/controllers/auto-recover", {method: "POST", body: "{}"});
-    const summary = (result.results || []).map(item => `${item.controller}: ${item.action}`).join(" | ");
-    showToast(summary || "Recovery check completed.", (result.results || []).some(item => item.action === "Deferred" || item.action.includes("unavailable")) ? "warning" : "success");
-    await Promise.all([loadDebugging(), loadSupervisorDebugging(), loadCncDebugging(), loadMillSupervisor()]);
-    if (result.reconciliation) await reconcileSupervisorCandidate(result.reconciliation);
-  } catch (error) {
-    showToast(error.message, "error");
-  } finally {
-    ui.autoRecover.disabled = false;
-    ui.autoRecover.textContent = "Auto recover";
-  }
-});
-
-ui.clearMongoFault.addEventListener("click", async () => {
-  if (!snapshotState) {
-    showToast("Robot status is not loaded yet.", "error");
-    return;
-  }
-  if (await window.mpsConfirm({
-    eyebrow: "Robot fault",
-    title: "Clear recorded fault?",
-    message: "Inspect the cell and identify the cause first. This will not release an E-stop, power the arm, resume a program, or move the robot.",
-    tone: "danger",
-    primaryLabel: "Clear fault",
-  }) !== "primary") return;
-  ui.clearMongoFault.disabled = true;
-  ui.clearMongoFault.textContent = "Clearing...";
-  try {
-    const result = await api("/api/debug/robot-fault/clear", {
-      method: "POST",
-      body: JSON.stringify({expected_revision: snapshotState.revision, confirmed: true}),
-    });
-    showToast(result.message);
-    await loadDebugging();
-  } catch (error) {
-    showToast(error.message, "error");
-  } finally {
-    ui.clearMongoFault.disabled = false;
-    ui.clearMongoFault.textContent = "Clear robot fault/error";
-  }
-});
 
 function renderNetworkTest(result) {
   const paths = result.paths || [];

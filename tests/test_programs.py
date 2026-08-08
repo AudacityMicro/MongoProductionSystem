@@ -222,6 +222,7 @@ def test_program_metadata_parser_validates_and_sorts_header_values() -> None:
     parsed = parse_program_metadata(mps_program(105, 1, 20, 20, cycle_seconds=91.2))
 
     assert parsed["program_tools"] == ["T1", "T20", "T105"]
+    assert parsed["program_tool_counts"] == {"T1": 1, "T20": 2, "T105": 1}
     assert parsed["program_wcs"] == ["G54"]
     assert parsed["expected_cycle_seconds"] == 92
     assert parsed["program_metadata_state"] == "parsed"

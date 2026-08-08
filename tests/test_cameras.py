@@ -51,6 +51,29 @@ def test_camera_manager_reports_configured_phase_without_hardware() -> None:
     manager.stop()
 
 
+def test_camera_mode_probe_is_non_invasive_without_enabled_hardware() -> None:
+    manager = CameraManager()
+    settings = SimpleNamespace(
+        camera_devices_json='[{"id":"front","name":"Front","device_index":0,"enabled":false}]',
+        camera_idle_id="front",
+        camera_loading_id="front",
+        camera_machining_id="front",
+        camera_recording_enabled=False,
+        camera_recording_path="data/camera-recordings",
+        camera_recording_retention_days=7,
+        camera_width=320,
+        camera_height=240,
+        camera_fps=30,
+        camera_segment_seconds=300,
+        run_mode_state="idle",
+    )
+    result = manager.probe_supported_modes(settings)
+    assert result["cameras"] == []
+    assert result["supported_resolutions"] == []
+    assert result["message"] == "No enabled cameras are configured."
+    manager.stop()
+
+
 def test_camera_settings_persist(client: TestClient) -> None:
     board = client.get("/api/settings").json()
     response = client.put(

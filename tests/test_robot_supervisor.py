@@ -304,6 +304,29 @@ def test_manual_program_recovery_bootstraps_only_when_dashboard_is_idle(client, 
         assert service.recover_robot_supervisor_program(session, trigger="test") == expected
 
 
+def test_manual_jog_recovery_restarts_only_the_stopped_mongo_supervisor(client, monkeypatch) -> None:
+    class DisconnectedSupervisor:
+        def status(self):
+            return {"connected": False}
+
+    monkeypatch.setattr(service, "robot_supervisor", lambda: DisconnectedSupervisor())
+    monkeypatch.setattr(
+        service,
+        "robot_program_status",
+        lambda *_args: {"running": False, "loaded_program": "/programs/mongo-production-system/mongo_supervisor.script"},
+    )
+    expected = {"connected": True, "reconciliation_required": False}
+    monkeypatch.setattr(service, "bootstrap_robot_supervisor", lambda _session: expected)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.48"
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        session.commit()
+        assert service.recover_robot_supervisor_program(session, trigger="watchdog") == expected
+
+
 def test_manual_program_recovery_api_uses_the_guarded_service(client, monkeypatch) -> None:
     monkeypatch.setattr(
         application_main,
@@ -315,6 +338,59 @@ def test_manual_program_recovery_api_uses_the_guarded_service(client, monkeypatc
 
     assert response.status_code == 200
     assert response.json() == {"connected": True, "trigger": "operator"}
+
+
+def test_manual_robot_reconnect_is_available_during_a_paused_mill_retry(client, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(service, "robot_supervisor_status", lambda _session: {"reconciliation_required": False})
+    monkeypatch.setattr(
+        service,
+        "recover_robot_supervisor_program",
+        lambda _session, **kwargs: calls.append(kwargs) or {"connected": True},
+    )
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.48"
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "retry_cnc_program"
+        session.commit()
+
+        result = service.reconnect_robot_after_manual_control(session)
+
+    assert result["status"] == "reconnected"
+    assert "Run Mode remains paused" in result["message"]
+    assert calls == [{"trigger": "manual-control-reconnect", "allow_run_mode_paused": True}]
+
+
+def test_reconciled_command_from_prior_robot_session_does_not_block_recovery(client, monkeypatch) -> None:
+    class NewRobotSession:
+        def status(self):
+            return {
+                "connected": True,
+                "robot_session": 22,
+                "robot_last_sequence": 7,
+                "robot_last_event": "idle",
+                "telemetry_age_seconds": 0.1,
+            }
+
+    monkeypatch.setattr(service, "robot_supervisor", NewRobotSession)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_last_sequence = 7
+        session.add(RobotSupervisorCommand(
+            id="prior-session-command", sequence=7, robot_session=11,
+            operation="pick_pool", opcode=1, status="operator_faulted", attempted=True,
+            created_at="2026-08-06T00:00:00+00:00", completed_at="2026-08-06T00:01:00+00:00",
+        ))
+        session.commit()
+
+        status = service.robot_supervisor_status(session)
+
+    assert status["session_mismatch"] is False
+    assert status["reconciliation_required"] is False
 
 
 def test_auto_controller_recovery_leaves_live_supervisors_untouched(client, monkeypatch) -> None:

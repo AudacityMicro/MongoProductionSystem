@@ -35,6 +35,10 @@ class Settings:
         "MPS_DATABASE_URL",
         DEFAULT_DATABASE_URL,
     )
+    customer_api_key: str = os.getenv("MPS_CUSTOMER_API_KEY", "")
+    customer_api_origins: tuple[str, ...] = tuple(
+        origin.strip() for origin in os.getenv("MPS_CUSTOMER_API_ORIGINS", "").split(",") if origin.strip()
+    )
 
 
 settings = Settings()

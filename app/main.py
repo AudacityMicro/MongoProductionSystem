@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import secrets
 import subprocess
 import threading
 import time
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -27,12 +29,15 @@ from app.schemas import (
     CreatePallet,
     ClearRobotFault,
     CncTelemetryConnectionTest,
+    CustomerQueueRequest,
     MovePallet,
     MillSupervisorActivation,
     MillSupervisorReconcile,
     ManualReturnPallet,
     RecoverPalletMotion,
     RecoverRunMode,
+    RecoveryAnswer,
+    RecoveryCancel,
     ConfigureDebugProgram,
     ConfigureDebugMillProgram,
     ConfirmRunModeAction,
@@ -40,10 +45,12 @@ from app.schemas import (
     RenameDebugIo,
     ReorderQueue,
     RevisionRequest,
+    ProgramCompletionStatUpdate,
     BackupRestoreRequest,
     RobotFileAction,
     SettingsUpdate,
     SetRunModeSafety,
+    UpdatePoolLocationsDuringRun,
     StartRunMode,
     StartMillPalletTransfer,
     StartPalletMotion,
@@ -58,6 +65,7 @@ from app.schemas import (
 )
 from app.service import (
     get_settings,
+    topbar_connection_status,
     board_snapshot,
     autoschedule_queue_preview,
     cnc_debug_snapshot,
@@ -76,6 +84,8 @@ from app.service import (
     stop_mill_supervisor_listener,
     add_fusion_tool_library,
     dashboard_snapshot,
+    update_program_completion_stat,
+    reset_program_completion_stat,
     tools_snapshot,
     create_pallet,
     configure_debug_program,
@@ -95,6 +105,7 @@ from app.service import (
     network_diagnostic_status,
     robot_io_snapshot,
     retry_robot_telemetry,
+    reconnect_robot_after_manual_control,
     clear_robot_controller_fault,
     robot_file_manager_settings,
     robot_programs_page_settings,
@@ -109,6 +120,7 @@ from app.service import (
     pallet_program_files,
     run_debug_mill_pallet_motion,
     run_debug_pallet_motion,
+    align_robot_for_pallet_pick,
     simulate_signal,
     toggle_debug_io,
     update_pallet,
@@ -129,9 +141,15 @@ from app.service import (
     set_run_mode_safety,
     confirm_run_mode_action,
     dismiss_run_mode_alert,
+    resume_run_mode_after_manual_robot_control,
+    update_pool_locations_during_manual_robot_pause,
     clear_stale_run_mode_status,
     start_run_mode_recovery,
     execute_run_mode_recovery,
+    recovery_status,
+    start_system_recovery,
+    answer_system_recovery,
+    cancel_system_recovery,
     rebuild_pallet_motion_scripts,
     rebuild_mill_load_position_program,
     bootstrap_robot_supervisor,
@@ -327,6 +345,14 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
         redoc_url=None,
         lifespan=lifespan,
     )
+    if settings.customer_api_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.customer_api_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST"],
+            allow_headers=["X-MPS-API-Key", "Content-Type"],
+        )
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @application.middleware("http")
@@ -383,6 +409,11 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def get_session(request: Request) -> Generator[Session, None, None]:
         with request.app.state.session_factory() as session:
             yield session
+
+    def require_customer_api_key(x_mps_api_key: str | None = Header(default=None)) -> None:
+        configured_key = settings.customer_api_key
+        if not configured_key or not x_mps_api_key or not secrets.compare_digest(x_mps_api_key, configured_key):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Customer API is disabled or the API key is invalid.")
 
     @application.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -444,6 +475,28 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def get_board(session: Session = Depends(get_session)) -> dict:
         return board_snapshot(session)
 
+    @application.get("/api/recovery/status")
+    def get_recovery_status(session: Session = Depends(get_session)) -> dict[str, object]:
+        return recovery_status(session)
+
+    @application.post("/api/recovery/start")
+    def start_recovery(session: Session = Depends(get_session)) -> dict[str, object]:
+        return start_system_recovery(session)
+
+    @application.post("/api/recovery/answer")
+    def answer_recovery(
+        payload: RecoveryAnswer,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        return answer_system_recovery(session, payload)
+
+    @application.post("/api/recovery/cancel")
+    def cancel_recovery(
+        payload: RecoveryCancel,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        return cancel_system_recovery(session, payload.session_id)
+
     @application.post("/api/run-mode/start", status_code=status.HTTP_202_ACCEPTED)
     def start_production_run_mode(
         payload: StartRunMode,
@@ -482,6 +535,22 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
         session: Session = Depends(get_session),
     ) -> dict:
         set_run_mode_safety(session, payload)
+        return board_snapshot(session)
+
+    @application.post("/api/run-mode/resume-after-manual-robot")
+    def resume_production_after_manual_robot_control(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        resume_run_mode_after_manual_robot_control(session, payload.expected_revision)
+        return board_snapshot(session)
+
+    @application.post("/api/settings/pool-locations-during-run")
+    def save_pool_locations_during_manual_robot_pause(
+        payload: UpdatePoolLocationsDuringRun,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        update_pool_locations_during_manual_robot_pause(session, payload)
         return board_snapshot(session)
 
     @application.post("/api/run-mode/confirm")
@@ -524,6 +593,27 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def get_dashboard(session: Session = Depends(get_session)) -> dict:
         return dashboard_snapshot(session)
 
+    @application.put("/api/program-completions")
+    def edit_program_completion(
+        payload: ProgramCompletionStatUpdate,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        update_program_completion_stat(
+            session,
+            payload.program_path,
+            payload.completed_count,
+            payload.expected_revision,
+        )
+        return dashboard_snapshot(session)
+
+    @application.post("/api/program-completions/reset")
+    def reset_program_completion(
+        payload: ProgramCompletionStatUpdate,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        reset_program_completion_stat(session, payload.program_path, payload.expected_revision)
+        return dashboard_snapshot(session)
+
     @application.get("/api/cameras")
     def get_cameras(session: Session = Depends(get_session)) -> dict:
         return camera_manager().snapshot(get_settings(session))
@@ -531,6 +621,10 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.get("/api/cameras/discover")
     def discover_usb_cameras() -> dict:
         return {"cameras": discover_cameras()}
+
+    @application.get("/api/cameras/modes")
+    def probe_camera_modes(session: Session = Depends(get_session)) -> dict:
+        return camera_manager().probe_supported_modes(get_settings(session))
 
     @application.get("/api/cameras/{camera_id}/stream")
     def stream_camera(camera_id: str, session: Session = Depends(get_session)) -> StreamingResponse:
@@ -672,6 +766,64 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def mill_file_error(error: RobotFileAccessError) -> HTTPException:
         return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error))
 
+    @application.get("/api/customer/v1/catalog", dependencies=[Depends(require_customer_api_key)])
+    def customer_catalog(session: Session = Depends(get_session)) -> dict:
+        """Return only the stock and program data needed by the customer scheduler."""
+        board = board_snapshot(session)
+        return {
+            "revision": board["revision"],
+            "pallets": [
+                {
+                    key: pallet.get(key)
+                    for key in ("id", "name", "workholding", "content_status", "program_path", "location", "queue_position", "pool_slot_number")
+                }
+                for pallet in board["pallets"]
+                if pallet.get("location") == "pool" and pallet.get("content_status") not in {"complete_parts", "defective_parts"}
+            ],
+            "programs": pallet_program_files(session),
+        }
+
+    @application.get("/api/system/status")
+    def system_status(session: Session = Depends(get_session)) -> dict:
+        return topbar_connection_status(session)
+
+    @application.post("/api/customer/v1/queue", dependencies=[Depends(require_customer_api_key)])
+    def customer_assign_and_queue(
+        payload: CustomerQueueRequest,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Assign and queue one pallet; it can only wake an already armed Run Mode."""
+        pallet = next((item for item in board_snapshot(session)["pallets"] if item["id"] == payload.pallet_id), None)
+        if not pallet:
+            raise HTTPException(status_code=404, detail="Pallet not found.")
+        if pallet["location"] != "pool":
+            raise HTTPException(status_code=409, detail="Only a pallet currently in the Pool can be queued by the customer site.")
+        if pallet["content_status"] in {"complete_parts", "defective_parts"}:
+            raise HTTPException(status_code=409, detail="Completed or defective pallets cannot be queued by the customer site.")
+        current = get_settings(session)
+        update_pallet(session, payload.pallet_id, UpdatePallet(
+            expected_revision=current.revision,
+            workholding=pallet["workholding"],
+            weight_kg=pallet["weight_kg"],
+            content_status=pallet["content_status"],
+            program_path=payload.program_path,
+        ))
+        run_token = queue_pallet(session, payload.pallet_id, QueuePallet(
+            expected_revision=get_settings(session).revision,
+            queue_index=payload.queue_index,
+        ))
+        if run_token:
+            threading.Thread(
+                target=execute_run_mode,
+                args=(request.app.state.session_factory, run_token),
+                daemon=True,
+                name="production-run-mode",
+            ).start()
+        board = board_snapshot(session)
+        queued = next(item for item in board["pallets"] if item["id"] == payload.pallet_id)
+        return {"pallet": queued, "revision": board["revision"]}
+
     @application.post("/api/pallets", status_code=status.HTTP_201_CREATED)
     def add_pallet(
         payload: CreatePallet,
@@ -684,9 +836,17 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def edit_pallet(
         pallet_id: str,
         payload: UpdatePallet,
+        request: Request,
         session: Session = Depends(get_session),
     ) -> dict:
-        update_pallet(session, pallet_id, payload)
+        run_token = update_pallet(session, pallet_id, payload)
+        if run_token:
+            threading.Thread(
+                target=execute_run_mode,
+                args=(request.app.state.session_factory, run_token),
+                daemon=True,
+                name="production-run-mode",
+            ).start()
         return board_snapshot(session)
 
     @application.post("/api/pallets/{pallet_id}/duplicate")
@@ -803,9 +963,17 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def add_to_queue(
         pallet_id: str,
         payload: QueuePallet,
+        request: Request,
         session: Session = Depends(get_session),
     ) -> dict:
-        queue_pallet(session, pallet_id, payload)
+        run_token = queue_pallet(session, pallet_id, payload)
+        if run_token:
+            threading.Thread(
+                target=execute_run_mode,
+                args=(request.app.state.session_factory, run_token),
+                daemon=True,
+                name="production-run-mode",
+            ).start()
         return board_snapshot(session)
 
     @application.delete("/api/pallets/{pallet_id}/queue")
@@ -870,6 +1038,13 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     ) -> dict:
         return run_debug_pallet_motion(session, payload)
 
+    @application.post("/api/settings/robot/align-pallet-pick")
+    def align_robot_pallet_pick(
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        return align_robot_for_pallet_pick(session, payload.expected_revision)
+
     @application.post("/api/debug/mill-pallet-motion")
     def run_debug_mill_pallet_motion_test(
         payload: RunDebugMillPalletMotion,
@@ -919,6 +1094,10 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.post("/api/debug/robot-supervisor/recover")
     def recover_robot_supervisor_connection_program(session: Session = Depends(get_session)) -> dict:
         return recover_robot_supervisor_program(session, trigger="operator")
+
+    @application.post("/api/debug/robot-supervisor/reconnect")
+    def reconnect_robot_supervisor_after_manual_control(session: Session = Depends(get_session)) -> dict:
+        return reconnect_robot_after_manual_control(session)
 
     @application.post("/api/debug/controllers/auto-recover")
     def auto_recover_controllers(session: Session = Depends(get_session)) -> dict:

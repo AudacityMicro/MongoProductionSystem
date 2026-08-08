@@ -35,13 +35,20 @@ const ui = {
   robotHeld: document.querySelector("#robot-held-slot"),
   robotMotionStatus: document.querySelector("#robot-motion-status"),
   robotMotionSummary: document.querySelector("#robot-motion-summary"),
-  robotMotionRecover: document.querySelector("#recover-robot-motion"),
   robotMotionDismiss: document.querySelector("#dismiss-robot-motion"),
-  motionRecoveryDialog: document.querySelector("#motion-recovery-dialog"),
-  motionRecoveryForm: document.querySelector("#motion-recovery-form"),
   runModeToggle: document.querySelector("#run-mode-toggle"),
+  resumeQueueAfterManualRobot: document.querySelector("#resume-queue-after-manual-robot"),
   runModeStatus: document.querySelector("#run-mode-status"),
   runConfirmDialog: document.querySelector("#run-confirm-dialog"),
+  recoveryLaunch: document.querySelector("#system-recovery-launch"),
+  recoveryDialog: document.querySelector("#system-recovery-dialog"),
+  recoveryMessage: document.querySelector("#system-recovery-message"),
+  recoveryFaults: document.querySelector("#system-recovery-faults"),
+  recoveryServices: document.querySelector("#system-recovery-services"),
+  recoveryQuestions: document.querySelector("#system-recovery-questions"),
+  recoveryActions: document.querySelector("#system-recovery-actions"),
+  recoveryCancel: document.querySelector("#system-recovery-cancel"),
+  recoveryContinue: document.querySelector("#system-recovery-continue"),
 };
 
 let board = null;
@@ -60,6 +67,8 @@ let dismissedMotionKey = null;
 let runModeStartPending = false;
 let runModeStopQueued = false;
 let pendingRunModeRequestId = null;
+let recoveryState = null;
+let recoveryPollTimer = null;
 
 function newRunModeRequestId() {
   // Some older tablet/webview browsers lack crypto.randomUUID(). The server
@@ -370,7 +379,6 @@ function renderRobotMotionStatus() {
     dismissedMotionKey = null;
     ui.robotMotionStatus.classList.add("hidden");
     ui.robotMotionSummary.innerHTML = "";
-    ui.robotMotionRecover.classList.add("hidden");
     return;
   }
   const palletIsHeld = motion.operation === "pick"
@@ -407,30 +415,6 @@ function renderRobotMotionStatus() {
   ui.robotMotionStatus.className = `robot-motion-status ${motion.status}`;
   ui.robotMotionStatus.classList.toggle("hidden", dismissedMotionKey === motionKey);
   ui.robotMotionSummary.innerHTML = `<strong>${status}: ${escapeHtml(motion.pallet_name || "Pallet")}</strong><span>${escapeHtml(motion.operation)} ${target} | ${escapeHtml(motion.program_path)}${motion.failure_detail ? ` | ${escapeHtml(motion.failure_detail)}` : ""}</span>`;
-  ui.robotMotionRecover.classList.toggle("hidden", motion.status !== "faulted");
-  if (motion.status === "faulted") {
-    const linkLostAfterCompletion = motion.failure_detail?.includes("atomic") && motion.failure_detail?.includes("finished before latching");
-    const options = motion.operation === "pick"
-      ? (linkLostAfterCompletion
-        ? [["robot_held", "Robot-held (recommended)"], ["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`]]
-        : [["source_pool", `Return to Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"]])
-      : motion.operation === "put"
-        ? (linkLostAfterCompletion
-          ? [["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")} (recommended)`], ["robot_held", "Robot-held"]]
-          : [["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]])
-      : motion.operation === "load_mill"
-          ? (linkLostAfterCompletion
-            ? [["machine", "Mill (recommended)"], ["robot_held", "Robot-held"], ["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`]]
-            : (motion.source_slot
-              ? [["source_pool", `Pool ${String(motion.source_slot).padStart(2, "0")}`], ["robot_held", "Robot-held"], ["machine", "Mill"]]
-              : [["robot_held", "Robot-held"], ["machine", "Mill"]]))
-          : (linkLostAfterCompletion
-            ? [["robot_held", "Robot-held (recommended)"], ["machine", "Mill"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]
-            : [["machine", "Mill"], ["robot_held", "Robot-held"], ["destination_pool", `Pool ${String(motion.destination_slot).padStart(2, "0")}`]]);
-    document.querySelector("#motion-recovery-message").textContent = `${motion.failure_detail || "Movement fault."} Verify the actual pallet location before saving.`;
-    document.querySelector("#motion-recovery-resolution").innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
-    if (!ui.motionRecoveryDialog.open) ui.motionRecoveryDialog.showModal();
-  }
 }
 
 ui.toast.addEventListener("click", event => {
@@ -473,11 +457,13 @@ function renderRunMode() {
       : run.state === "stopping" ? "Stopping run mode..." : "Start run mode";
   ui.runModeToggle.disabled = run.state === "stopping" || (pendingStart && runModeStopQueued);
   ui.runModeToggle.classList.toggle("active", Boolean(run.enabled));
+  ui.resumeQueueAfterManualRobot.classList.toggle("hidden", !run.manual_robot_pause);
   ui.runModeStatus.className = `run-mode-status ${escapeHtml(run.state || "idle")}`;
   const pallet = run.current_pallet_name ? ` · ${escapeHtml(run.current_pallet_name)}` : "";
   const showDetail = (
     !run.enabled && ["faulted", "interrupted", "stopped"].includes(run.state)
   ) || [
+    "idle_waiting_queue",
     "telemetry_unavailable",
     "telemetry_restored",
     "recovering_startup_telemetry",
@@ -485,20 +471,7 @@ function renderRunMode() {
     "recovering_robot_telemetry",
   ].includes(run.state);
   const detail = showDetail ? `<span>${escapeHtml(run.detail || "Run Mode needs operator attention.")}</span>` : "";
-  const machinePallet = board.pallets.find(item => item.location === "machine");
-  const recoveryActions = showDetail && machinePallet?.return_pool_slot_number
-    ? `<div class="run-mode-recovery-actions">
-        <button class="button secondary" type="button" data-recover-run-mode="rerun_assigned_program">Run assigned program again</button>
-        <button class="button secondary" type="button" data-recover-run-mode="manual_complete_and_unload">Mark complete and unload</button>
-        <button class="button secondary" type="button" data-recover-run-mode="retry_robot_only">Retry robot unload only</button>
-        <button class="button ghost" type="button" data-recover-run-mode="reposition_and_retry">Reposition mill, then retry</button>
-        <button class="button danger" type="button" data-cancel-run-mode-recovery>Cancel and stop</button>
-      </div>`
-    : "";
-  const clearStatus = !run.enabled && ["faulted", "interrupted"].includes(run.state)
-    ? '<button class="notice-dismiss run-mode-clear" type="button" data-clear-run-mode-status>Clear warning</button>'
-    : "";
-  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div>${detail}${recoveryActions}${clearStatus}`;
+  ui.runModeStatus.innerHTML = `<div><span class="run-mode-light"></span><strong>${run.enabled ? "Run mode active" : "Run mode " + escapeHtml(run.state || "idle")}${pallet}</strong></div>${detail}`;
 
   if (run.confirmation_token && run.pending_action && shownRunConfirmationToken !== run.confirmation_token) {
     shownRunConfirmationToken = run.confirmation_token;
@@ -527,77 +500,161 @@ function renderRunMode() {
   }
 }
 
-ui.runModeStatus.addEventListener("click", async event => {
-  const cancelRecovery = event.target.closest("[data-cancel-run-mode-recovery]");
-  if (cancelRecovery && board) {
-    if (await window.mpsConfirm({
-      eyebrow: "Run mode recovery",
-      title: "Cancel recovery and stop?",
-      message: "No further automated action will start. The mill program will not be stopped and the pallet location will not change.",
-      tone: "danger",
-      primaryLabel: "Cancel and stop",
-    }) !== "primary") return;
-    cancelRecovery.disabled = true;
-    try {
-      board = await api("/api/run-mode/recovery/cancel", {
-        method: "POST",
-        body: JSON.stringify({expected_revision: board.revision}),
-      });
-      renderBoard();
-      showToast("Recovery cancelled. Run Mode is stopped.");
-    } catch (error) {
-      showToast(`Could not cancel recovery: ${error.message}`, "error");
-    }
+function recoveryList(items, service = false) {
+  if (!items?.length) return `<p class="field-help">${service ? "No enabled service faults detected." : "No blocking conditions detected."}</p>`;
+  return `<ul class="recovery-list">${items.map(item => {
+    const tone = item.severity === "handoff" || item.action === "Handoff required" ? "error" : item.connected === true || item.action === "Recovered" ? "healthy" : "warning";
+    const title = item.title || `${item.controller || item.name || "Recovery"}: ${item.action || item.state || "status"}`;
+    return `<li class="${tone}"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(item.detail || item.message || item.state || "")}</span></li>`;
+  }).join("")}</ul>`;
+}
+
+function renderSystemRecovery() {
+  const data = recoveryState;
+  const session = data?.session;
+  const existingQuestion = ui.recoveryQuestions.querySelector("[data-recovery-answer]");
+  const existingAnswerKey = existingQuestion?.dataset.recoveryAnswer;
+  const existingAnswerValue = existingQuestion?.checked === true;
+  const existingChoices = Object.fromEntries(
+    [...ui.recoveryQuestions.querySelectorAll("[data-recovery-choice]:checked")]
+      .map(input => [input.dataset.recoveryChoice, input.value]),
+  );
+  if (!session) {
+    ui.recoveryMessage.textContent = "No recovery session is active.";
+    ui.recoveryFaults.innerHTML = recoveryList(data?.faults || []);
+    ui.recoveryServices.innerHTML = recoveryList(data?.services || [], true);
+    ui.recoveryQuestions.innerHTML = "";
+    ui.recoveryActions.innerHTML = "";
+    ui.recoveryContinue.classList.add("hidden");
     return;
   }
-  const recoveryButton = event.target.closest("[data-recover-run-mode]");
-  if (recoveryButton && board) {
-    const strategy = recoveryButton.dataset.recoverRunMode;
-    const prompt = strategy === "rerun_assigned_program"
-      ? "Run this pallet's assigned mill program again, then unload it and continue the queue?"
-      : strategy === "manual_complete_and_unload"
-        ? "Confirm the work is complete. The mill will move to its loading position, then Mongo will unload the pallet and continue the queue."
-      : strategy === "retry_robot_only"
-      ? "Confirm the mill is still at its loading position. Retry only the robot unload?"
-      : "Move the mill to its loading position again, then retry the robot unload?";
-    const choice = await window.mpsConfirm({
-      eyebrow: "Run mode recovery",
-      title: "Start recovery?",
-      message: prompt,
-      tone: "warning",
-      primaryLabel: "Start recovery",
-    });
-    if (choice !== "primary") return;
-    document.querySelectorAll("[data-recover-run-mode]").forEach(item => { item.disabled = true; });
-    recoveryButton.textContent = "Starting recovery...";
-    try {
-      board = await api("/api/run-mode/recover", {
-        method: "POST",
-        body: JSON.stringify({expected_revision: board.revision, strategy}),
-      });
-      renderBoard();
-      showToast("Run Mode recovery started.");
-    } catch (error) {
-      showToast(`Could not start recovery: ${error.message}`, "error");
-      await loadBoard();
-    }
-    return;
+  ui.recoveryMessage.textContent = session.message || "Recovery status updated.";
+  ui.recoveryFaults.innerHTML = recoveryList(data.faults?.length ? data.faults : session.faults);
+  ui.recoveryServices.innerHTML = recoveryList(data.services || [], true);
+  const recoveryBusy = ["running", "awaiting_restart"].includes(session.status);
+  const recordedActions = session.actions?.length
+    ? recoveryList(session.actions)
+    : `<p class="field-help">The next controller check is starting.</p>`;
+  ui.recoveryActions.innerHTML = recoveryBusy
+    ? `<div class="recovery-progress" role="status" aria-live="polite"><span class="recovery-spinner" aria-hidden="true"></span><div><strong>Recovery is working</strong><span>${escapeHtml(session.message || "Checking controller connections…")}</span></div></div>${recordedActions}`
+    : recordedActions;
+  const guidance = data.guidance || (data.faults || []).map(item => item.guidance).filter(Boolean);
+  const guidedQuestions = guidance.map(item => item.type === "choice"
+    ? `<fieldset class="recovery-resolution"><legend>${escapeHtml(item.title)}</legend><p>${escapeHtml(item.detail || "")}</p>${(item.options || []).map(option => `<label class="recovery-question"><input type="radio" name="recovery-${escapeHtml(item.key)}" data-recovery-choice="${escapeHtml(item.key)}" value="${escapeHtml(option.value)}"><span><strong>${escapeHtml(option.label)}</strong>${option.detail ? `<small>${escapeHtml(option.detail)}</small>` : ""}</span></label>`).join("")}</fieldset>`
+    : `<section class="recovery-instruction"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail || "")}</p></section>`
+  ).join("");
+  const instructionAcknowledgement = guidance.some(item => item.type === "instruction")
+    ? `<label class="recovery-question"><input type="checkbox" data-recovery-answer="retry"><span><strong>I completed the checks that are physically possible.</strong><small>Recheck the system now. Recovery will still refuse unsafe or ambiguous state.</small></span></label>`
+    : "";
+  ui.recoveryQuestions.innerHTML = session.status === "awaiting_safety"
+    ? `<label class="recovery-question"><input type="checkbox" data-recovery-answer="cell_clear"><span><strong>I inspected the cell.</strong><small>Everyone is clear, no robot or mill motion is active, and I understand that the wizard will not move either machine.</small></span></label>`
+    : session.status === "handoff"
+      ? guidedQuestions
+        ? `${guidedQuestions}${instructionAcknowledgement}`
+        : `<label class="recovery-question"><input type="checkbox" data-recovery-answer="retry"><span><strong>The reported physical condition has been handled.</strong><small>I completed the displayed controller, power, network, or configuration checks and it is safe to retry software recovery.</small></span></label>`
+      : session.status === "ready"
+        ? `<label class="recovery-question"><input type="checkbox" data-recovery-answer="final_approval"><span><strong>Approve the ready state.</strong><small>All displayed services are acceptable. Production will not start automatically.</small></span></label>`
+        : "";
+  const renderedQuestion = ui.recoveryQuestions.querySelector("[data-recovery-answer]");
+  if (renderedQuestion && renderedQuestion.dataset.recoveryAnswer === existingAnswerKey) {
+    renderedQuestion.checked = existingAnswerValue;
   }
-  const button = event.target.closest("[data-clear-run-mode-status]");
-  if (!button || !board) return;
-  button.disabled = true;
-  button.textContent = "Clearing...";
+  ui.recoveryQuestions.querySelectorAll("[data-recovery-choice]").forEach(input => {
+    if (existingChoices[input.dataset.recoveryChoice] === input.value) input.checked = true;
+  });
+  ui.recoveryContinue.classList.toggle("hidden", !["awaiting_safety", "handoff", "ready"].includes(session.status));
+  ui.recoveryContinue.disabled = ["running", "awaiting_restart", "completed", "cancelled"].includes(session.status);
+  ui.recoveryContinue.textContent = session.status === "ready"
+    ? "Approve ready state"
+    : session.status === "handoff" && guidance.length ? "Continue guided recovery"
+      : session.status === "handoff" ? "Retry recovery" : "Start software recovery";
+}
+
+async function loadRecoveryStatus({showErrors = false} = {}) {
   try {
-    board = await api("/api/run-mode/status/clear", {
-      method: "POST",
-      body: JSON.stringify({expected_revision: board.revision}),
-    });
-    renderBoard();
-    showToast("Stale Run Mode warning cleared.");
+    recoveryState = await api("/api/recovery/status", {cache: "no-store"});
+    renderSystemRecovery();
+    return recoveryState;
   } catch (error) {
-    showToast(`Could not clear warning: ${error.message}`, "error");
-    await loadBoard();
+    if (showErrors) showToast(`Recovery status unavailable: ${error.message}`, "error");
+    return null;
   }
+}
+
+function scheduleRecoveryPoll() {
+  window.clearTimeout(recoveryPollTimer);
+  if (!recoveryState?.active) return;
+  recoveryPollTimer = window.setTimeout(async () => {
+    await loadRecoveryStatus();
+    scheduleRecoveryPoll();
+  }, 1000);
+}
+
+async function openSystemRecovery() {
+  ui.recoveryLaunch.disabled = true;
+  try {
+    recoveryState = await api("/api/recovery/start", {method: "POST", body: "{}"});
+    renderSystemRecovery();
+    if (!ui.recoveryDialog.open) ui.recoveryDialog.showModal();
+    scheduleRecoveryPoll();
+  } catch (error) {
+    showToast(`Could not start recovery: ${error.message}`, "error");
+  } finally {
+    ui.recoveryLaunch.disabled = false;
+  }
+}
+
+if (ui.recoveryLaunch) ui.recoveryLaunch.addEventListener("click", openSystemRecovery);
+ui.recoveryContinue.addEventListener("click", async () => {
+  const session = recoveryState?.session;
+  if (!session) return openSystemRecovery();
+  const answers = {};
+  ui.recoveryQuestions.querySelectorAll("[data-recovery-answer]").forEach(input => {
+    answers[input.dataset.recoveryAnswer] = input.checked;
+  });
+  const choices = Object.fromEntries(
+    [...ui.recoveryQuestions.querySelectorAll("[data-recovery-choice]:checked")]
+      .map(input => [input.dataset.recoveryChoice, input.value]),
+  );
+  const requiredChoices = [...ui.recoveryQuestions.querySelectorAll("[data-recovery-choice]")]
+    .map(input => input.dataset.recoveryChoice)
+    .filter((value, index, values) => values.indexOf(value) === index);
+  const missingChoice = requiredChoices.find(key => !choices[key]);
+  if (session.status === "handoff" && missingChoice) {
+    showToast("Answer each displayed recovery question before continuing.", "error");
+    return;
+  }
+  ui.recoveryContinue.disabled = true;
+  try {
+    recoveryState = await api("/api/recovery/answer", {
+      method: "POST",
+      body: JSON.stringify({session_id: session.id, answers, choices}),
+    });
+    renderSystemRecovery();
+    scheduleRecoveryPoll();
+    await loadBoard();
+  } catch (error) {
+    showToast(`Recovery could not continue: ${error.message}`, "error");
+    ui.recoveryContinue.disabled = false;
+  }
+});
+
+ui.recoveryCancel.addEventListener("click", async () => {
+  const session = recoveryState?.session;
+  if (session && recoveryState.active) {
+    try {
+      recoveryState = await api("/api/recovery/cancel", {
+        method: "POST",
+        body: JSON.stringify({session_id: session.id}),
+      });
+      renderSystemRecovery();
+      scheduleRecoveryPoll();
+    } catch (error) {
+      showToast(`Recovery could not be cancelled: ${error.message}`, "error");
+      return;
+    }
+  }
+  ui.recoveryDialog.close();
 });
 
 async function loadBoard() {
@@ -863,7 +920,10 @@ ui.runModeToggle.addEventListener("click", () => {
     return;
   }
   const queued = board.pallets.filter(item => item.queue_position !== null).length;
-  askConfirmation("Start run mode", `Run all ${queued} queued pallet${queued === 1 ? "" : "s"} in order?`, async () => {
+  const startMessage = queued
+    ? `Run ${queued} queued pallet${queued === 1 ? "" : "s"} in order, then remain armed for later pallets?`
+    : "Arm Run Mode and wait for pallets added to the production queue?";
+  askConfirmation("Start run mode", startMessage, async () => {
     runModeStartPending = true;
     runModeStopQueued = false;
     pendingRunModeRequestId = newRunModeRequestId();
@@ -904,6 +964,22 @@ ui.runModeToggle.addEventListener("click", () => {
     pendingRunModeRequestId = null;
     renderRunMode();
   });
+});
+
+ui.resumeQueueAfterManualRobot.addEventListener("click", async () => {
+  ui.resumeQueueAfterManualRobot.disabled = true;
+  try {
+    board = await api("/api/run-mode/resume-after-manual-robot", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision}),
+    });
+    renderBoard();
+    showToast("Manual robot control ended. Run Mode will continue safely.");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.resumeQueueAfterManualRobot.disabled = false;
+  }
 });
 
 async function answerRunConfirmation(approved) {
@@ -1113,36 +1189,6 @@ document.addEventListener("click", event => {
   if (put) startRobotMotion("put", Number(put.dataset.putSlot));
 });
 
-ui.robotMotionRecover.addEventListener("click", () => {
-  if (!ui.motionRecoveryDialog.open) ui.motionRecoveryDialog.showModal();
-});
-document.querySelector("#cancel-motion-recovery").addEventListener("click", () => {
-  ui.motionRecoveryDialog.close();
-});
-
-ui.motionRecoveryForm.addEventListener("submit", async event => {
-  event.preventDefault();
-  const motion = board.robot_motion?.active;
-  if (!motion) return;
-  const saveButton = document.querySelector("#save-motion-recovery");
-  saveButton.disabled = true;
-  saveButton.textContent = "Saving...";
-  try {
-    board = await api(`/api/robot-motions/${motion.id}/recover`, {
-      method: "POST",
-      body: JSON.stringify({expected_revision: board.revision, resolution: document.querySelector("#motion-recovery-resolution").value}),
-    });
-    ui.motionRecoveryDialog.close();
-    renderBoard();
-    showToast("Pallet movement fault reconciled.");
-  } catch (error) {
-    showToast(error.message, "error");
-  } finally {
-    saveButton.disabled = false;
-    saveButton.textContent = "Save recovery";
-  }
-});
-
 document.querySelector("#confirm-action").addEventListener("click", async event => {
   event.preventDefault();
   ui.confirmDialog.close();
@@ -1324,4 +1370,5 @@ document.querySelectorAll("[data-debug-signal]").forEach(button => {
   });
 });
 
+void loadRecoveryStatus();
 pollBoard();

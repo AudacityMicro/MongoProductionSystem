@@ -71,6 +71,30 @@ def test_motion_interlock_detects_meaningful_tcp_pose_change(client: TestClient,
     assert moving is True
 
 
+def test_pre_motion_alarm_emits_three_short_bursts_after_idle(client: TestClient, monkeypatch) -> None:
+    output_calls: list[tuple[str, int, float, str, int, bool]] = []
+    monkeypatch.setattr(service.time, "sleep", lambda _: None)
+    monkeypatch.setattr(service, "set_robot_digital_output", lambda *args: output_calls.append(args))
+
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.0.2.10"
+        settings.stack_light_enabled = True
+        settings.stack_light_outputs = json.dumps({"alarm": {"bank": "standard", "index": 5}})
+        session.add(service.RobotMotion(
+            id="old-motion", pallet_id="pallet", operation="pick", source_slot=1,
+            program_path="/programs/pick.urp", status="succeeded",
+            created_at="2020-01-01T00:00:00+00:00", completed_at="2020-01-01T00:00:00+00:00",
+        ))
+        session.commit()
+
+        assert service.emit_pre_motion_alarm(session, "pick") is True
+
+    assert [call[-1] for call in output_calls] == [True, False, True, False, True, False]
+    assert all(call[3:5] == ("standard", 5) for call in output_calls)
+
+
 def test_physical_motion_interlock_reads_live_telemetry_directly(client: TestClient, monkeypatch) -> None:
     samples = iter([
         _motion_snapshot([0.10, -0.19, 0.56, 0.52, -1.93, 1.91]),

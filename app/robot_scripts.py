@@ -10,7 +10,7 @@ from app.robot_transport import robot_command_lock
 
 
 GENERATED_REMOTE_DIRECTORY = "mongo-production-system"
-PALLET_MOTION_SCRIPT_REVISION = 14
+PALLET_MOTION_SCRIPT_REVISION = 15
 UNLOADED_TOOL_PAYLOAD_KG = 5 * 0.028349523125
 _PALLET_PAYLOAD_ASSIGNMENT_PREFIX = "global mongo_pallet_payload_kg = "
 _SUPERVISOR_SEQUENCE_PREFIX = "global mongo_last_sequence = "
@@ -488,6 +488,17 @@ def build_robot_supervisor_script(
             invoke=False,
         )))
 
+    orientation = generation
+    functions.append("\n".join([
+        "def mps_align_pallet_pick():",
+        "  # Rotate only the TCP orientation at its current position for teaching pool poses.",
+        "  local current = get_actual_tcp_pose()",
+        "  local target = p["
+        f"current[0],current[1],current[2],{float(orientation['rx_rad']):.6f},{float(orientation['ry_rad']):.6f},{float(orientation['rz_rad']):.6f}]",
+        "  movel(target, a=0.200, v=0.030)",
+        "end",
+    ]))
+
     heartbeat_timeout = max(3.0, float(heartbeat_seconds) * 4.0)
     # PolyScope 3.2 socket reads have a fixed two-second timeout and no clock API.
     heartbeat_miss_limit = max(2, int(math.ceil(heartbeat_timeout / 2.0)))
@@ -510,6 +521,8 @@ def build_robot_supervisor_script(
         "        mps_load_mill()",
         "      elif mongo_command_opcode == 4:",
         "        mps_unload_mill()",
+        "      elif mongo_command_opcode == 6:",
+        "        mps_align_pallet_pick()",
         "      elif mongo_command_opcode == 10:",
         "        set_standard_digital_out(mongo_command_argument, mongo_command_value != 0)",
         "      elif mongo_command_opcode == 11:",

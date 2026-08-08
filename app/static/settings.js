@@ -6,6 +6,10 @@ const ui = {
   unit: document.querySelector("#weight-unit"),
   poolSlotCount: document.querySelector("#pool-slot-count"),
   poolLocationGrid: document.querySelector("#pool-location-grid"),
+  savePoolLocationsDuringRunRow: document.querySelector("#save-pool-locations-during-run-row"),
+  savePoolLocationsDuringRun: document.querySelector("#save-pool-locations-during-run"),
+  alignRobotPalletPick: document.querySelector("#align-robot-pallet-pick"),
+  alignRobotPalletPickStatus: document.querySelector("#align-robot-pallet-pick-status"),
   onDeckEnabled: document.querySelector("#on-deck-enabled"),
   drippingEnabled: document.querySelector("#dripping-enabled"),
   runModeSafetyConfirm: document.querySelector("#run-mode-safety-confirm"),
@@ -19,6 +23,13 @@ const ui = {
   millLoadPositionProgramStatus: document.querySelector("#mill-load-position-program-status"),
   debugMenuEnabled: document.querySelector("#debug-menu-enabled"),
   manualIoControlEnabled: document.querySelector("#manual-io-control-enabled"),
+  stackLightEnabled: document.querySelector("#stack-light-enabled"),
+  stackLightRed: document.querySelector("#stack-light-red"),
+  stackLightAmber: document.querySelector("#stack-light-amber"),
+  stackLightGreen: document.querySelector("#stack-light-green"),
+  stackLightBlue: document.querySelector("#stack-light-blue"),
+  stackLightWhite: document.querySelector("#stack-light-white"),
+  stackLightAlarm: document.querySelector("#stack-light-alarm"),
   robotConnectionMode: document.querySelector("#robot-connection-mode"),
   robotHost: document.querySelector("#robot-host"),
   robotPort: document.querySelector("#robot-port"),
@@ -108,9 +119,9 @@ const ui = {
   intermediateSafePoseSlots: document.querySelector("#intermediate-safe-pose-slots"),
   addIntermediateSafePose: document.querySelector("#add-intermediate-safe-pose"),
   intermediateSafePoseList: document.querySelector("#intermediate-safe-pose-list"),
-  rebuildMotionScripts: document.querySelector("#rebuild-motion-scripts"),
+  rebuildMotionScripts: Array.from(document.querySelectorAll("[data-rebuild-motion-scripts]")),
   generatedMotionProgramList: document.querySelector("#generated-motion-program-list"),
-  motionProgramFileStatus: document.querySelector("#motion-program-file-status"),
+  motionProgramFileStatus: Array.from(document.querySelectorAll("[data-motion-rebuild-status]")),
   newWorkholding: document.querySelector("#new-workholding"),
   addWorkholding: document.querySelector("#add-workholding"),
   workholdingLibraryList: document.querySelector("#workholding-library-list"),
@@ -125,9 +136,10 @@ const ui = {
   cameraRecordingEnabled: document.querySelector("#camera-recording-enabled"),
   cameraRecordingPath: document.querySelector("#camera-recording-path"),
   cameraRecordingRetentionDays: document.querySelector("#camera-recording-retention-days"),
-  cameraWidth: document.querySelector("#camera-width"),
-  cameraHeight: document.querySelector("#camera-height"),
+  cameraResolution: document.querySelector("#camera-resolution"),
   cameraFps: document.querySelector("#camera-fps"),
+  probeCameraModes: document.querySelector("#probe-camera-modes"),
+  cameraModeStatus: document.querySelector("#camera-mode-status"),
   openRobotDirectory: document.querySelector("#open-robot-directory"),
   robotFileAccessStatus: document.querySelector("#robot-file-access-status"),
   robotDirectoryModal: document.querySelector("#robot-directory-modal"),
@@ -137,8 +149,6 @@ const ui = {
   robotDirectoryClose: document.querySelector("#robot-directory-close"),
   robotConnectionHelp: document.querySelector("#robot-connection-help"),
   appVersion: document.querySelector("#app-version"),
-  relaunchSystem: document.querySelector("#relaunch-system"),
-  relaunchStatus: document.querySelector("#relaunch-status"),
   backupNow: document.querySelector("#backup-now"),
   deployGithubUpdate: document.querySelector("#deploy-github-update"),
   backupStatus: document.querySelector("#backup-status"),
@@ -182,8 +192,15 @@ function organizeSettingsPage() {
       eyebrow: "General",
       title: "Production and display",
       description: "Shared scheduling, pallet, workholding, and operator display settings.",
-      panels: ["Display", "Cameras", "Pallet pool", "Workflow stations", "Workholding library"],
-      openPanels: ["Display"],
+      panels: ["Display", "Cameras"],
+      widePanels: [],
+    },
+    {
+      id: "settings-pool",
+      eyebrow: "Pool",
+      title: "Pallet pool and workflow",
+      description: "Pool capacity, optional staging stations, and workholding used by pallet records.",
+      panels: ["Pallet pool", "Pallet locations and safe poses", "Workflow stations", "Workholding library"],
       widePanels: ["Workholding library"],
     },
     {
@@ -191,9 +208,8 @@ function organizeSettingsPage() {
       eyebrow: "Robot",
       title: "Mongo robot",
       description: "Connection, controller files, physical locations, and generated pallet motion.",
-      panels: ["Robot connection", "Robot file access", "Robot Programs page", "Robot pallet locations", "Robot pallet motion"],
-      openPanels: ["Robot connection"],
-      widePanels: ["Robot pallet locations", "Robot pallet motion"],
+      panels: ["Robot connection", "Robot poses and locations", "Robot pallet motion", "Robot file access", "Robot Programs page"],
+      widePanels: ["Robot poses and locations", "Robot pallet motion"],
     },
     {
       id: "settings-mill",
@@ -201,7 +217,6 @@ function organizeSettingsPage() {
       title: "Tormach and PathPilot",
       description: "CNC telemetry, programs, machine loading coordinates, and tooling sources.",
       panels: ["CNC telemetry", "Mill programs", "Mill Programs page", "Mill loading position", "Fusion 360 tools"],
-      openPanels: ["CNC telemetry"],
       widePanels: ["CNC telemetry", "Mill Programs page"],
     },
     {
@@ -210,7 +225,6 @@ function organizeSettingsPage() {
       title: "Application and diagnostics",
       description: "Diagnostic access, test controls, saving, and backend lifecycle actions.",
       panels: ["Debugging controls", "Backup & updates"],
-      openPanels: ["Debugging controls", "Backup & updates"],
       widePanels: ["Debugging controls", "Backup & updates"],
     },
   ];
@@ -221,22 +235,34 @@ function organizeSettingsPage() {
     const control = input?.closest(".checkbox-control");
     if (control && debugFields) debugFields.prepend(control);
   });
-
-  function setPanelExpanded(panel, expanded) {
-    const fields = panel.querySelector(".panel-fields");
-    const toggle = panel.querySelector(".settings-panel-toggle");
-    panel.classList.toggle("is-collapsed", !expanded);
-    fields.hidden = !expanded;
-    toggle.setAttribute("aria-expanded", String(expanded));
-    toggle.textContent = expanded ? "Hide" : "Show";
+  const poolFields = panels.get("Pallet locations and safe poses")?.querySelector(".panel-fields");
+  const robotPoseFields = panels.get("Robot poses and locations")?.querySelector(".panel-fields");
+  const robotMotionFields = panels.get("Robot pallet motion")?.querySelector(".panel-fields");
+  const poolRebuild = poolFields?.querySelector(":scope > .inline-actions");
+  const placePoolSetting = item => {
+    if (item && poolFields) poolFields.insertBefore(item, poolRebuild || null);
+  };
+  if (poolFields && robotPoseFields) {
+    const teaching = robotPoseFields.querySelector(":scope > .location-fieldset");
+    const locations = robotPoseFields.querySelector("#pool-location-grid");
+    const stations = robotPoseFields.querySelector(".location-stations");
+    [teaching, locations, stations].forEach(placePoolSetting);
+  }
+  if (poolFields && robotMotionFields) {
+    const intermediate = [...robotMotionFields.querySelectorAll(":scope > .location-fieldset")]
+      .find(fieldset => fieldset.querySelector("legend")?.textContent.includes("Intermediate joint-safe poses"));
+    placePoolSetting(intermediate);
   }
 
   for (const group of groups) {
     const section = document.createElement("section");
     section.className = "settings-category";
     section.id = group.id;
-    section.innerHTML = `<header class="settings-category-heading"><p>${group.eyebrow}</p><h2>${group.title}</h2><span>${group.description}</span></header><div class="settings-category-panels"></div>`;
+    section.setAttribute("role", "tabpanel");
+    section.innerHTML = `<header class="settings-category-heading"><p>${group.eyebrow}</p><h2>${group.title}</h2><span>${group.description}</span></header><nav class="settings-panel-nav" aria-label="${group.title} settings" role="tablist"></nav><div class="settings-category-panels"></div>`;
+    const panelTabs = section.querySelector(".settings-panel-nav");
     const container = section.querySelector(".settings-category-panels");
+    const groupPanels = [];
     group.panels.forEach((title, index) => {
       const panel = panels.get(title);
       if (!panel) return;
@@ -244,24 +270,54 @@ function organizeSettingsPage() {
       panel.classList.toggle("settings-panel-wide", group.widePanels.includes(title));
       const fields = panel.querySelector(".panel-fields");
       fields.id = `${group.id}-panel-${index + 1}`;
-      const toggle = document.createElement("button");
-      toggle.className = "settings-panel-toggle";
-      toggle.type = "button";
-      toggle.setAttribute("aria-controls", fields.id);
-      panel.querySelector(".panel-intro").append(toggle);
-      toggle.addEventListener("click", () => setPanelExpanded(panel, toggle.getAttribute("aria-expanded") !== "true"));
-      setPanelExpanded(panel, group.openPanels.includes(title));
+      fields.hidden = false;
+      panel.id = `${group.id}-setting-${index + 1}`;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", `${group.id}-setting-tab-${index + 1}`);
+      const panelTab = document.createElement("button");
+      panelTab.id = `${group.id}-setting-tab-${index + 1}`;
+      panelTab.type = "button";
+      panelTab.setAttribute("role", "tab");
+      panelTab.setAttribute("aria-controls", panel.id);
+      panelTab.textContent = title;
+      panelTabs.append(panelTab);
+      groupPanels.push({panel, tab: panelTab});
       container.append(panel);
     });
-    if (group.id === "settings-system") {
-      const systemBody = document.createElement("div");
-      systemBody.className = "settings-system-body";
-      systemBody.append(actions, ui.form.querySelector("#relaunch-status"));
-      section.append(systemBody);
+    function activatePanel(panelId) {
+      const selected = groupPanels.some(item => item.panel.id === panelId)
+        ? panelId
+        : groupPanels[0]?.panel.id;
+      groupPanels.forEach(item => {
+        const active = item.panel.id === selected;
+        item.panel.hidden = !active;
+        item.tab.classList.toggle("active", active);
+        item.tab.setAttribute("aria-selected", String(active));
+        item.tab.tabIndex = active ? 0 : -1;
+      });
     }
-    if (group.id === "settings-system") ui.form.append(section);
-    else ui.form.insertBefore(section, actions);
+    groupPanels.forEach(item => item.tab.addEventListener("click", () => activatePanel(item.panel.id)));
+    activatePanel();
+    ui.form.insertBefore(section, actions);
   }
+  ui.form.prepend(actions);
+
+  const tabs = [...document.querySelectorAll("[data-settings-tab]")];
+  const categories = groups.map(group => document.querySelector(`#${group.id}`)).filter(Boolean);
+  function activateTab(id, updateHash = true) {
+    const selected = categories.some(category => category.id === id) ? id : "settings-general";
+    categories.forEach(category => { category.hidden = category.id !== selected; });
+    tabs.forEach(tab => {
+      const active = tab.dataset.settingsTab === selected;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+    });
+    if (updateHash && window.location.hash !== `#${selected}`) history.replaceState(null, "", `#${selected}`);
+  }
+  tabs.forEach(tab => tab.addEventListener("click", () => activateTab(tab.dataset.settingsTab)));
+  window.addEventListener("hashchange", () => activateTab(window.location.hash.slice(1), false));
+  activateTab(window.location.hash.slice(1), false);
 }
 
 organizeSettingsPage();
@@ -318,11 +374,6 @@ function setSystemState() {
   const processLabel = healthProcessId ? `pid ${healthProcessId}` : "pid ?";
   ui.state.lastChild.textContent = ` Online | v${healthVersion} | ${revision} | ${processLabel}`;
   ui.appVersion.textContent = `Version ${healthVersion}`;
-}
-
-function setRelaunchStatus(message, kind = "working") {
-  ui.relaunchStatus.textContent = message;
-  ui.relaunchStatus.className = `relaunch-status ${kind}`;
 }
 
 function renderBackupState(data) {
@@ -436,6 +487,20 @@ ui.discoverCameras.addEventListener("click", async () => {
     ui.cameraDiscoveryStatus.textContent = error.message;
   } finally {
     ui.discoverCameras.disabled = false;
+  }
+});
+
+ui.probeCameraModes.addEventListener("click", async () => {
+  ui.probeCameraModes.disabled = true;
+  ui.cameraModeStatus.textContent = "Reading the mode currently used by the live preview...";
+  try {
+    const result = await api("/api/cameras/modes", {cache: "no-store"});
+    ui.cameraModeStatus.textContent = result.message || "Actual camera mode refreshed.";
+    await refreshCameraModeStatus();
+  } catch (error) {
+    ui.cameraModeStatus.textContent = `Mode detection failed: ${error.message}`;
+  } finally {
+    ui.probeCameraModes.disabled = false;
   }
 });
 
@@ -671,6 +736,18 @@ function syncOptionalStationUi() {
 }
 
 function settingsDraft() {
+  const [cameraWidth, cameraHeight] = (ui.cameraResolution.value || "1920x1080").split("x").map(Number);
+  const stackLightOutputs = {};
+  [["red", ui.stackLightRed], ["amber", ui.stackLightAmber], ["green", ui.stackLightGreen], ["blue", ui.stackLightBlue], ["white", ui.stackLightWhite], ["alarm", ui.stackLightAlarm]].forEach(([name, field]) => {
+    const text = field.value.trim();
+    if (!text) return;
+    const match = text.match(/^(standard|configurable|tool):(\d+)$/i);
+    if (!match) throw new Error(`${name[0].toUpperCase()}${name.slice(1)} stack-light output must use bank:index, for example standard:0.`);
+    const bank = match[1].toLowerCase();
+    const index = Number(match[2]);
+    if (index > (bank === "tool" ? 1 : 7)) throw new Error(`${name[0].toUpperCase()}${name.slice(1)} stack-light output is outside the ${bank} output range.`);
+    stackLightOutputs[name] = {bank, index};
+  });
   return {
     source_folder: ui.source.value,
     program_extensions: programExtensions(),
@@ -686,8 +763,8 @@ function settingsDraft() {
     camera_recording_enabled: ui.cameraRecordingEnabled.checked,
     camera_recording_path: ui.cameraRecordingPath.value.trim() || "data/camera-recordings",
     camera_recording_retention_days: fieldNumber(ui.cameraRecordingRetentionDays, 7),
-    camera_width: fieldNumber(ui.cameraWidth, 1920),
-    camera_height: fieldNumber(ui.cameraHeight, 1080),
+    camera_width: Number.isFinite(cameraWidth) ? cameraWidth : 1920,
+    camera_height: Number.isFinite(cameraHeight) ? cameraHeight : 1080,
     camera_fps: fieldNumber(ui.cameraFps, 30),
     pool_locations: poolLocationsDraft(),
     on_deck_location: readLocation("on_deck"),
@@ -697,6 +774,8 @@ function settingsDraft() {
     mill_load_unload_g53: readMillG53(),
     debug_menu_enabled: ui.debugMenuEnabled.checked,
     manual_io_control_enabled: ui.manualIoControlEnabled.checked,
+    stack_light_enabled: ui.stackLightEnabled.checked,
+    stack_light_outputs: stackLightOutputs,
     robot_connection_mode: ui.robotConnectionMode.value,
     robot_host: ui.robotHost.value.trim(),
     robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30003),
@@ -770,6 +849,50 @@ function settingsDraft() {
   };
 }
 
+function setCameraResolutionOptions(modes, currentValue = ui.cameraResolution.value) {
+  const options = modes.length ? modes : Array.from(ui.cameraResolution.options).map(option => {
+    const [width, height] = option.value.split("x").map(Number);
+    return {width, height, label: option.textContent};
+  });
+  ui.cameraResolution.replaceChildren(...options.map(mode => {
+    const option = document.createElement("option");
+    option.value = `${mode.width}x${mode.height}`;
+    option.textContent = mode.label || `${mode.width} × ${mode.height}`;
+    return option;
+  }));
+  if (!Array.from(ui.cameraResolution.options).some(option => option.value === currentValue)) {
+    const legacyOption = document.createElement("option");
+    legacyOption.value = currentValue;
+    legacyOption.textContent = `Current: ${currentValue.replace("x", " × ")}`;
+    ui.cameraResolution.appendChild(legacyOption);
+  }
+  ui.cameraResolution.value = currentValue;
+}
+
+function renderCameraModeStatus(snapshot) {
+  const cameras = snapshot?.cameras || [];
+  if (!cameras.length) {
+    ui.cameraModeStatus.textContent = "No enabled cameras are currently online.";
+    return;
+  }
+  ui.cameraModeStatus.textContent = cameras.map(camera => {
+    if (!camera.actual_width || !camera.actual_height) return `${camera.name}: waiting for a frame.`;
+    const actual = `${camera.actual_width} × ${camera.actual_height}${camera.actual_fps ? ` at ${camera.actual_fps} FPS` : ""}`;
+    const requested = `${camera.requested_width} × ${camera.requested_height}`;
+    return camera.mode_applied === false
+      ? `${camera.name}: actual ${actual}; requested ${requested}, driver selected a different mode.`
+      : `${camera.name}: actual ${actual}.`;
+  }).join(" ");
+}
+
+async function refreshCameraModeStatus() {
+  try {
+    renderCameraModeStatus(await api("/api/cameras", {cache: "no-store"}));
+  } catch (error) {
+    ui.cameraModeStatus.textContent = `Camera status unavailable: ${error.message}`;
+  }
+}
+
 function cloneSettingsDraft(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -810,6 +933,7 @@ async function loadSettings() {
     isLoadingSettings = true;
     await loadHealth();
     board = await api("/api/settings");
+    ui.savePoolLocationsDuringRunRow.classList.toggle("hidden", !board.run_mode?.manual_robot_pause);
     ui.source.value = board.settings.source_folder;
     ui.extensions.value = board.settings.program_extensions.join(", ");
     ui.unit.value = board.settings.weight_unit;
@@ -823,8 +947,8 @@ async function loadSettings() {
     ui.cameraRecordingEnabled.checked = board.settings.camera_recording_enabled === true;
     ui.cameraRecordingPath.value = board.settings.camera_recording_path || "data/camera-recordings";
     ui.cameraRecordingRetentionDays.value = board.settings.camera_recording_retention_days || 7;
-    ui.cameraWidth.value = board.settings.camera_width || 1920;
-    ui.cameraHeight.value = board.settings.camera_height || 1080;
+    const resolutionValue = `${board.settings.camera_width || 1920}x${board.settings.camera_height || 1080}`;
+    setCameraResolutionOptions([], resolutionValue);
     ui.cameraFps.value = board.settings.camera_fps || 30;
     renderCameraDevices();
     ui.cameraIdleId.value = board.settings.camera_idle_id || "";
@@ -833,6 +957,12 @@ async function loadSettings() {
     renderLocationFields();
     ui.debugMenuEnabled.checked = board.settings.debug_menu_enabled;
     ui.manualIoControlEnabled.checked = board.settings.manual_io_control_enabled;
+    ui.stackLightEnabled.checked = board.settings.stack_light_enabled === true;
+    const stackLightOutputs = board.settings.stack_light_outputs || {};
+    [["red", ui.stackLightRed], ["amber", ui.stackLightAmber], ["green", ui.stackLightGreen], ["blue", ui.stackLightBlue], ["white", ui.stackLightWhite], ["alarm", ui.stackLightAlarm]].forEach(([name, field]) => {
+      const output = stackLightOutputs[name];
+      field.value = output ? `${output.bank}:${output.index}` : "";
+    });
     ui.robotConnectionMode.value = board.settings.robot_connection_mode;
     ui.robotHost.value = board.settings.robot_host || "";
     ui.robotPort.value = board.settings.robot_port;
@@ -924,6 +1054,7 @@ async function loadSettings() {
     setDirtyState(false);
     syncRobotModeUi();
     setSystemState();
+    await refreshCameraModeStatus();
   } catch (error) {
     ui.state.lastChild.textContent = " Unavailable";
     showToast(error.message, "error");
@@ -947,10 +1078,10 @@ function closeScriptRebuildPrompt() {
 
 async function saveSettings({promptForScriptRebuild = true} = {}) {
   normalizeSettingsPrecision();
-  const draft = settingsDraft();
-  const baseDraft = savedSettingsDraft || cloneSettingsDraft(draft);
-  let settingsChanges = changedSettings(baseDraft, draft);
   try {
+    const draft = settingsDraft();
+    const baseDraft = savedSettingsDraft || cloneSettingsDraft(draft);
+    let settingsChanges = changedSettings(baseDraft, draft);
     const submit = revision => api("/api/settings", {
       method: "PUT",
       body: JSON.stringify({expected_revision: revision, ...settingsChanges}),
@@ -1000,6 +1131,38 @@ bindPrecisionRounding(ui.form);
 ui.robotConnectionMode.addEventListener("change", syncRobotModeUi);
 ui.onDeckEnabled.addEventListener("change", syncOptionalStationUi);
 ui.drippingEnabled.addEventListener("change", syncOptionalStationUi);
+ui.alignRobotPalletPick.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    ui.alignRobotPalletPickStatus.textContent = "Save Settings first so the robot uses the displayed tool orientation.";
+    return;
+  }
+  if (await window.mpsConfirm({
+    eyebrow: "Pallet-pick teaching",
+    title: "Align the fork now?",
+    message: "The robot will rotate the fork at its current TCP position to the saved pallet tool orientation. Keep the cell clear. It will not translate to a pallet location.",
+    tone: "warning",
+    primaryLabel: "Align fork",
+  }) !== "primary") return;
+  const originalLabel = ui.alignRobotPalletPick.textContent;
+  ui.alignRobotPalletPick.disabled = true;
+  ui.alignRobotPalletPick.textContent = "Aligning...";
+  ui.alignRobotPalletPickStatus.textContent = "Waiting for Mongo to confirm the orientation move...";
+  try {
+    const result = await api("/api/settings/robot/align-pallet-pick", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision}),
+    });
+    ui.alignRobotPalletPickStatus.textContent = result.message;
+    showToast("Robot pallet-pick alignment completed.");
+    board = await api("/api/board", {cache: "no-store"});
+  } catch (error) {
+    ui.alignRobotPalletPickStatus.textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    ui.alignRobotPalletPick.disabled = false;
+    ui.alignRobotPalletPick.textContent = originalLabel;
+  }
+});
 ui.testCncTelemetry.addEventListener("click", async () => {
   const originalLabel = ui.testCncTelemetry.textContent;
   ui.testCncTelemetry.disabled = true;
@@ -1393,31 +1556,49 @@ ui.intermediateSafePoseList.addEventListener("click", event => {
 });
 
 async function rebuildMotionScripts() {
-  ui.rebuildMotionScripts.disabled = true;
-  ui.motionProgramFileStatus.textContent = "Synchronizing generated scripts...";
+  ui.rebuildMotionScripts.forEach(button => { button.disabled = true; });
+  ui.motionProgramFileStatus.forEach(status => { status.textContent = "Synchronizing generated scripts..."; });
   try {
     const result = await api("/api/robot-motions/rebuild-scripts", {method: "POST"});
     board = result.board;
     renderGeneratedMotionPrograms();
-    ui.motionProgramFileStatus.textContent = `${result.files.length} scripts synchronized locally and to the robot.`;
+    ui.motionProgramFileStatus.forEach(status => { status.textContent = `${result.files.length} scripts synchronized locally and to the robot.`; });
     savedSettingsDraft = cloneSettingsDraft(settingsDraft());
     savedSettingsSignature = JSON.stringify(savedSettingsDraft);
     setDirtyState(false);
     showToast("Generated robot scripts rebuilt and synchronized.");
     return true;
   } catch (error) {
-    ui.motionProgramFileStatus.textContent = error.message;
+    ui.motionProgramFileStatus.forEach(status => { status.textContent = error.message; });
     showToast(error.message, "error");
     return false;
   } finally {
-    ui.rebuildMotionScripts.disabled = false;
+    ui.rebuildMotionScripts.forEach(button => { button.disabled = false; });
   }
 }
 
-ui.rebuildMotionScripts.addEventListener("click", async () => {
-  ui.motionProgramFileStatus.textContent = "Saving settings and synchronizing generated scripts...";
+ui.rebuildMotionScripts.forEach(button => button.addEventListener("click", async () => {
+  ui.motionProgramFileStatus.forEach(status => { status.textContent = "Saving settings and synchronizing generated scripts..."; });
   if (!await saveSettings({promptForScriptRebuild: false})) return;
   await rebuildMotionScripts();
+}));
+
+ui.savePoolLocationsDuringRun.addEventListener("click", async () => {
+  ui.savePoolLocationsDuringRun.disabled = true;
+  try {
+    const result = await api("/api/settings/pool-locations-during-run", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, pool_locations: poolLocationsDraft()}),
+    });
+    board = result;
+    await rebuildMotionScripts();
+    await loadSettings();
+    showToast("Pool locations saved. Resume the queue when teaching is complete.");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.savePoolLocationsDuringRun.disabled = false;
+  }
 });
 
 ui.scriptRebuildLater.addEventListener("click", () => {
@@ -1635,57 +1816,6 @@ ui.unsavedSave.addEventListener("click", async () => {
   } else {
     continueNavigation();
   }
-});
-
-ui.relaunchSystem.addEventListener("click", async () => {
-  const button = ui.relaunchSystem;
-  const startingProcessId = healthProcessId;
-  const startingStartedAt = healthStartedAt;
-  button.disabled = true;
-  button.textContent = "Relaunching";
-  setRelaunchStatus("Step 1 of 3: requesting backend restart...");
-  try {
-    await api("/api/system/relaunch", {method: "POST"});
-    setRelaunchStatus("Step 2 of 3: backend restart requested. Waiting for the server to cycle...");
-    showToast("Backend relaunch requested. This page will refresh when the server is current.");
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = "Close and relaunch";
-    setRelaunchStatus(`Relaunch failed: ${error.message}`, "error");
-    showToast(error.message, "error");
-    return;
-  }
-
-  const deadline = Date.now() + 45000;
-  let sawOffline = false;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`/api/health?t=${Date.now()}`, {cache: "no-store"});
-      if (response.ok) {
-        const health = await response.json();
-        healthVersion = health.version || "unknown";
-        healthProcessId = health.process_id || null;
-        healthStartedAt = health.started_at || "";
-        const processChanged = healthProcessId && healthProcessId !== startingProcessId;
-        const startChanged = healthStartedAt && healthStartedAt !== startingStartedAt;
-        if (sawOffline || processChanged || startChanged) {
-          setRelaunchStatus("Step 3 of 3: backend is back online. Refreshing the UI...", "success");
-          window.location.reload();
-          return;
-        }
-        setRelaunchStatus("Step 2 of 3: restart is still in progress...");
-      }
-    } catch {
-      sawOffline = true;
-      setRelaunchStatus("Step 2 of 3: backend is offline during restart. Waiting for it to return...");
-    }
-    await new Promise(resolve => window.setTimeout(resolve, 1000));
-  }
-
-  button.disabled = false;
-  button.textContent = "Close and relaunch";
-  setRelaunchStatus("Relaunch timed out. The backend may still be restarting; refresh this page once in a few seconds.", "error");
-  showToast("Relaunch timed out. If the backend did restart, refresh this page once.", "error");
 });
 
 ui.backupNow.addEventListener("click", async () => {

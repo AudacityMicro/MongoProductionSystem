@@ -24,7 +24,17 @@ from sqlalchemy.orm.exc import StaleDataError
 from app.diagnostics import diagnostics
 from app.cameras import camera_manager, parse_camera_devices
 from app.program_metadata import parse_program_metadata, unavailable_program_metadata, PROGRAM_METADATA_PREFIX_BYTES
-from app.models import AppSettings, MillSupervisorCommand, Pallet, RobotMotion, RobotReliabilityRun, RobotSupervisorCommand
+from app.models import (
+    AppSettings,
+    MillSupervisorCommand,
+    Pallet,
+    ProgramCompletionStat,
+    ProgramRuntime,
+    RecoverySession,
+    RobotMotion,
+    RobotReliabilityRun,
+    RobotSupervisorCommand,
+)
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
 from app.cnc_linuxcnc import (
     CncProgramFault,
@@ -79,6 +89,7 @@ from app.robot_supervisor import (
     EVENT_RUNNING,
     FAULT_LINK_LOST_AFTER_ATOMIC_COMPLETION,
     OP_CLEAR_LATCH,
+    OP_ALIGN_PALLET_PICK,
     OP_ENTER_MAINTENANCE,
     OP_LOAD_MILL,
     OP_PICK_POOL,
@@ -95,10 +106,13 @@ from app.robot_rtde import (
     RobotTelemetryError,
     read_robot_snapshot,
     reset_robot_connections,
+    set_robot_digital_output,
     toggle_robot_digital_output,
 )
 from app.schemas import (
     ClearRobotFault,
+    MillSupervisorActivation,
+    MillSupervisorReconcile,
     CreatePallet,
     MovePallet,
     ManualReturnPallet,
@@ -114,11 +128,13 @@ from app.schemas import (
     StartRunMode,
     StartMillPalletTransfer,
     StartPalletMotion,
+    SupervisorReconcile,
     ToggleDebugIo,
     RunDebugProgram,
     RunDebugMillProgram,
     RunDebugMillPalletMotion,
     RunDebugPalletMotion,
+    RecoveryAnswer,
     UpdatePallet,
 )
 
@@ -537,10 +553,12 @@ def program_metadata(
     detail: str = "",
     cycle_basis: str | None = None,
     wcs: list[str] | None = None,
+    tool_counts: dict[str, int] | None = None,
 ) -> dict:
     hidden = not program_path or content_status in {"complete_parts", "defective_parts"}
     return {
         "program_tools": [] if hidden else list(tools or []),
+        "program_tool_counts": {} if hidden else dict(tool_counts or {}),
         "program_wcs": [] if hidden else list(wcs or []),
         "expected_cycle_seconds": None if hidden else expected_cycle_seconds,
         "program_metadata_state": state,
@@ -599,6 +617,7 @@ def read_assigned_program_metadata(settings: AppSettings, program_path: str) -> 
 
 def _store_pallet_program_metadata(pallet: Pallet, metadata: dict[str, object]) -> None:
     pallet.program_tools_json = json.dumps(metadata.get("program_tools") or [], separators=(",", ":"))
+    pallet.program_tool_counts_json = json.dumps(metadata.get("program_tool_counts") or {}, separators=(",", ":"), sort_keys=True)
     pallet.program_wcs_json = json.dumps(metadata.get("program_wcs") or [], separators=(",", ":"))
     pallet.expected_cycle_seconds = metadata.get("expected_cycle_seconds")
     pallet.program_metadata_state = str(metadata.get("program_metadata_state") or "unavailable")
@@ -992,6 +1011,14 @@ def mill_supervisor_status(session: Session) -> dict[str, object]:
     terminal_uncertain = bool(
         latest and latest.status in {"uncertain", "faulted", "latched"}
     )
+    reconciliation = None
+    if terminal_uncertain and latest:
+        reconciliation = {
+            "sequence": latest.sequence,
+            "operation": latest.operation,
+            "command_status": latest.status,
+            "detail": latest.fault_detail,
+        }
     status.update({
         "enabled": settings.mill_supervisor_enabled,
         "activation_verified": settings.mill_supervisor_activation_verified,
@@ -1000,6 +1027,7 @@ def mill_supervisor_status(session: Session) -> dict[str, object]:
         "configured": bool(settings.cnc_host.strip() and settings.cnc_ssh_username and settings.cnc_ssh_password),
         "sequence_mismatch": sequence_mismatch,
         "reconciliation_required": sequence_mismatch or terminal_uncertain,
+        "reconciliation": reconciliation,
         "recent_commands": [
             {
                 "sequence": item.sequence,
@@ -1013,6 +1041,36 @@ def mill_supervisor_status(session: Session) -> dict[str, object]:
         ],
     })
     return status
+
+
+def topbar_connection_status(session: Session) -> dict[str, dict[str, str]]:
+    """Cheap local supervisor-status summary for the persistent page header."""
+    settings = get_settings(session)
+    robot_configured = settings.robot_connection_mode == "physical" and bool(settings.robot_host.strip())
+    mill_configured = bool(settings.cnc_telemetry_enabled and settings.cnc_host.strip())
+    robot = robot_supervisor().status()
+    mill = mill_supervisor().status()
+    robot_age = robot.get("telemetry_age_seconds")
+    mill_age = mill.get("telemetry_age_seconds")
+    robot_live = bool(robot.get("connected") and robot_age is not None and float(robot_age) <= settings.robot_supervisor_heartbeat_seconds * 4)
+    mill_live = bool(mill.get("connected") and mill_age is not None and float(mill_age) <= settings.mill_supervisor_heartbeat_seconds * 3)
+
+    def status(configured: bool, connected: bool, live: bool, name: str, simulated: bool = False) -> dict[str, str]:
+        if simulated:
+            return {"state": "neutral", "label": f"{name}: Simulated"}
+        if not configured:
+            return {"state": "neutral", "label": f"{name}: Not configured"}
+        if live:
+            return {"state": "online", "label": f"{name}: Live"}
+        if connected:
+            return {"state": "warning", "label": f"{name}: Telemetry stale"}
+        return {"state": "offline", "label": f"{name}: Disconnected"}
+
+    return {
+        "backend": {"state": "online", "label": "Backend: Online"},
+        "robot": status(robot_configured, bool(robot.get("connected")), robot_live, "Robot", settings.robot_connection_mode == "simulated"),
+        "mill": status(mill_configured, bool(mill.get("connected")), mill_live, "Mill"),
+    }
 
 
 def stop_mill_supervisor_listener() -> None:
@@ -1183,6 +1241,13 @@ def bootstrap_mill_supervisor(session: Session) -> dict[str, object]:
     try:
         write_robot_text_file(path=_MILL_SUPERVISOR_AGENT_PATH, text=asset, **connection)
         write_robot_text_file(path=_MILL_SUPERVISOR_CONFIG_PATH, text=json.dumps(config, sort_keys=True), **connection)
+        # The helper reads its configuration only at process startup. An old
+        # but live PID can otherwise keep retrying a stale backend address
+        # while the launcher incorrectly reports that it is already running.
+        stop_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds, _MILL_SUPERVISOR_PID_PATH,
+        )
         start_mill_supervisor_agent(
             settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
             settings.cnc_ssh_password, settings.cnc_timeout_seconds,
@@ -1454,6 +1519,10 @@ def serialize_pallet(pallet: Pallet) -> dict:
     except (TypeError, json.JSONDecodeError):
         tools = []
     try:
+        tool_counts = json.loads(pallet.program_tool_counts_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        tool_counts = {}
+    try:
         wcs = json.loads(pallet.program_wcs_json or "[]")
     except (TypeError, json.JSONDecodeError):
         wcs = []
@@ -1477,6 +1546,7 @@ def serialize_pallet(pallet: Pallet) -> dict:
             pallet.program_metadata_detail,
             pallet.program_cycle_basis,
             wcs,
+            tool_counts,
         ),
     }
 
@@ -1614,6 +1684,122 @@ def store_pallet_location_positions(
     settings.mill_pallet_change_g53_position = json.dumps(current["mill_load_unload_g53"], separators=(",", ":"))
 
 
+_STACK_LIGHT_CHANNELS = ("red", "amber", "green", "blue", "white", "alarm")
+_PRE_MOTION_ALARM_IDLE_SECONDS = 120
+_PRE_MOTION_ALARM_BURSTS = 3
+_PRE_MOTION_ALARM_BURST_SECONDS = 0.25
+
+
+def _stack_light_outputs(settings: AppSettings) -> dict[str, dict[str, object]]:
+    try:
+        raw = json.loads(settings.stack_light_outputs or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return {
+        name: value
+        for name, value in raw.items()
+        if name in _STACK_LIGHT_CHANNELS and isinstance(value, dict)
+        and value.get("bank") in {"standard", "configurable", "tool"}
+        and isinstance(value.get("index"), int)
+    }
+
+
+def _stack_light_state(settings: AppSettings) -> dict[str, bool]:
+    active = {name: False for name in _STACK_LIGHT_CHANNELS}
+    state = settings.run_mode_state
+    if state in {"faulted", "interrupted"}:
+        active["red"] = active["alarm"] = True
+    elif settings.run_mode_enabled and state in {"loading", "machining", "unloading", "preparing", "positioning_mill", "advancing"}:
+        active["blue"] = True
+    elif settings.run_mode_enabled and state in {"waiting_confirmation", "start_requested", "resuming", "recovering_startup_telemetry", "recovering_cnc_telemetry", "recovering_robot_telemetry"}:
+        active["amber"] = True
+    else:
+        active["green"] = True
+    return active
+
+
+def _effective_stack_light_state(session: Session, settings: AppSettings) -> dict[str, bool]:
+    active = _stack_light_state(settings)
+    recovery_active = session.scalar(
+        select(RecoverySession.id).where(RecoverySession.status.in_(_RECOVERY_ACTIVE_STATUSES)).limit(1)
+    )
+    if recovery_active and not active["red"]:
+        active["amber"] = False
+        active["green"] = False
+        active["white"] = True
+    return active
+
+
+def apply_stack_light(session: Session) -> None:
+    """Drive only explicitly configured non-motion outputs; disabled by default."""
+    settings = get_settings(session)
+    if not (settings.stack_light_enabled and settings.robot_connection_mode == "physical" and settings.robot_host.strip()):
+        return
+    state = _effective_stack_light_state(session, settings)
+    for name, output in _stack_light_outputs(settings).items():
+        set_robot_digital_output(
+            settings.robot_host.strip(), settings.robot_port, settings.robot_timeout_seconds,
+            str(output["bank"]), int(output["index"]), state[name],
+        )
+
+
+def refresh_stack_light(session: Session) -> None:
+    try:
+        apply_stack_light(session)
+    except RobotTelemetryError as exc:
+        diagnostics().record("stack_light", "output_unavailable", str(exc), severity="warning")
+
+
+def _pre_motion_alarm_required(session: Session) -> bool:
+    """Warn before resuming after a known, sustained period without robot motion."""
+    last_completed = session.scalar(
+        select(RobotMotion.completed_at)
+        .where(RobotMotion.completed_at.is_not(None))
+        .order_by(RobotMotion.completed_at.desc())
+        .limit(1)
+    )
+    if not last_completed:
+        return False
+    try:
+        idle_since = datetime.fromisoformat(last_completed.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if idle_since.tzinfo is None:
+        idle_since = idle_since.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - idle_since).total_seconds() >= _PRE_MOTION_ALARM_IDLE_SECONDS
+
+
+def emit_pre_motion_alarm(session: Session, operation: str) -> bool:
+    """Emit three short alarm pulses before a physical robot move resumes after idling."""
+    settings = get_settings(session)
+    output = _stack_light_outputs(settings).get("alarm")
+    if not (
+        output
+        and settings.stack_light_enabled
+        and settings.robot_connection_mode == "physical"
+        and settings.robot_host.strip()
+        and _pre_motion_alarm_required(session)
+    ):
+        return False
+    diagnostics().record(
+        "stack_light", "pre_motion_alarm",
+        "Emitting three short audible warnings before robot movement resumes after two idle minutes.",
+        details={"operation": operation, "bursts": _PRE_MOTION_ALARM_BURSTS},
+    )
+    for _ in range(_PRE_MOTION_ALARM_BURSTS):
+        set_robot_digital_output(
+            settings.robot_host.strip(), settings.robot_port, settings.robot_timeout_seconds,
+            str(output["bank"]), int(output["index"]), True,
+        )
+        time.sleep(_PRE_MOTION_ALARM_BURST_SECONDS)
+        set_robot_digital_output(
+            settings.robot_host.strip(), settings.robot_port, settings.robot_timeout_seconds,
+            str(output["bank"]), int(output["index"]), False,
+        )
+        time.sleep(_PRE_MOTION_ALARM_BURST_SECONDS)
+    return True
+
+
 def board_snapshot(session: Session) -> dict:
     settings = get_settings(session)
     pallets = session.scalars(select(Pallet)).all()
@@ -1640,6 +1826,9 @@ def board_snapshot(session: Session) -> dict:
             **pallet_location_positions(settings),
             "debug_menu_enabled": settings.debug_menu_enabled,
             "manual_io_control_enabled": settings.manual_io_control_enabled,
+            "stack_light_enabled": settings.stack_light_enabled,
+            "stack_light_outputs": _stack_light_outputs(settings),
+            "stack_light_state": _effective_stack_light_state(session, settings),
             "machine_state": settings.machine_state,
             "robot_connection_mode": settings.robot_connection_mode,
             "robot_host": settings.robot_host,
@@ -1714,6 +1903,7 @@ def board_snapshot(session: Session) -> dict:
             "return_slot": settings.run_mode_return_slot,
             "pending_action": settings.run_mode_pending_action or None,
             "confirmation_token": settings.run_mode_confirmation_token or None,
+            "manual_robot_pause": settings.run_mode_manual_robot_pause,
         },
         "programs": programs,
         "program_warning": warning,
@@ -1988,7 +2178,12 @@ def _atc_inventory(telemetry: dict | None, descriptions: dict[int, dict] | None 
     return inventory
 
 
-def _tool_color_states(library: list[dict], telemetry: dict | None, atc_slots: list[dict]) -> dict[str, dict]:
+def _tool_color_states(
+    library: list[dict],
+    telemetry: dict | None,
+    atc_slots: list[dict],
+    extra_numbers: set[int] | None = None,
+) -> dict[str, dict]:
     if not telemetry:
         return {}
     loaded_numbers = {slot["number"] for slot in atc_slots if slot["number"] is not None}
@@ -1998,8 +2193,9 @@ def _tool_color_states(library: list[dict], telemetry: dict | None, atc_slots: l
         if row.get("tool_number") is not None
     }
     states = {}
-    for tool in library:
-        number = tool["number"]
+    numbers = {tool["number"] for tool in library}
+    numbers.update(extra_numbers or set())
+    for number in sorted(numbers):
         length = lengths.get(number)
         if number in loaded_numbers:
             status = "atc"
@@ -2016,25 +2212,131 @@ def dashboard_snapshot(session: Session) -> dict:
     pallets = session.scalars(select(Pallet)).all()
     queue = sorted((item for item in pallets if item.queue_position is not None), key=lambda item: item.queue_position or 0)
     machine = next((item for item in pallets if item.location == "machine"), None)
-    queue_items = [serialize_pallet(item) for item in queue]
-    queue_cycle_seconds = sum(item["expected_cycle_seconds"] or 0 for item in queue_items)
-    queue_tools = sorted({tool for item in queue_items for tool in item["program_tools"]}, key=lambda tool: int(tool[1:]))
+    runtime_rows = session.scalars(select(ProgramRuntime).order_by(ProgramRuntime.completed_at.desc())).all()
+    runtime_totals: dict[str, tuple[int, int]] = {}
+    for item in runtime_rows:
+        total, count = runtime_totals.get(item.program_path, (0, 0))
+        runtime_totals[item.program_path] = (total + item.duration_seconds, count + 1)
+
+    def estimated_cycle(item: Pallet) -> tuple[int | None, str, int]:
+        program_path = (item.program_path or "").strip()
+        total, count = runtime_totals.get(program_path, (0, 0))
+        if count:
+            return max(1, round(total / count)), "Measured average", count
+        return item.expected_cycle_seconds, "Posted estimate", 0
+
+    def dashboard_pallet(item: Pallet) -> dict[str, object]:
+        result = serialize_pallet(item)
+        estimate, source, samples = estimated_cycle(item)
+        result.update({
+            "estimated_cycle_seconds": estimate,
+            "estimate_source": source,
+            "measured_run_count": samples,
+        })
+        return result
+
+    queue_items = [dashboard_pallet(item) for item in queue]
     machine_item = serialize_pallet(machine) if machine else None
+    machine_estimate, _machine_source, _machine_samples = estimated_cycle(machine) if machine else (None, "Posted estimate", 0)
+    started_at = settings.run_mode_program_started_at if settings.run_mode_state in {"machining", "telemetry_unavailable", "telemetry_restored"} else None
+    elapsed_seconds = 0
+    if started_at:
+        try:
+            elapsed_seconds = max(0, round((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()))
+        except ValueError:
+            started_at = None
+    current_remaining_seconds = max(0, (machine_estimate or 0) - elapsed_seconds) if machine else None
+    queue_cycle_seconds = sum(item["estimated_cycle_seconds"] or 0 for item in queue_items)
+    if machine and not any(item.get("id") == machine.id for item in queue_items):
+        queue_cycle_seconds += current_remaining_seconds or 0
+    elif machine and machine_estimate:
+        queue_cycle_seconds = max(0, queue_cycle_seconds - elapsed_seconds)
+    queue_tools = sorted(
+        {tool for item in queue_items for tool in item["program_tools"]}
+        | set(machine_item["program_tools"] if machine_item else []),
+        key=lambda tool: int(tool[1:]),
+    )
     telemetry, atc_source = _configured_cnc_telemetry(settings)
     atc_slots = _atc_inventory(telemetry)
+    queue_tool_numbers = {int(tool[1:]) for tool in queue_tools if tool.startswith("T") and tool[1:].isdigit()}
+    queue_tool_states = _tool_color_states([], telemetry, atc_slots, queue_tool_numbers)
     cameras = camera_manager().snapshot(settings)
+    # Keep the dashboard focused on programs physically in the cell's pool or
+    # mill, plus those actively queued. Historical/staged programs remain
+    # stored but do not clutter the live production counter.
+    program_paths = {
+        item.program_path.strip()
+        for item in pallets
+        if (
+            item.program_path
+            and item.program_path.strip()
+            and (item.location in {"pool", "machine"} or item.queue_position is not None)
+        )
+    }
+    completion_counts = {
+        item.program_path: item.completed_count
+        for item in session.scalars(select(ProgramCompletionStat)).all()
+    }
     return {
         "revision": settings.revision,
         "queue": queue_items,
         "queue_cycle_seconds": queue_cycle_seconds,
         "queue_tools": queue_tools,
+        "queue_tool_states": queue_tool_states,
         "machine_pallet": machine_item,
-        "current_cycle_seconds": machine_item["expected_cycle_seconds"] if machine_item else None,
+        "current_cycle_seconds": machine_estimate,
+        "current_cycle_started_at": started_at,
+        "current_cycle_elapsed_seconds": elapsed_seconds if started_at else None,
+        "current_cycle_remaining_seconds": current_remaining_seconds,
         "atc_tools": [slot["tool"] for slot in atc_slots if slot["tool"]],
         "atc_source": atc_source,
         "cameras": cameras,
+        "program_completions": [
+            {
+                "program_path": path,
+                "completed_count": completion_counts.get(path, 0),
+                "measured_run_count": runtime_totals.get(path, (0, 0))[1],
+                "average_run_seconds": (
+                    round(runtime_totals[path][0] / runtime_totals[path][1])
+                    if runtime_totals.get(path, (0, 0))[1] else None
+                ),
+            }
+            for path in sorted(program_paths, key=str.casefold)
+        ],
         "summary": _board_summary(settings, pallets),
     }
+
+
+def update_program_completion_stat(session: Session, program_path: str, completed_count: int, expected_revision: int) -> None:
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    stat = session.get(ProgramCompletionStat, program_path)
+    if stat is None:
+        stat = ProgramCompletionStat(program_path=program_path, completed_count=completed_count)
+        session.add(stat)
+    else:
+        stat.completed_count = completed_count
+    bump(settings)
+    commit_or_conflict(session)
+
+
+def reset_program_completion_stat(session: Session, program_path: str, expected_revision: int) -> None:
+    update_program_completion_stat(session, program_path, 0, expected_revision)
+
+
+def mark_pallet_program_completed(session: Session, pallet: Pallet) -> None:
+    """Mark a finished pallet and record exactly one completed program run."""
+    if pallet.content_status == "complete_parts":
+        return
+    pallet.content_status = "complete_parts"
+    program_path = (pallet.program_path or "").strip()
+    if not program_path:
+        return
+    stat = session.get(ProgramCompletionStat, program_path)
+    if stat is None:
+        session.add(ProgramCompletionStat(program_path=program_path, completed_count=1))
+    else:
+        stat.completed_count += 1
 
 
 def autoschedule_queue_preview(session: Session, expected_revision: int) -> dict:
@@ -2121,12 +2423,33 @@ def tools_snapshot(session: Session) -> dict:
     by_number = {item["number"]: item for item in library}
     telemetry, atc_source = _configured_cnc_telemetry(settings)
     atc_slots = _atc_inventory(telemetry, by_number)
+    program_usage: dict[str, list[dict[str, object]]] = {}
+    counted_programs: set[str] = set()
+    for pallet in session.scalars(select(Pallet).where(Pallet.program_path.is_not(None))).all():
+        if not pallet.program_path or pallet.program_path in counted_programs:
+            continue
+        counted_programs.add(pallet.program_path)
+        try:
+            counts = json.loads(pallet.program_tool_counts_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            counts = {}
+        if not counts:
+            try:
+                counts = {tool: 1 for tool in json.loads(pallet.program_tools_json or "[]")}
+            except (TypeError, json.JSONDecodeError):
+                counts = {}
+        if not isinstance(counts, dict):
+            continue
+        for tool, count in counts.items():
+            if isinstance(tool, str) and isinstance(count, int) and count > 0:
+                program_usage.setdefault(tool, []).append({"program_path": pallet.program_path, "uses": count})
     return {
         "revision": settings.revision,
         "atc_slots": atc_slots,
         "atc_tools": [slot for slot in atc_slots if slot["tool"]],
         "atc_source": atc_source,
         "tool_states": _tool_color_states(library, telemetry, atc_slots),
+        "program_usage": program_usage,
         "library": library,
         "warning": " ".join(warnings) or None,
     }
@@ -2570,9 +2893,9 @@ _ROBOT_TELEMETRY_LOCK = RLock()
 _ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 60.0
 _SUPERVISOR_RECOVERY_STOP = Event()
 _SUPERVISOR_RECOVERY_THREAD: Thread | None = None
-_SUPERVISOR_RECOVERY_COOLDOWN_SECONDS = 60.0
-_SUPERVISOR_RECOVERY_GRACE_SECONDS = 20.0
-_SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS = 300.0
+_SUPERVISOR_RECOVERY_COOLDOWN_SECONDS = 15.0
+_SUPERVISOR_RECOVERY_GRACE_SECONDS = 10.0
+_SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS = 30.0
 _MILL_SUPERVISOR_RECOVERY_STOP = Event()
 _MILL_SUPERVISOR_RECOVERY_THREAD: Thread | None = None
 _MOTION_TELEMETRY_READ_RETRY_SECONDS = 20.0
@@ -2871,10 +3194,45 @@ def robot_io_snapshot(session: Session) -> dict:
     }
 
 
-def retry_robot_telemetry(session: Session) -> dict:
-    """Allow an explicit reconnect only while no automated operation is active."""
+def _run_mode_allows_robot_reconnect(settings: AppSettings) -> bool:
+    """True only when production is paused on a mill-only retry, not robot work."""
+    return settings.run_mode_enabled and settings.run_mode_state in {
+        "retry_cnc_program",
+        "retry_cnc_preflight",
+        "recovering_cnc_telemetry",
+    }
+
+
+def reconnect_robot_after_manual_control(session: Session) -> dict[str, object]:
+    """Restore MPS telemetry after manual jogging without advancing production."""
     settings = get_settings(session)
-    if settings.run_mode_enabled:
+    if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
+        raise problem(409, "Configure a physical Mongo controller before reconnecting it.")
+    if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
+        raise problem(409, "Enable and verify the Mongo supervisor before reconnecting it.")
+    if settings.run_mode_enabled and not _run_mode_allows_robot_reconnect(settings):
+        raise problem(409, "Robot reconnect is available only when Run Mode is stopped or paused on a mill-only retry.")
+    motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
+    if motion:
+        raise problem(409, "Wait for the active pallet movement before reconnecting Mongo.")
+    if robot_supervisor_status(session).get("reconciliation_required"):
+        raise problem(409, "Reconcile the uncertain robot command before reconnecting Mongo.")
+    result = recover_robot_supervisor_program(
+        session,
+        trigger="manual-control-reconnect",
+        allow_run_mode_paused=True,
+    )
+    return {
+        "status": "reconnected" if result.get("connected") else "waiting",
+        "message": "Mongo supervisor restored. Run Mode remains paused and no robot movement was commanded.",
+        "supervisor": result,
+    }
+
+
+def retry_robot_telemetry(session: Session) -> dict:
+    """Allow an explicit telemetry reset only while no automated operation is active."""
+    settings = get_settings(session)
+    if settings.run_mode_enabled and not _run_mode_allows_robot_reconnect(settings):
         raise problem(409, "Stop Run Mode before resetting the robot connection.")
     motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
     if motion:
@@ -2884,7 +3242,7 @@ def retry_robot_telemetry(session: Session) -> dict:
         _ROBOT_TELEMETRY_CACHE.clear()
         _ROBOT_TELEMETRY_REFRESHING.clear()
     if settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
-        recover_robot_supervisor_connection(session, trigger="operator")
+        recover_robot_supervisor_connection(session, trigger="operator", allow_run_mode_paused=True)
         return {"status": "retrying", "message": "Mongo supervisor socket was reset locally; waiting for the existing robot supervisor to reconnect."}
     return {"status": "retrying", "message": "Mongo connection state was reset; one reconnect sequence is starting."}
 
@@ -3053,7 +3411,7 @@ def create_pallet(session: Session, payload: CreatePallet) -> None:
     commit_or_conflict(session)
 
 
-def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> None:
+def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> str | None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     pallet = session.get(Pallet, pallet_id)
@@ -3075,6 +3433,8 @@ def update_pallet(session: Session, pallet_id: str, payload: UpdatePallet) -> No
         _clear_pallet_program_metadata(pallet)
     bump(settings)
     commit_or_conflict(session)
+    refresh_stack_light(session)
+    return resume_armed_run_mode(session)
 
 
 def duplicate_pallet(session: Session, pallet_id: str, expected_revision: int) -> None:
@@ -3093,6 +3453,7 @@ def duplicate_pallet(session: Session, pallet_id: str, expected_revision: int) -
             content_status=source.content_status,
             program_path=source.program_path,
             program_tools_json=source.program_tools_json,
+            program_tool_counts_json=source.program_tool_counts_json,
             program_wcs_json=source.program_wcs_json,
             expected_cycle_seconds=source.expected_cycle_seconds,
             program_metadata_state=source.program_metadata_state,
@@ -3583,7 +3944,7 @@ def stop_robot_supervisor_listener() -> None:
     robot_supervisor().stop()
 
 
-def recover_robot_supervisor_connection(session: Session, *, trigger: str) -> bool:
+def recover_robot_supervisor_connection(session: Session, *, trigger: str, allow_run_mode_paused: bool = False) -> bool:
     """Reset only the desktop listener so Mongo's existing supervisor reconnects.
 
     This has no Dashboard, RTDE, file-transfer, or motion side effect. It is
@@ -3594,7 +3955,7 @@ def recover_robot_supervisor_connection(session: Session, *, trigger: str) -> bo
     if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
         return False
     active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
-    if settings.run_mode_enabled or active_motion:
+    if active_motion or (settings.run_mode_enabled and not (allow_run_mode_paused and _run_mode_allows_robot_reconnect(settings))):
         return False
     if robot_supervisor().status().get("connected"):
         return False
@@ -3648,13 +4009,25 @@ def restart_robot_supervisor_listener(session: Session, *, trigger: str) -> dict
     }
 
 
-def recover_robot_supervisor_program(session: Session, *, trigger: str) -> dict[str, object]:
+def recover_robot_supervisor_program(
+    session: Session,
+    *,
+    trigger: str,
+    allow_run_mode_manual_pause: bool = False,
+    allow_run_mode_paused: bool = False,
+) -> dict[str, object]:
     """Restore Mongo's no-motion supervisor without replacing operator work."""
     settings = get_settings(session)
     if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
         raise problem(409, "Enable and verify the Mongo supervisor before recovering it.")
     active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
-    if settings.run_mode_enabled or active_motion:
+    if active_motion or (
+        settings.run_mode_enabled
+        and not (
+            (allow_run_mode_manual_pause and settings.run_mode_manual_robot_pause)
+            or (allow_run_mode_paused and _run_mode_allows_robot_reconnect(settings))
+        )
+    ):
         raise problem(409, "Stop Run Mode and wait for active pallet motion before recovering the Mongo supervisor.")
     if robot_supervisor().status().get("connected"):
         return robot_supervisor_status(session)
@@ -3665,24 +4038,33 @@ def recover_robot_supervisor_program(session: Session, *, trigger: str) -> dict[
     loaded_program = str(controller.get("loaded_program") or "").strip()
     if controller.get("running"):
         raise problem(409, "Mongo is running a controller program. Supervisor recovery will not interrupt it.")
-    if loaded_program:
+    supervisor_selected = PurePosixPath(loaded_program).name.casefold() == "mongo_supervisor.script"
+    if loaded_program and not supervisor_selected:
         raise problem(
             409,
             "Mongo has a controller program selected (" + loaded_program + "). "
             "Clear it or finish operator work before recovering the supervisor.",
         )
-    status = bootstrap_robot_supervisor(session)
+    status = (
+        bootstrap_robot_supervisor(
+            session,
+            allow_run_mode_manual_pause=allow_run_mode_manual_pause,
+            allow_run_mode_paused=allow_run_mode_paused,
+        )
+        if allow_run_mode_manual_pause or allow_run_mode_paused
+        else bootstrap_robot_supervisor(session)
+    )
     diagnostics().record(
         "robot_supervisor",
         "program_recovered",
-        "Restored Mongo's no-motion supervisor after it was not running.",
+        "Restored Mongo's no-motion supervisor after it was not running or after manual jogging paused it.",
         severity="warning",
         details={"trigger": trigger},
     )
     return status
 
 
-def auto_recover_controller_connections(session: Session) -> dict[str, object]:
+def auto_recover_controller_connections(session: Session, progress=None) -> dict[str, object]:
     """Apply bounded, non-motion recovery and return every decision made."""
     settings = get_settings(session)
     results: list[dict[str, object]] = []
@@ -3690,8 +4072,63 @@ def auto_recover_controller_connections(session: Session) -> dict[str, object]:
     active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
     automation_idle = not settings.run_mode_enabled and active_motion is None
 
+    if progress:
+        progress("Checking the Mongo controller connection.", results)
+
     robot_status = robot_supervisor_status(session)
-    if settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
+    robot_configured = settings.robot_connection_mode == "physical" and bool(settings.robot_host.strip())
+    robot_recovery_handled = False
+    if robot_configured and not (
+        settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified
+    ):
+        robot_recovery_handled = True
+        if not automation_idle:
+            results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo supervisor recovery waits for Run Mode and pallet motion to become idle."})
+        elif robot_status.get("connected"):
+            if robot_status.get("reconciliation_required"):
+                results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo is connected, but its command sequence requires physical reconciliation before routing can be enabled."})
+            else:
+                settings.robot_supervisor_enabled = True
+                settings.robot_supervisor_activation_verified = True
+                bump(settings)
+                commit_or_conflict(session)
+                results.append({"controller": "Mongo", "action": "Enabled", "detail": "Mongo supervisor is connected and verified command routing is enabled."})
+        else:
+            try:
+                controller = robot_program_status(settings.robot_host.strip(), settings.robot_timeout_seconds)
+                loaded_program = str(controller.get("loaded_program") or "").strip()
+                supervisor_program = "mongo_supervisor" in loaded_program.casefold()
+                if controller.get("running"):
+                    results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo is running a controller program; recovery will not interrupt it."})
+                else:
+                    if loaded_program and not supervisor_program:
+                        results.append({
+                            "controller": "Mongo",
+                            "action": "Selected program preserved",
+                            "detail": f"{loaded_program} is selected but stopped. The no-motion supervisor will run without unloading or starting it.",
+                        })
+                    bootstrap_robot_supervisor(session)
+                    current = get_settings(session)
+                    current.robot_supervisor_enabled = True
+                    current.robot_supervisor_activation_verified = True
+                    bump(current)
+                    commit_or_conflict(session)
+                    refreshed = robot_supervisor().status()
+                    results.append({
+                        "controller": "Mongo",
+                        "action": "Recovered" if refreshed.get("connected") else "Recovery pending",
+                        "detail": "Restored the no-motion Mongo supervisor and local listener." if refreshed.get("connected") else "The no-motion Mongo supervisor was requested but has not reconnected yet.",
+                    })
+            except (HTTPException, RobotDashboardError, RobotFileAccessError, RobotTelemetryError) as exc:
+                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                results.append({"controller": "Mongo", "action": "Deferred", "detail": str(detail)})
+        try:
+            dashboard = robot_dashboard_health(settings.robot_host.strip(), settings.robot_timeout_seconds)
+            results.append({"controller": "Mongo", "action": "Dashboard checked", "detail": "Dashboard responded." if dashboard else "Dashboard returned no health detail."})
+        except RobotDashboardError as exc:
+            results.append({"controller": "Mongo", "action": "Dashboard unavailable", "detail": str(exc)})
+
+    if not robot_recovery_handled and settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
         heartbeat_limit = max(5.0, settings.robot_supervisor_heartbeat_seconds * 4)
         telemetry_age = robot_status.get("telemetry_age_seconds")
         stale = telemetry_age is None or float(telemetry_age) > heartbeat_limit
@@ -3732,11 +4169,74 @@ def auto_recover_controller_connections(session: Session) -> dict[str, object]:
                 "action": "Physical confirmation required",
                 "detail": "The connection is available, but the last robot command has an uncertain physical result. Confirm the observed pallet location before more motion is allowed.",
             })
-    else:
+    elif not robot_recovery_handled:
         results.append({"controller": "Mongo", "action": "Skipped", "detail": "Robot supervisor recovery is not enabled and verified."})
 
+    if progress:
+        progress("Checking the PathPilot mill connection.", results)
+
     mill_status = mill_supervisor().status()
-    if settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified:
+    mill_configured = bool(
+        settings.cnc_telemetry_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    )
+    mill_recovery_handled = False
+    if mill_configured:
+        try:
+            observed_cycle = read_linuxcnc_cycle_state(
+                settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+                settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+            )
+            observed_program = str(observed_cycle.get("program") or "").strip()
+            machine_pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+            expected_program = (machine_pallet.program_path or "").strip() if machine_pallet else ""
+            if (
+                observed_cycle.get("interp_state") != 1 and observed_program
+                and (not expected_program or PurePosixPath(observed_program).name != PurePosixPath(expected_program).name)
+            ):
+                mill_recovery_handled = True
+                results.append({
+                    "controller": "Mill",
+                    "action": "Different program running",
+                    "detail": f"PathPilot is running {observed_program}. It does not match Mongo's expected program ({expected_program or 'none'}), so recovery left it untouched and continued with other services.",
+                })
+        except CncTelemetryError:
+            # The normal recovery path below records telemetry failures with a
+            # user-facing action; do not mask it during this non-invasive check.
+            pass
+    if not mill_recovery_handled and mill_configured and (
+        not settings.mill_supervisor_activation_verified or not mill_status.get("connected")
+    ):
+        mill_recovery_handled = True
+        if not automation_idle:
+            results.append({"controller": "Mill", "action": "Deferred", "detail": "Mill supervisor recovery waits for Run Mode and pallet motion to become idle."})
+        else:
+            desired_enabled = bool(settings.mill_supervisor_enabled)
+            try:
+                bootstrap_mill_supervisor(session)
+                if desired_enabled:
+                    current = get_settings(session)
+                    set_mill_supervisor_activation(
+                        session,
+                        MillSupervisorActivation(
+                            expected_revision=current.revision,
+                            enabled=True,
+                            confirmed=True,
+                        ),
+                    )
+                refreshed = mill_supervisor().status()
+                results.append({
+                    "controller": "Mill",
+                    "action": "Recovered" if refreshed.get("connected") else "Recovery pending",
+                    "detail": "Restored the no-motion PathPilot supervisor and local listener." if refreshed.get("connected") else "The no-motion PathPilot supervisor was requested but has not reconnected yet.",
+                })
+            except (HTTPException, CncTelemetryError, RobotFileAccessError) as exc:
+                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                results.append({"controller": "Mill", "action": "Deferred", "detail": str(detail)})
+
+    if not mill_recovery_handled and settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified:
         mill_heartbeat_limit = max(10.0, settings.mill_supervisor_heartbeat_seconds * 3)
         mill_age = mill_status.get("telemetry_age_seconds")
         mill_stale = mill_age is None or float(mill_age) > mill_heartbeat_limit
@@ -3746,14 +4246,33 @@ def auto_recover_controller_connections(session: Session) -> dict[str, object]:
                 settings.cnc_ssh_password, settings.cnc_timeout_seconds,
             )
             mill_idle = mill_cycle.get("interp_state") == 1
-            results.append({"controller": "Mill", "action": "PathPilot checked", "detail": "PathPilot reports Idle." if mill_idle else "PathPilot is not idle; no helper restart was attempted."})
+            running_program = str(mill_cycle.get("program") or "").strip()
+            machine_pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+            expected_program = (machine_pallet.program_path or "").strip() if machine_pallet else ""
+            different_program_running = bool(
+                not mill_idle and running_program
+                and (not expected_program or PurePosixPath(running_program).name != PurePosixPath(expected_program).name)
+            )
+            if different_program_running:
+                results.append({
+                    "controller": "Mill",
+                    "action": "Different program running",
+                    "detail": f"PathPilot is running {running_program}. It does not match Mongo's expected program ({expected_program or 'none'}), so recovery left it untouched and continued with other services.",
+                })
+            else:
+                results.append({"controller": "Mill", "action": "PathPilot checked", "detail": "PathPilot reports Idle." if mill_idle else "PathPilot is not idle; no helper restart was attempted."})
         except CncTelemetryError as exc:
             mill_idle = False
+            different_program_running = False
             results.append({"controller": "Mill", "action": "PathPilot unavailable", "detail": str(exc)})
         if mill_status.get("connected") and not mill_stale:
             results.append({"controller": "Mill", "action": "Healthy", "detail": "Mill supervisor connection and telemetry are live."})
         else:
-            if not automation_idle or not mill_idle:
+            if different_program_running:
+                # A separately operated program is never stopped, reloaded, or
+                # used as a reason to block recovery of independent services.
+                pass
+            elif not automation_idle or not mill_idle:
                 results.append({"controller": "Mill", "action": "Deferred", "detail": "Mill supervisor is stale or disconnected; helper recovery waits for idle automation and an idle PathPilot interpreter."})
             else:
                 try:
@@ -3775,7 +4294,7 @@ def auto_recover_controller_connections(session: Session) -> dict[str, object]:
                         results.append({"controller": "Mill", "action": "Recovery pending", "detail": "The idle mill helper restart was requested; it has not reconnected yet."})
                 except CncTelemetryError as exc:
                     results.append({"controller": "Mill", "action": "Deferred", "detail": str(exc)})
-    else:
+    elif not mill_recovery_handled:
         results.append({"controller": "Mill", "action": "Skipped", "detail": "Mill supervisor recovery is not enabled and verified."})
 
     if any(item["action"] in {"Dashboard unavailable", "PathPilot unavailable", "Recovery pending"} for item in results):
@@ -3795,6 +4314,852 @@ def auto_recover_controller_connections(session: Session) -> dict[str, object]:
     return response
 
 
+_RECOVERY_ACTIVE_STATUSES = {"awaiting_safety", "running", "awaiting_restart", "ready", "handoff"}
+
+
+def _recovery_json(value: str, fallback):
+    try:
+        parsed = json.loads(value or "")
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if isinstance(parsed, type(fallback)) else fallback
+
+
+def _recovery_motion_options(motion: RobotMotion, pallet: Pallet | None) -> list[dict[str, str]]:
+    name = pallet.name if pallet else "The pallet"
+    options: list[dict[str, str]] = []
+    if motion.operation == "pick":
+        if motion.source_slot is not None:
+            options.append({"value": "source_pool", "label": f"{name} is still in pool slot {motion.source_slot}."})
+        options.append({"value": "robot_held", "label": f"The robot is holding {name}."})
+    elif motion.operation == "put":
+        options.append({"value": "robot_held", "label": f"The robot is still holding {name}."})
+        if motion.destination_slot is not None:
+            options.append({"value": "destination_pool", "label": f"{name} is in pool slot {motion.destination_slot}."})
+    elif motion.operation == "load_mill":
+        if motion.source_slot is not None:
+            options.append({"value": "source_pool", "label": f"{name} is still in pool slot {motion.source_slot}."})
+        options.append({"value": "robot_held", "label": f"The robot is holding {name}."})
+        options.append({"value": "machine", "label": f"{name} is physically loaded in the mill."})
+    elif motion.operation == "unload_mill":
+        options.append({"value": "machine", "label": f"{name} is still physically in the mill."})
+        options.append({"value": "robot_held", "label": f"The robot is holding {name}."})
+        if motion.destination_slot is not None:
+            options.append({"value": "destination_pool", "label": f"{name} is in pool slot {motion.destination_slot}."})
+    return options
+
+
+def _recovery_choice(
+    key: str,
+    title: str,
+    detail: str,
+    options: list[dict[str, str]],
+) -> dict[str, object]:
+    return {"type": "choice", "key": key, "title": title, "detail": detail, "options": options}
+
+
+def _recovery_instruction(key: str, title: str, detail: str) -> dict[str, object]:
+    return {"type": "instruction", "key": key, "title": title, "detail": detail}
+
+
+def _robot_recovery_command_guidance(reconciliation: dict[str, object]) -> dict[str, object]:
+    """Describe an uncertain supervisor command without exposing protocol jargon.
+
+    The sequence number is useful in diagnostics, but it gives an operator no
+    way to decide what to observe.  Recovery questions must name the physical
+    action (and pallet when known), then make it explicit when the command was
+    only an MPS/robot communication action with no possible robot motion.
+    """
+    operation = str(reconciliation.get("operation") or "").strip()
+    pallet_name = str(reconciliation.get("pallet_name") or "").strip()
+    actions = {
+        "pick": "pick a pallet from the pool",
+        "pick_pool": "pick a pallet from the pool",
+        "put": "place a pallet in the pool",
+        "put_pool": "place a pallet in the pool",
+        "load": "load a pallet into the mill",
+        "load_mill": "load a pallet into the mill",
+        "unload": "unload a pallet from the mill",
+        "unload_mill": "unload a pallet from the mill",
+        "align_pallet_pick": "move to the pallet-pick alignment position",
+    }
+    no_motion_actions = {
+        "bootstrap_restart": "restart the Mongo supervisor connection",
+        "clear_latch": "clear the Mongo supervisor communication latch",
+        "clear_link_loss_latch": "clear the Mongo connection-loss latch",
+        "enter_maintenance": "enter robot maintenance mode",
+        "set_output": "change a robot output signal",
+    }
+    if operation in no_motion_actions:
+        action = no_motion_actions[operation]
+        return _recovery_choice(
+            "robot_command",
+            "Confirm the Mongo connection action",
+            f"MPS did not receive confirmation that it could {action}. This action does not move the robot or a pallet.",
+            [
+                {"value": "accept_completed", "label": "It completed — continue."},
+                {"value": "mark_faulted", "label": "It did not complete — record the issue."},
+            ],
+        )
+
+    action = actions.get(operation, "perform the last requested robot action")
+    pallet = f" for pallet {pallet_name}" if pallet_name else ""
+    return _recovery_choice(
+        "robot_command",
+        "Check the last robot action",
+        f"MPS did not receive completion confirmation after telling the robot to {action}{pallet}. Look at the cell before choosing. This choice records what already happened; it will not move or retry the robot.",
+        [
+            {"value": "accept_completed", "label": "The action finished — continue."},
+            {"value": "mark_faulted", "label": "The action did not finish — record the issue."},
+        ],
+    )
+
+
+def _mill_recovery_command_guidance(reconciliation: dict[str, object]) -> dict[str, object]:
+    operation = str(reconciliation.get("operation") or "").strip()
+    actions = {
+        "run_program": "run the selected CNC program",
+        "load_program": "load the selected CNC program",
+        "stop": "stop the CNC program",
+        "reset": "reset PathPilot",
+    }
+    action = actions.get(operation, "perform the last requested mill action")
+    return _recovery_choice(
+        "mill_command",
+        "Check the last mill action",
+        f"MPS did not receive completion confirmation after asking PathPilot to {action}. Inspect PathPilot and the workpiece before choosing. This only records what already happened; it will not rerun a program.",
+        [
+            {"value": "accept_completed", "label": "The action finished — continue."},
+            {"value": "mark_faulted", "label": "The action did not finish — record the issue."},
+        ],
+    )
+
+
+def _recovery_observe(session: Session) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Collect recovery facts without issuing motion or controller commands."""
+    settings = get_settings(session)
+    faults: list[dict[str, object]] = []
+    motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(
+        ("requested", "running", "faulted")
+    )))
+    if motion:
+        pallet = session.get(Pallet, motion.pallet_id)
+        motion_options = _recovery_motion_options(motion, pallet) if motion.status == "faulted" else []
+        motion_guidance = (
+            _recovery_choice(
+                "robot_motion",
+                f"Where is {pallet.name if pallet else 'the pallet'} physically now?",
+                "Select only the location you directly verified. This updates the ledger and does not move the robot.",
+                motion_options,
+            )
+            if motion_options
+            else _recovery_instruction(
+                "active_robot_motion",
+                "Wait for the active robot movement to settle",
+                "Request a Run Mode stop if offered, then wait until the current atomic movement completes or faults. Recovery will not interrupt it mid-motion.",
+            )
+        )
+        faults.append({
+            "code": "active_or_faulted_motion",
+            "severity": "handoff",
+            "title": "Robot pallet movement needs physical reconciliation",
+            "detail": f"{motion.operation} for {motion.pallet_id} is {motion.status}. The wizard will not guess its physical result.",
+            "motion_id": motion.id,
+            "operation": motion.operation,
+            "pallet_name": pallet.name if pallet else None,
+            "board_location": pallet.location if pallet else None,
+            "options": motion_options,
+            "guidance": motion_guidance,
+        })
+    machine_pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+    if settings.run_mode_enabled:
+        faults.append({
+            "code": "run_mode_active",
+            "severity": "handoff",
+            "title": "Run Mode is active",
+            "detail": "Stop or physically verify the current operation before recovery can continue.",
+            "guidance": _recovery_choice(
+                "run_mode",
+                "Stop automated production safely?",
+                "This prevents another automated step from starting. It does not abort a mill program or interrupt an atomic robot movement already in progress.",
+                [{"value": "request_stop", "label": "Request a safe Run Mode stop."}],
+            ),
+        })
+    if settings.run_mode_state in {"faulted", "interrupted", "stopping"}:
+        run_guidance = None
+        if machine_pallet:
+            run_guidance = _recovery_choice(
+                "run_mode_fault",
+                f"Leave {machine_pallet.name} recorded in the mill and stop the scheduler?",
+                "Use this after physically verifying the pallet remains in the mill. No robot or mill motion will be commanded.",
+                [{"value": "stop_keep_machine", "label": "Stop Run Mode and keep the pallet recorded in the mill."}],
+            )
+        faults.append({
+            "code": "run_mode_fault",
+            "severity": "handoff" if machine_pallet else "recoverable",
+            "title": "Run Mode needs attention",
+            "detail": settings.run_mode_detail or f"Run Mode is {settings.run_mode_state}.",
+            "guidance": run_guidance,
+        })
+
+    robot_status = robot_supervisor_status(session)
+    robot_configured = settings.robot_connection_mode == "physical" and bool(settings.robot_host.strip())
+    robot_enabled = settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified
+    if robot_configured and robot_status.get("reconciliation_required"):
+        robot_reconciliation = robot_status.get("reconciliation") or {}
+        robot_guidance = (
+            _robot_recovery_command_guidance(robot_reconciliation)
+            if robot_reconciliation.get("sequence") and not motion
+            else None
+        )
+        if not robot_guidance and not motion:
+            robot_guidance = _recovery_instruction(
+                "robot_sequence_mismatch",
+                "Robot command sequences do not agree",
+                "Keep the robot stopped. Inspect the latest backend and controller sequence records; automatic recovery will not invent or discard a command.",
+            )
+        faults.append({
+            "code": "robot_reconciliation_required",
+            "severity": "handoff",
+            "title": "Robot command result is uncertain",
+            "detail": "Inspect the cell and reconcile the pallet location before clearing the supervisor latch.",
+            "guidance": robot_guidance,
+        })
+    if robot_configured and not robot_status.get("connected"):
+        faults.append({
+            "code": "robot_supervisor_disconnected",
+            "severity": "recoverable",
+            "title": "Robot supervisor is disconnected",
+            "detail": str(robot_status.get("last_disconnect_detail") or "The robot listener has no live controller session."),
+            "guidance": _recovery_instruction(
+                "robot_connectivity",
+                "Restore robot controller connectivity",
+                "Verify Mongo is powered on, its Ethernet cable and switch link are active, the configured IP is correct, and the Windows firewall permits the supervisor connection. Then retry.",
+            ),
+        })
+    if robot_configured and not robot_enabled:
+        faults.append({
+            "code": "robot_supervisor_activation_required",
+            "severity": "recoverable",
+            "title": "Robot supervisor needs activation recovery",
+            "detail": "The robot is configured, but its local supervisor is disabled or not yet verified. Recovery will restore the no-motion connection without changing the configured routing setting.",
+            "guidance": _recovery_instruction(
+                "robot_activation",
+                "Verify the robot can accept its no-motion supervisor",
+                "Keep the robot idle, stop any controller program, and verify the configured robot address. Recovery will redeploy and verify the supervisor without commanding motion.",
+            ),
+        })
+
+    mill_status = mill_supervisor_status(session)
+    mill_configured = bool(
+        settings.cnc_telemetry_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    )
+    mill_enabled = settings.mill_supervisor_enabled and settings.mill_supervisor_activation_verified
+    if mill_configured and mill_status.get("reconciliation_required"):
+        mill_reconciliation = mill_status.get("reconciliation") or {}
+        mill_guidance = (
+            _mill_recovery_command_guidance(mill_reconciliation)
+            if mill_reconciliation.get("sequence")
+            else _recovery_instruction(
+                "mill_sequence_mismatch",
+                "Mill command sequences do not agree",
+                "Keep PathPilot idle. Inspect the latest backend and helper sequence records; automatic recovery will not invent or discard a command.",
+            )
+        )
+        faults.append({
+            "code": "mill_reconciliation_required",
+            "severity": "handoff",
+            "title": "Mill supervisor command state needs reconciliation",
+            "detail": "Inspect the mill and reconcile the last command before another command is allowed.",
+            "guidance": mill_guidance,
+        })
+    if mill_configured and not mill_status.get("connected"):
+        faults.append({
+            "code": "mill_supervisor_disconnected",
+            "severity": "recoverable",
+            "title": "Mill supervisor is disconnected",
+            "detail": str(mill_status.get("last_disconnect_detail") or "The mill helper has no live session."),
+            "guidance": _recovery_instruction(
+                "mill_connectivity",
+                "Restore PathPilot connectivity",
+                "Verify the mill is powered on, PathPilot is running and Idle, Ethernet is connected, and the configured SSH address and credentials are correct. Then retry.",
+            ),
+        })
+    if mill_configured and not mill_enabled:
+        faults.append({
+            "code": "mill_supervisor_activation_required",
+            "severity": "recoverable",
+            "title": "Mill supervisor needs activation recovery",
+            "detail": "PathPilot is configured, but its local supervisor is disabled or not yet verified. Recovery will restore the no-motion telemetry connection and reapply the saved routing setting only after an idle handshake.",
+            "guidance": _recovery_instruction(
+                "mill_activation",
+                "Verify PathPilot is idle for helper recovery",
+                "Leave PathPilot at an Idle interpreter state and verify its SSH settings. Recovery will restart only the telemetry helper and will not start a CNC program.",
+            ),
+        })
+
+    services = [
+        {
+            "name": "MPS backend",
+            "state": "online",
+            "enabled": True,
+            "connected": True,
+        },
+        {
+            "name": "Robot supervisor",
+            "state": "connected" if robot_status.get("connected") else "activation required" if robot_configured and not robot_enabled else "disconnected",
+            "enabled": robot_configured,
+            "connected": bool(robot_status.get("connected")) if robot_configured else None,
+        },
+        {
+            "name": "Mill supervisor",
+            "state": "connected" if mill_status.get("connected") else "activation required" if mill_configured and not mill_enabled else "disconnected",
+            "enabled": mill_configured,
+            "connected": bool(mill_status.get("connected")) if mill_configured else None,
+        },
+        {
+            "name": "Robot transport",
+            "state": "configured" if settings.robot_connection_mode == "physical" else "simulated",
+            "enabled": settings.robot_connection_mode == "physical",
+            "connected": None,
+        },
+        {
+            "name": "CNC telemetry",
+            "state": "configured" if settings.cnc_telemetry_enabled else "disabled",
+            "enabled": bool(settings.cnc_telemetry_enabled),
+            "connected": None,
+        },
+    ]
+    return faults, services
+
+
+def _recovery_snapshot(session: Session, recovery: RecoverySession | None) -> dict[str, object]:
+    faults, services = _recovery_observe(session)
+    guidance = [item["guidance"] for item in faults if item.get("guidance")]
+    if not recovery:
+        return {
+            "active": False,
+            "session": None,
+            "faults": faults,
+            "services": services,
+            "guidance": guidance,
+        }
+    if recovery.status == "handoff" and not guidance:
+        guidance.append(_recovery_instruction(
+            "current_recovery_condition",
+            "Complete the reported controller or physical check",
+            recovery.message or "Correct the displayed condition, then ask recovery to recheck every service.",
+        ))
+    return {
+        "active": recovery.status in _RECOVERY_ACTIVE_STATUSES,
+        "session": {
+            "id": recovery.id,
+            "status": recovery.status,
+            "step": recovery.step,
+            "answers": _recovery_json(recovery.answers_json, {}),
+            "faults": _recovery_json(recovery.faults_json, []),
+            "actions": _recovery_json(recovery.actions_json, []),
+            "message": recovery.message,
+            "created_at": recovery.created_at,
+            "updated_at": recovery.updated_at,
+        },
+        "faults": faults,
+        "services": services,
+        "guidance": guidance,
+    }
+
+
+def recovery_status(session: Session) -> dict[str, object]:
+    recovery = session.scalar(
+        select(RecoverySession)
+        .where(RecoverySession.status.in_(_RECOVERY_ACTIVE_STATUSES))
+        .order_by(RecoverySession.updated_at.desc())
+    )
+    if not recovery:
+        # Preserve the most recent success for the Debug page after a refresh.
+        # A new recovery still creates a fresh active session, so this history
+        # item can never block or alter the next recovery attempt.
+        recovery = session.scalar(
+            select(RecoverySession)
+            .where(RecoverySession.status == "completed")
+            .order_by(RecoverySession.updated_at.desc())
+        )
+    return _recovery_snapshot(session, recovery)
+
+
+def start_system_recovery(session: Session) -> dict[str, object]:
+    existing = session.scalar(
+        select(RecoverySession)
+        .where(RecoverySession.status.in_(_RECOVERY_ACTIVE_STATUSES))
+        .order_by(RecoverySession.updated_at.desc())
+    )
+    if existing:
+        return _recovery_snapshot(session, existing)
+    now = datetime.now(timezone.utc).isoformat()
+    faults, _services = _recovery_observe(session)
+    recovery = RecoverySession(
+        id=str(uuid4()),
+        status="awaiting_safety",
+        step="safety",
+        faults_json=json.dumps(faults, separators=(",", ":")),
+        message="Inspect the cell. Confirm that no person is exposed to motion and no robot or mill movement is active.",
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(recovery)
+    session.commit()
+    diagnostics().record(
+        "recovery",
+        "started",
+        "Guided system recovery started.",
+        severity="warning",
+        details={"session_id": recovery.id, "faults": faults},
+    )
+    return _recovery_snapshot(session, recovery)
+
+
+def _save_recovery(
+    session: Session,
+    recovery: RecoverySession,
+    *,
+    status: str | None = None,
+    step: str | None = None,
+    message: str | None = None,
+    answers: dict[str, bool] | None = None,
+    actions: list[dict[str, object]] | None = None,
+) -> None:
+    if status is not None:
+        recovery.status = status
+    if step is not None:
+        recovery.step = step
+    if message is not None:
+        recovery.message = message[:1000]
+    if answers is not None:
+        recovery.answers_json = json.dumps(answers, separators=(",", ":"))
+    if actions is not None:
+        recovery.actions_json = json.dumps(actions, separators=(",", ":"))
+    recovery.updated_at = datetime.now(timezone.utc).isoformat()
+    session.commit()
+
+
+def _supervisor_operation_completed(operation: str, resolution: str) -> bool:
+    return {
+        "pick_pool": resolution in {"robot_held", "machine", "destination_pool"},
+        "put_pool": resolution == "destination_pool",
+        "load_mill": resolution == "machine",
+        "unload_mill": resolution in {"robot_held", "destination_pool"},
+    }.get(operation, False)
+
+
+def _reconcile_recovery_motion(
+    session: Session,
+    resolution: str,
+) -> list[dict[str, object]]:
+    motion = session.scalar(select(RobotMotion).where(RobotMotion.status == "faulted"))
+    if not motion:
+        raise problem(409, "No faulted pallet movement is available for physical reconciliation.")
+    supervisor_before = robot_supervisor_status(session)
+    reconciliation = supervisor_before.get("reconciliation") or {}
+    settings = get_settings(session)
+    recover_pallet_motion(
+        session,
+        motion.id,
+        RecoverPalletMotion(expected_revision=settings.revision, resolution=resolution),
+    )
+    actions: list[dict[str, object]] = [{
+        "controller": "Pallet ledger",
+        "action": "Reconciled",
+        "detail": f"Recorded the observed physical result as {resolution.replace('_', ' ')}.",
+    }]
+    if reconciliation.get("motion_id") != motion.id or not reconciliation.get("sequence"):
+        return actions
+
+    command_resolution = (
+        "accept_completed"
+        if _supervisor_operation_completed(str(reconciliation.get("operation") or ""), resolution)
+        else "mark_faulted"
+    )
+    settings = get_settings(session)
+    reconcile_robot_supervisor(
+        session,
+        SupervisorReconcile(
+            expected_revision=settings.revision,
+            sequence=int(reconciliation["sequence"]),
+            resolution=command_resolution,
+        ),
+    )
+    actions.append({
+        "controller": "Mongo supervisor",
+        "action": "Command reconciled",
+        "detail": "Recorded the uncertain robot command as physically completed." if command_resolution == "accept_completed" else "Recorded the uncertain robot command as not physically completed.",
+    })
+    supervisor_after = robot_supervisor_status(session)
+    if supervisor_after.get("latched"):
+        settings = get_settings(session)
+        reconcile_robot_supervisor(
+            session,
+            SupervisorReconcile(
+                expected_revision=settings.revision,
+                sequence=int(reconciliation["sequence"]),
+                resolution="clear_latch",
+            ),
+        )
+        actions.append({
+            "controller": "Mongo supervisor",
+            "action": "Latch cleared",
+            "detail": "Cleared the reconciled supervisor latch without moving the robot.",
+        })
+    return actions
+
+
+def _reconcile_recovery_robot_command(
+    session: Session,
+    resolution: str,
+) -> list[dict[str, object]]:
+    if resolution not in {"accept_completed", "mark_faulted"}:
+        raise problem(422, "Choose whether the observed robot command completed or did not complete.")
+    status = robot_supervisor_status(session)
+    reconciliation = status.get("reconciliation") or {}
+    sequence = reconciliation.get("sequence")
+    if not sequence:
+        raise problem(409, "The robot has no uncertain command that can be safely reconciled automatically.")
+    settings = get_settings(session)
+    reconcile_robot_supervisor(
+        session,
+        SupervisorReconcile(
+            expected_revision=settings.revision,
+            sequence=int(sequence),
+            resolution=resolution,
+        ),
+    )
+    actions: list[dict[str, object]] = [{
+        "controller": "Mongo supervisor",
+        "action": "Command reconciled",
+        "detail": "Recorded the operator-observed result without resending the robot command.",
+    }]
+    refreshed = robot_supervisor_status(session)
+    if refreshed.get("latched"):
+        settings = get_settings(session)
+        reconcile_robot_supervisor(
+            session,
+            SupervisorReconcile(
+                expected_revision=settings.revision,
+                sequence=int(sequence),
+                resolution="clear_latch",
+            ),
+        )
+        actions.append({
+            "controller": "Mongo supervisor",
+            "action": "Latch cleared",
+            "detail": "Cleared the reconciled application latch without moving the robot.",
+        })
+    return actions
+
+
+def _reconcile_recovery_mill_command(
+    session: Session,
+    resolution: str,
+) -> list[dict[str, object]]:
+    if resolution not in {"accept_completed", "mark_faulted"}:
+        raise problem(422, "Choose whether the observed mill command completed or did not complete.")
+    status = mill_supervisor_status(session)
+    reconciliation = status.get("reconciliation") or {}
+    sequence = reconciliation.get("sequence")
+    if not sequence:
+        raise problem(409, "The mill has no uncertain command that can be safely reconciled automatically.")
+    settings = get_settings(session)
+    reconcile_mill_supervisor_command(
+        session,
+        MillSupervisorReconcile(
+            expected_revision=settings.revision,
+            sequence=int(sequence),
+            resolution=resolution,
+        ),
+    )
+    return [{
+        "controller": "Mill supervisor",
+        "action": "Command reconciled",
+        "detail": "Recorded the operator-observed PathPilot result without rerunning the command.",
+    }]
+
+
+def _rebuild_generated_programs_for_recovery(
+    session: Session,
+    actions: list[dict[str, object]],
+    progress,
+) -> None:
+    """Deploy only MPS-generated controller programs after recovery is safely idle."""
+    settings = get_settings(session)
+    if settings.robot_connection_mode == "physical" and settings.robot_host.strip():
+        progress("Rebuilding generated Mongo pallet programs.", [])
+        rebuilt = rebuild_pallet_motion_scripts(session)
+        actions.append({
+            "controller": "Mongo",
+            "action": "Programs rebuilt",
+            "detail": f"Deployed {len(rebuilt['files'])} generated pallet and supervisor programs.",
+        })
+        progress("Restarting Mongo with the rebuilt supervisor program.", [])
+        supervisor = bootstrap_robot_supervisor(session)
+        if not supervisor.get("connected"):
+            raise problem(504, "Mongo did not reconnect after its rebuilt supervisor program was started.")
+        actions.append({
+            "controller": "Mongo",
+            "action": "Supervisor restarted",
+            "detail": "Restarted the no-motion supervisor so it uses the rebuilt program.",
+        })
+    else:
+        actions.append({
+            "controller": "Mongo",
+            "action": "Programs skipped",
+            "detail": "Mongo is not configured for physical control; no robot program was deployed.",
+        })
+
+    settings = get_settings(session)
+    if settings.cnc_host.strip():
+        progress("Rebuilding the generated PathPilot loading program.", [])
+        rebuilt_mill = rebuild_mill_load_position_program(session, settings.revision)
+        actions.append({
+            "controller": "Mill",
+            "action": "Program rebuilt",
+            "detail": f"Uploaded {rebuilt_mill['filename']} to PathPilot.",
+        })
+    else:
+        actions.append({
+            "controller": "Mill",
+            "action": "Program skipped",
+            "detail": "PathPilot is not configured; no mill program was deployed.",
+        })
+
+
+def answer_system_recovery(session: Session, payload: RecoveryAnswer) -> dict[str, object]:
+    recovery = session.get(RecoverySession, payload.session_id)
+    if not recovery or recovery.status not in _RECOVERY_ACTIVE_STATUSES:
+        raise problem(409, "That recovery session is no longer active. Refresh the Dashboard.")
+    answers = _recovery_json(recovery.answers_json, {})
+    answers.update({key: bool(value) for key, value in payload.answers.items()})
+
+    if recovery.status == "awaiting_safety":
+        if not answers.get("cell_clear"):
+            raise problem(422, "Confirm that the cell is clear before recovery can touch controller connections.")
+        faults, _services = _recovery_observe(session)
+        if any(item["severity"] == "handoff" for item in faults):
+            _save_recovery(
+                session,
+                recovery,
+                status="handoff",
+                step="physical_intervention",
+                message="Physical inspection or pallet-location reconciliation is required before software recovery can continue.",
+                answers=answers,
+            )
+            return _recovery_snapshot(session, recovery)
+        _save_recovery(
+            session,
+            recovery,
+            status="running",
+            step="services",
+            message="Resetting local connections and restarting enabled supervisors.",
+            answers=answers,
+        )
+
+    elif recovery.status == "handoff":
+        faults, _services = _recovery_observe(session)
+        choices = dict(payload.choices)
+        if payload.resolution and "robot_motion" not in choices:
+            choices["robot_motion"] = payload.resolution
+        recovery_actions = _recovery_json(recovery.actions_json, [])
+        handled = False
+
+        run_active = next((item for item in faults if item.get("code") == "run_mode_active"), None)
+        if run_active:
+            if choices.get("run_mode") != "request_stop":
+                _save_recovery(session, recovery, message="Choose the guided safe-stop option before recovery continues.", answers=answers)
+                return _recovery_snapshot(session, recovery)
+            settings = get_settings(session)
+            stop_run_mode(session, settings.revision)
+            recovery_actions.append({
+                "controller": "Run Mode",
+                "action": "Safe stop requested",
+                "detail": "No subsequent automated step may start; an operation already in progress was not aborted.",
+            })
+            handled = True
+            if not session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running")))) and not session.scalar(select(Pallet).where(Pallet.location == "machine")):
+                settings = get_settings(session)
+                cancel_run_mode_recovery(session, settings.revision)
+            faults, _services = _recovery_observe(session)
+
+        run_fault = next((item for item in faults if item.get("code") == "run_mode_fault" and item.get("severity") == "handoff"), None)
+        if run_fault and choices.get("run_mode_fault") == "stop_keep_machine":
+            settings = get_settings(session)
+            cancel_run_mode_recovery(session, settings.revision)
+            recovery_actions.append({
+                "controller": "Run Mode",
+                "action": "Scheduler stopped",
+                "detail": "Stopped automated scheduling while preserving the pallet's recorded mill location.",
+            })
+            handled = True
+            faults, _services = _recovery_observe(session)
+
+        motion_fault = next((item for item in faults if item.get("code") == "active_or_faulted_motion"), None)
+        if motion_fault and motion_fault.get("options"):
+            motion_resolution = choices.get("robot_motion")
+            if not motion_resolution:
+                _save_recovery(
+                    session,
+                    recovery,
+                    message="Select the pallet's observed physical location before recovery can clear the uncertain movement record.",
+                    answers=answers,
+                    actions=recovery_actions,
+                )
+                return _recovery_snapshot(session, recovery)
+            recovery_actions.extend(_reconcile_recovery_motion(session, motion_resolution))
+            handled = True
+            faults, _services = _recovery_observe(session)
+
+        robot_fault = next((item for item in faults if item.get("code") == "robot_reconciliation_required"), None)
+        if robot_fault and (robot_fault.get("guidance") or {}).get("type") == "choice":
+            robot_resolution = choices.get("robot_command")
+            if not robot_resolution:
+                _save_recovery(session, recovery, message="Check the last robot action and record whether it finished.", answers=answers, actions=recovery_actions)
+                return _recovery_snapshot(session, recovery)
+            recovery_actions.extend(_reconcile_recovery_robot_command(session, robot_resolution))
+            handled = True
+            faults, _services = _recovery_observe(session)
+
+        mill_fault = next((item for item in faults if item.get("code") == "mill_reconciliation_required"), None)
+        if mill_fault and (mill_fault.get("guidance") or {}).get("type") == "choice":
+            mill_resolution = choices.get("mill_command")
+            if not mill_resolution:
+                _save_recovery(session, recovery, message="Check the last mill action and record whether it finished.", answers=answers, actions=recovery_actions)
+                return _recovery_snapshot(session, recovery)
+            recovery_actions.extend(_reconcile_recovery_mill_command(session, mill_resolution))
+            handled = True
+            faults, _services = _recovery_observe(session)
+
+        if handled:
+            _save_recovery(
+                session,
+                recovery,
+                message="Guided recovery choice recorded. Rechecking every controller and service.",
+                answers=answers,
+                actions=recovery_actions,
+            )
+        elif not answers.get("retry"):
+            raise problem(422, "Complete the displayed physical checks and acknowledge retry before recovery continues.")
+        if any(item["severity"] == "handoff" for item in faults):
+            recovery.answers_json = json.dumps(answers, separators=(",", ":"))
+            recovery.actions_json = json.dumps(recovery_actions, separators=(",", ":"))
+            recovery.updated_at = datetime.now(timezone.utc).isoformat()
+            session.commit()
+            return _recovery_snapshot(session, recovery)
+        _save_recovery(session, recovery, status="running", step="services", message="Retrying software recovery.", answers=answers)
+
+    elif recovery.status == "ready":
+        if not answers.get("final_approval"):
+            raise problem(422, "Final approval is required before marking the system ready.")
+        _save_recovery(
+            session,
+            recovery,
+            status="completed",
+            step="complete",
+            message="Recovery completed. The system is ready for a separate operator-controlled production start.",
+            answers=answers,
+        )
+        diagnostics().record("recovery", "completed", recovery.message, details={"session_id": recovery.id})
+        return _recovery_snapshot(session, recovery)
+
+    actions = _recovery_json(recovery.actions_json, [])
+    try:
+        faults, _services = _recovery_observe(session)
+        if any(item["severity"] == "handoff" for item in faults):
+            _save_recovery(session, recovery, status="handoff", step="physical_intervention", message="A physical operation became active while recovery was running.", answers=answers, actions=actions)
+            return _recovery_snapshot(session, recovery)
+
+        settings = get_settings(session)
+        if settings.robot_connection_mode == "physical":
+            reset_robot_connections()
+            actions.append({"controller": "Robot", "action": "Transport reset", "detail": "Cleared local robot connection caches and reconnect cooldowns."})
+
+        def recovery_progress(message: str, service_results: list[dict[str, object]]) -> None:
+            _save_recovery(
+                session,
+                recovery,
+                status="running",
+                step="services",
+                message=message,
+                answers=answers,
+                actions=actions + list(service_results),
+            )
+
+        controller_result = auto_recover_controller_connections(session, progress=recovery_progress)
+        current_results = controller_result.get("results", [])
+        actions.extend(current_results)
+        if controller_result.get("reconciliation"):
+            _save_recovery(
+                session,
+                recovery,
+                status="handoff",
+                step="physical_intervention",
+                message="The robot reported an uncertain command result. Reconcile the physical pallet location before continuing.",
+                answers=answers,
+                actions=actions,
+            )
+            return _recovery_snapshot(session, recovery)
+
+        settings = get_settings(session)
+        if settings.robot_connection_mode == "physical" and settings.robot_host.strip():
+            result = clear_robot_controller_fault(
+                session,
+                ClearRobotFault(expected_revision=settings.revision, confirmed=True),
+            )
+            actions.append({"controller": "Robot", "action": result.get("action", "Fault check"), "detail": result.get("message", "Robot fault check completed.")})
+
+        blocking_actions = [item for item in current_results if item.get("action") in {"Deferred", "Dashboard unavailable", "PathPilot unavailable", "Recovery pending"}]
+        faults, _services = _recovery_observe(session)
+        blocking_faults = [item for item in faults if item["severity"] == "handoff"]
+        if blocking_actions or blocking_faults:
+            _save_recovery(
+                session,
+                recovery,
+                status="handoff",
+                step="physical_intervention" if blocking_faults else "services",
+                message="Recovery could not establish every required service. Review the action results and correct the reported condition before retrying.",
+                answers=answers,
+                actions=actions,
+            )
+            return _recovery_snapshot(session, recovery)
+
+        _rebuild_generated_programs_for_recovery(session, actions, recovery_progress)
+
+        _save_recovery(
+            session,
+            recovery,
+            status="ready",
+            step="final_approval",
+            message="Software recovery completed. Review the service results, then approve the final ready state.",
+            answers=answers,
+            actions=actions,
+        )
+        diagnostics().record("recovery", "ready", recovery.message, details={"session_id": recovery.id, "actions": actions})
+        return _recovery_snapshot(session, recovery)
+    except (HTTPException, RobotTelemetryError, RobotDashboardError, CncTelemetryError, RobotFileAccessError) as exc:
+        detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+        actions.append({"controller": "Recovery", "action": "Handoff required", "detail": detail})
+        _save_recovery(session, recovery, status="handoff", step="physical_intervention", message=detail, answers=answers, actions=actions)
+        return _recovery_snapshot(session, recovery)
+
+
+def cancel_system_recovery(session: Session, session_id: str) -> dict[str, object]:
+    recovery = session.get(RecoverySession, session_id)
+    if not recovery or recovery.status not in _RECOVERY_ACTIVE_STATUSES:
+        raise problem(409, "That recovery session is no longer active.")
+    _save_recovery(session, recovery, status="cancelled", step="cancelled", message="Operator cancelled guided system recovery.")
+    diagnostics().record("recovery", "cancelled", recovery.message, severity="warning", details={"session_id": recovery.id})
+    return _recovery_snapshot(session, recovery)
+
+
 def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
     """Heal an idle stale socket without ever touching controller motion."""
     global _SUPERVISOR_RECOVERY_THREAD
@@ -3810,18 +5175,26 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
             try:
                 with session_factory() as session:
                     status = robot_supervisor().status()
+                    settings = get_settings(session)
                     listener_age = float(status.get("listener_age_seconds") or 0)
                     if status.get("connected"):
+                        listener_recovery_count = 0
+                        continue
+                    if pause_run_mode_for_manual_robot_control(session):
+                        # The mill owns its active cycle. Do not restart Mongo
+                        # while an operator is teaching it by hand.
                         listener_recovery_count = 0
                         continue
                     now = time.monotonic()
                     if not status.get("listening") or listener_age < _SUPERVISOR_RECOVERY_GRACE_SECONDS:
                         continue
-                    # A listener reset cannot help when the controller-side
-                    # script is absent. After two bounded retries, restore it
-                    # only when Dashboard proves no operator program is loaded.
+                    # A listener reset cannot revive a supervisor program that
+                    # PolyScope stopped for manual jogging. After one bounded
+                    # listener retry, restart only when Dashboard proves that
+                    # no operator program is selected (or Mongo's own stopped
+                    # supervisor remains selected).
                     if (
-                        listener_recovery_count >= 2
+                        listener_recovery_count >= 1
                         and now - last_program_recovery >= _SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS
                     ):
                         try:
@@ -3929,19 +5302,33 @@ def robot_supervisor_status(session: Session) -> dict[str, object]:
         status.get("connected")
         and expected_sequence > 0
         and latest_expected
+        # A prior controller session is safe to accept once its final command
+        # has already been reconciled. Only an unresolved command can make a
+        # new robot session physically ambiguous.
+        and terminal_uncertain
         and latest_expected.robot_session is not None
         and latest_expected.robot_session != status.get("robot_session")
+    )
+    active_motion = session.scalar(select(RobotMotion.id).where(RobotMotion.status.in_(("requested", "running"))))
+    reconciliation_required = bool(
+        status.get("latched")
+        or session_mismatch
+        or (status.get("connected") and robot_sequence is not None and robot_sequence != expected_sequence)
+        or terminal_uncertain
     )
     status.update({
         "enabled": settings.robot_supervisor_enabled,
         "activation_verified": settings.robot_supervisor_activation_verified,
         "maintenance_mode": settings.robot_supervisor_maintenance_mode,
         "expected_sequence": expected_sequence,
-        "reconciliation_required": bool(
-            status.get("latched")
-            or session_mismatch
-            or (status.get("connected") and robot_sequence is not None and robot_sequence != expected_sequence)
-            or terminal_uncertain
+        "reconciliation_required": reconciliation_required,
+        "manual_reconnect_available": bool(
+            not status.get("connected")
+            and settings.robot_supervisor_enabled
+            and settings.robot_supervisor_activation_verified
+            and not reconciliation_required
+            and active_motion is None
+            and (not settings.run_mode_enabled or _run_mode_allows_robot_reconnect(settings))
         ),
         "session_mismatch": session_mismatch,
         "pre_dispatch_fallback": settings.robot_supervisor_pre_dispatch_fallback,
@@ -3974,12 +5361,23 @@ def robot_supervisor_status_document() -> dict[str, object]:
     return robot_supervisor().status_document()
 
 
-def bootstrap_robot_supervisor(session: Session) -> dict[str, object]:
+def bootstrap_robot_supervisor(
+    session: Session,
+    *,
+    allow_run_mode_manual_pause: bool = False,
+    allow_run_mode_paused: bool = False,
+) -> dict[str, object]:
     settings = get_settings(session)
     if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
         raise problem(409, "Configure a physical Mongo controller before bootstrapping its supervisor.")
     active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
-    if settings.run_mode_enabled or active_motion:
+    if active_motion or (
+        settings.run_mode_enabled
+        and not (
+            (allow_run_mode_manual_pause and settings.run_mode_manual_robot_pause)
+            or (allow_run_mode_paused and _run_mode_allows_robot_reconnect(settings))
+        )
+    ):
         raise problem(409, "Stop Run Mode and resolve all pallet movements before bootstrapping the supervisor.")
     restore_enabled_after_success = settings.robot_supervisor_enabled
     settings.robot_supervisor_enabled = False
@@ -4580,6 +5978,52 @@ def start_automatic_put_away(
     return motion_id, destination_slot
 
 
+def align_robot_for_pallet_pick(session: Session, expected_revision: int) -> dict[str, object]:
+    """Rotate the fork to the saved pallet orientation without translating the TCP."""
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    _assert_reliability_inactive(session)
+    if settings.run_mode_enabled:
+        raise problem(409, "Stop Run Mode before aligning the robot for pallet teaching.")
+    if _locked_motion(session):
+        raise problem(409, "Resolve or wait for the active robot pallet movement before aligning the robot.")
+    _assert_motion_ready(session, settings)
+
+    generation = pallet_motion_generation(settings)
+    orientation = [generation.get(axis) for axis in ("rx_rad", "ry_rad", "rz_rad")]
+    if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in orientation):
+        raise problem(422, "Set a finite pallet tool orientation before aligning the robot.")
+    if settings.robot_connection_mode == "simulated":
+        return {
+            "status": "simulated",
+            "message": "Simulated alignment accepted. No robot motion was commanded.",
+        }
+    if not settings.robot_supervisor_enabled or settings.robot_supervisor_maintenance_mode:
+        raise problem(409, "Enable the active Mongo supervisor before using pallet-pick alignment.")
+    if motion_scripts_need_rebuild(settings):
+        raise problem(409, "Rebuild generated robot scripts, then restart the Mongo supervisor before using pallet-pick alignment.")
+
+    command = _new_supervisor_command(
+        session,
+        motion=None,
+        operation="align_pallet_pick",
+        opcode=OP_ALIGN_PALLET_PICK,
+    )
+    outcome, detail = _dispatch_supervisor_command(
+        session,
+        command,
+        max(10.0, settings.robot_timeout_seconds * 12),
+        allow_pre_dispatch_fallback=False,
+    )
+    if outcome != "completed":
+        raise problem(409, detail or "The robot did not confirm pallet-pick alignment.")
+    return {
+        "status": "completed",
+        "sequence": command.sequence,
+        "message": "Fork aligned to the saved pallet tool orientation. The TCP position was not intentionally translated.",
+    }
+
+
 def run_debug_pallet_motion(session: Session, payload: RunDebugPalletMotion) -> dict[str, object]:
     """Dispatch one generated pallet script for cell setup without changing board state."""
     settings = get_settings(session)
@@ -5026,6 +6470,8 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                 _finish_motion(session, motion, False, "The pallet no longer exists.")
                 return
 
+            emit_pre_motion_alarm(session, motion.operation)
+
             mill_position_already_run = False
             if settings.robot_supervisor_enabled:
                 if motion.operation in {"load_mill", "unload_mill"} and MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path:
@@ -5253,6 +6699,7 @@ def _set_run_mode_status(
         settings.run_mode_return_slot = return_slot
     bump(settings)
     commit_or_conflict(session)
+    refresh_stack_light(session)
 
 
 def _finish_run_mode(session_factory, state: str, detail: str, run_token: str | None = None) -> None:
@@ -5266,11 +6713,14 @@ def _finish_run_mode(session_factory, state: str, detail: str, run_token: str | 
         settings.run_mode_pending_action = ""
         settings.run_mode_confirmation_token = ""
         settings.run_mode_confirmation_granted = False
+        settings.run_mode_manual_robot_pause = False
+        settings.run_mode_program_started_at = None
         settings.run_mode_start_request_id = ""
         settings.run_mode_current_pallet_id = None
         settings.run_mode_return_slot = None
         bump(settings)
         commit_or_conflict(session)
+        refresh_stack_light(session)
     diagnostics().record(
         "run_mode",
         state,
@@ -5290,6 +6740,8 @@ def interrupt_run_mode(session: Session) -> None:
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
+    settings.run_mode_manual_robot_pause = False
+    settings.run_mode_program_started_at = None
     settings.run_mode_start_request_id = ""
     bump(settings)
     commit_or_conflict(session)
@@ -5380,6 +6832,83 @@ def _run_mode_token_is_active(settings: AppSettings, run_token: str | None) -> b
     return settings.run_mode_enabled and (run_token is None or settings.run_mode_start_request_id == run_token)
 
 
+def pause_run_mode_for_manual_robot_control(session: Session) -> bool:
+    """Hold the next robot action after Mongo's supervisor is interrupted by manual control."""
+    settings = get_settings(session)
+    if (
+        not settings.run_mode_enabled
+        or settings.run_mode_manual_robot_pause
+        or settings.run_mode_state not in {"machining", "manual_robot_pause"}
+        or _locked_motion(session)
+    ):
+        return False
+    settings.run_mode_manual_robot_pause = True
+    settings.run_mode_state = "manual_robot_pause"
+    settings.run_mode_detail = (
+        "Manual robot control detected. The active mill program continues; MPS will not start another robot action. "
+        "Finish teaching, then choose Resume queue."
+    )
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record("run_mode", "manual_robot_pause", settings.run_mode_detail, severity="warning")
+    return True
+
+
+def _wait_for_manual_robot_pause(session_factory, run_token: str | None) -> bool:
+    """Never let a completed mill cycle advance to a robot action while teaching is active."""
+    while True:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if not _run_mode_token_is_active(settings, run_token):
+                return False
+            if not settings.run_mode_manual_robot_pause:
+                return True
+        time.sleep(0.25)
+
+
+def resume_run_mode_after_manual_robot_control(session: Session, expected_revision: int) -> None:
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    if not settings.run_mode_enabled or not settings.run_mode_manual_robot_pause:
+        raise problem(409, "Run Mode is not waiting for manual robot control.")
+    if _locked_motion(session):
+        raise problem(409, "Wait for the active robot movement to finish before resuming the queue.")
+    if settings.robot_connection_mode == "physical":
+        recover_robot_supervisor_program(
+            session,
+            trigger="manual-control-resume",
+            allow_run_mode_manual_pause=True,
+        )
+        settings = get_settings(session)
+        _assert_motion_ready(session, settings)
+    settings.run_mode_manual_robot_pause = False
+    settings.run_mode_state = "resuming"
+    settings.run_mode_detail = "Manual robot control ended. Run Mode is continuing safely."
+    bump(settings)
+    commit_or_conflict(session)
+
+
+def update_pool_locations_during_manual_robot_pause(session: Session, payload) -> None:
+    """Persist taught pool positions without changing scripts or dispatching motion."""
+    settings = get_settings(session)
+    check_revision(settings, payload.expected_revision)
+    if not settings.run_mode_enabled or not settings.run_mode_manual_robot_pause:
+        raise problem(409, "Pool locations can only be saved here while Run Mode is waiting for manual robot control.")
+    if _locked_motion(session):
+        raise problem(409, "Wait for the active robot movement to finish before saving pool locations.")
+    store_pallet_location_positions(
+        settings,
+        [item.model_dump() for item in payload.pool_locations],
+        None, None, None, None, None, None,
+    )
+    bump(settings)
+    commit_or_conflict(session)
+    diagnostics().record(
+        "settings", "pool_locations_taught_during_run",
+        "Saved pallet-pool locations while Run Mode was paused for manual robot control.",
+    )
+
+
 def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     settings = get_settings(session)
     request_id = payload.request_id or str(uuid4())
@@ -5398,8 +6927,6 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     queue = session.scalars(
         select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
     ).all()
-    if not queue:
-        raise problem(409, "Add at least one pallet to the production queue before starting run mode.")
     for pallet in queue:
         if pallet.location != "pool" or not pallet.pool_slot_number:
             raise problem(409, f"{pallet.name} must be in a pallet-pool position before run mode can start.")
@@ -5420,16 +6947,56 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     if payload.safety_confirm is not None:
         settings.run_mode_safety_confirm = payload.safety_confirm
     settings.run_mode_start_request_id = request_id
-    settings.run_mode_state = "start_requested"
-    settings.run_mode_detail = f"Start requested. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+    settings.run_mode_state = "start_requested" if queue else "idle_waiting_queue"
+    settings.run_mode_detail = (
+        f"Start requested. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+        if queue
+        else "Run Mode is armed and waiting for a pallet to be added to the production queue."
+    )
     settings.run_mode_current_pallet_id = None
     settings.run_mode_return_slot = None
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
+    settings.run_mode_program_started_at = None
+    settings.run_mode_manual_robot_pause = False
+    settings.run_mode_manual_robot_pause = False
     bump(settings)
     commit_or_conflict(session)
-    return request_id
+    refresh_stack_light(session)
+    return request_id if queue else None
+
+
+def resume_armed_run_mode(session: Session) -> str | None:
+    """Reserve one scheduler worker when an armed, idle queue becomes runnable."""
+    settings = get_settings(session)
+    if not settings.run_mode_enabled or settings.run_mode_state != "idle_waiting_queue":
+        return None
+    queue = session.scalars(
+        select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
+    ).all()
+    if not queue:
+        return None
+    not_ready = next((item for item in queue if (
+        item.location != "pool"
+        or not item.pool_slot_number
+        or not item.program_path
+        or item.content_status in {"complete_parts", "defective_parts"}
+    )), None)
+    if not_ready:
+        settings.run_mode_detail = (
+            f"Run Mode is armed, but {not_ready.name} still needs a pool position, an assigned program, and runnable stock status."
+        )
+        bump(settings)
+        commit_or_conflict(session)
+        refresh_stack_light(session)
+        return None
+    settings.run_mode_state = "resuming"
+    settings.run_mode_detail = f"Queue updated. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+    token = settings.run_mode_start_request_id
+    bump(settings)
+    commit_or_conflict(session)
+    return token or None
 
 
 def stop_run_mode(session: Session, expected_revision: int) -> None:
@@ -5446,8 +7013,10 @@ def stop_run_mode(session: Session, expected_revision: int) -> None:
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
+    settings.run_mode_manual_robot_pause = False
     bump(settings)
     commit_or_conflict(session)
+    refresh_stack_light(session)
     diagnostics().record(
         "run_mode",
         "stop_requested",
@@ -5466,6 +7035,7 @@ def cancel_run_mode_recovery(session: Session, expected_revision: int) -> None:
     settings.run_mode_pending_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
+    settings.run_mode_manual_robot_pause = False
     bump(settings)
     commit_or_conflict(session)
     diagnostics().record("run_mode", "recovery_cancelled", settings.run_mode_detail, severity="warning")
@@ -5495,6 +7065,8 @@ def confirm_run_mode_action(session: Session, payload: ConfirmRunModeAction) -> 
         settings.run_mode_pending_action = ""
         settings.run_mode_confirmation_token = ""
         settings.run_mode_confirmation_granted = False
+        settings.run_mode_manual_robot_pause = False
+        settings.run_mode_manual_robot_pause = False
     else:
         if settings.run_mode_pending_action in {"retry_cnc_program", "retry_cnc_preflight", "retry_robot_transfer"}:
             settings.machine_state = "idle"
@@ -6163,6 +7735,9 @@ def _run_mode_start_robot_transfer(
 
 
 def _run_mode_machine_cycle(session_factory, pallet_id: str, run_token: str | None = None) -> bool:
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
+    program_path = ""
     with session_factory() as session:
         settings = get_settings(session)
         if not _run_mode_token_is_active(settings, run_token):
@@ -6198,13 +7773,47 @@ def _run_mode_machine_cycle(session_factory, pallet_id: str, run_token: str | No
                 "previous_legacy_signature": legacy_status_before,
             }
         pallet_name = pallet.name
-    return _run_mode_cnc_cycle(
-        session_factory,
-        remote_program,
-        cycle_label=f"The assigned program for {pallet_name}",
-        run_token=run_token,
-        completion_status=completion_status,
-    )
+        program_path = pallet.program_path
+        # This timestamp drives the live dashboard countdown. It is set only
+        # after the pallet is in the mill and Run Mode has entered machining.
+        settings.run_mode_program_started_at = started_at.isoformat()
+        bump(settings)
+        commit_or_conflict(session)
+    completed = False
+    try:
+        completed = _run_mode_cnc_cycle(
+            session_factory,
+            remote_program,
+            cycle_label=f"The assigned program for {pallet_name}",
+            run_token=run_token,
+            completion_status=completion_status,
+        )
+        if completed:
+            duration_seconds = max(1, round(time.monotonic() - started_monotonic))
+            with session_factory() as session:
+                session.add(ProgramRuntime(
+                    id=str(uuid4()),
+                    program_path=program_path,
+                    pallet_id=pallet_id,
+                    started_at=started_at.isoformat(),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    duration_seconds=duration_seconds,
+                ))
+                diagnostics().record(
+                    "run_mode",
+                    "program_runtime_recorded",
+                    f"Recorded {duration_seconds} seconds for {program_path}.",
+                    details={"program": program_path, "pallet_id": pallet_id, "duration_seconds": duration_seconds},
+                )
+                commit_or_conflict(session)
+        return completed
+    finally:
+        with session_factory() as session:
+            settings = get_settings(session)
+            if settings.run_mode_program_started_at == started_at.isoformat():
+                settings.run_mode_program_started_at = None
+                bump(settings)
+                commit_or_conflict(session)
 
 
 def dismiss_run_mode_alert(session: Session) -> None:
@@ -6212,6 +7821,7 @@ def dismiss_run_mode_alert(session: Session) -> None:
     if not settings.run_mode_alert:
         return
     settings.run_mode_alert = ""
+    settings.run_mode_program_started_at = None
     bump(settings)
     commit_or_conflict(session)
 
@@ -6341,7 +7951,7 @@ def execute_run_mode_recovery(session_factory, run_token: str, strategy: str) ->
             settings = get_settings(session)
             pallet = session.get(Pallet, pallet_id)
             if pallet:
-                pallet.content_status = "complete_parts"
+                mark_pallet_program_completed(session, pallet)
             settings.run_mode_current_pallet_id = None
             settings.run_mode_return_slot = None
             remaining = session.scalar(select(Pallet.id).where(Pallet.queue_position.is_not(None)))
@@ -6465,7 +8075,17 @@ def execute_run_mode(session_factory, run_token: str | None = None) -> None:
                     select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
                 )
                 if not pallet:
-                    _finish_run_mode(session_factory, "complete", "All queued pallets completed successfully.", run_token)
+                    settings.run_mode_state = "idle_waiting_queue"
+                    settings.run_mode_detail = "Queue is empty. Run Mode remains armed and will resume when a ready pallet is added."
+                    settings.run_mode_current_pallet_id = None
+                    settings.run_mode_return_slot = None
+                    bump(settings)
+                    commit_or_conflict(session)
+                    diagnostics().record(
+                        "run_mode",
+                        "idle_waiting_queue",
+                        "Run Mode completed its queue and remains armed for newly queued pallets.",
+                    )
                     return
                 if pallet.location != "pool" or not pallet.pool_slot_number or not pallet.program_path:
                     raise problem(409, f"{pallet.name} is not ready in a pool position with an assigned program.")
@@ -6512,6 +8132,9 @@ def execute_run_mode(session_factory, run_token: str | None = None) -> None:
             if not _run_mode_machine_cycle(session_factory, pallet_id, run_token):
                 return
 
+            if not _wait_for_manual_robot_pause(session_factory, run_token):
+                return
+
             if not _await_run_mode_action(
                 session_factory, "unloading",
                 f"Return the mill to its G53 loading position, then unload {pallet_name} to Pool {return_slot:02d}?",
@@ -6543,7 +8166,7 @@ def execute_run_mode(session_factory, run_token: str | None = None) -> None:
                 settings = get_settings(session)
                 pallet = session.get(Pallet, pallet_id)
                 if pallet:
-                    pallet.content_status = "complete_parts"
+                    mark_pallet_program_completed(session, pallet)
                 settings.run_mode_current_pallet_id = None
                 settings.run_mode_return_slot = None
                 settings.run_mode_state = "advancing"
@@ -6696,7 +8319,7 @@ def rebuild_pallet_motion_scripts(session: Session) -> dict:
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before rebuilding scripts.")
     _assert_reliability_inactive(session)
-    if settings.run_mode_enabled:
+    if settings.run_mode_enabled and not settings.run_mode_manual_robot_pause:
         raise problem(409, "Stop Run Mode before rebuilding robot scripts.")
     if settings.robot_connection_mode != "physical" or not settings.robot_host.strip():
         raise problem(409, "Generated scripts require a configured physical robot.")
@@ -6837,7 +8460,7 @@ def queue_pallet(
     session: Session,
     pallet_id: str,
     payload: QueuePallet,
-) -> None:
+) -> str | None:
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
     pallet = session.get(Pallet, pallet_id)
@@ -6874,6 +8497,7 @@ def queue_pallet(
         item.queue_position = position
     bump(settings)
     commit_or_conflict(session)
+    return resume_armed_run_mode(session)
 
 
 def dequeue_pallet(
@@ -7076,6 +8700,19 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
         settings.robot_supervisor_reconnect_limit_seconds = payload.robot_supervisor_reconnect_limit_seconds
     if payload.robot_supervisor_pre_dispatch_fallback is not None:
         settings.robot_supervisor_pre_dispatch_fallback = payload.robot_supervisor_pre_dispatch_fallback
+    if payload.stack_light_enabled is not None:
+        settings.stack_light_enabled = payload.stack_light_enabled
+    if payload.stack_light_outputs is not None:
+        unknown = set(payload.stack_light_outputs) - set(_STACK_LIGHT_CHANNELS)
+        if unknown:
+            raise problem(422, "Stack-light outputs may only configure red, amber, green, blue, white, and alarm.")
+        assignments = [f"{item.bank}:{item.index}" for item in payload.stack_light_outputs.values()]
+        if len(assignments) != len(set(assignments)):
+            raise problem(422, "Each stack-light function must use a different robot output.")
+        settings.stack_light_outputs = json.dumps(
+            {name: item.model_dump() for name, item in payload.stack_light_outputs.items()},
+            separators=(",", ":"), sort_keys=True,
+        )
     if payload.debug_program_button_count is not None:
         settings.debug_program_button_count = payload.debug_program_button_count
     if payload.debug_mill_program_button_count is not None:
@@ -7221,6 +8858,7 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     cleared = reconcile_programs(session, settings) if program_catalog_changed else []
     bump(settings)
     commit_or_conflict(session)
+    refresh_stack_light(session)
     camera_manager().apply(settings)
     if supervisor_listener_changed:
         robot_supervisor().start(
@@ -7589,12 +9227,12 @@ def refresh_programs(session: Session, expected_revision: int) -> dict[str, obje
             metadata_by_program[program_path] = read_assigned_program_metadata(settings, program_path)
         metadata = metadata_by_program[program_path]
         previous = (
-            pallet.program_tools_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
+            pallet.program_tools_json, pallet.program_tool_counts_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
             pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
         )
         _store_pallet_program_metadata(pallet, metadata)
         current = (
-            pallet.program_tools_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
+            pallet.program_tools_json, pallet.program_tool_counts_json, pallet.program_wcs_json, pallet.expected_cycle_seconds,
             pallet.program_metadata_state, pallet.program_metadata_detail, pallet.program_cycle_basis,
         )
         metadata_changed = metadata_changed or previous != current

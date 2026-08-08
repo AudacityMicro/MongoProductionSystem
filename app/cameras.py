@@ -19,11 +19,21 @@ except ImportError:  # pragma: no cover - keeps the API usable before optional i
 
 PHASES = ("idle", "loading", "machining")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+COMMON_CAMERA_MODES = (
+    {"width": 320, "height": 240, "label": "320 × 240 (QVGA)"},
+    {"width": 640, "height": 480, "label": "640 × 480 (VGA)"},
+    {"width": 800, "height": 600, "label": "800 × 600 (SVGA)"},
+    {"width": 1280, "height": 720, "label": "1280 × 720 (HD / 720p)"},
+    {"width": 1280, "height": 960, "label": "1280 × 960"},
+    {"width": 1920, "height": 1080, "label": "1920 × 1080 (Full HD / 1080p)"},
+    {"width": 2560, "height": 1440, "label": "2560 × 1440 (QHD)"},
+    {"width": 3840, "height": 2160, "label": "3840 × 2160 (4K UHD)"},
+)
 
 
 def phase_for_run_state(run_mode_state: str | None) -> str:
     state = (run_mode_state or "").strip().lower()
-    if state == "machining":
+    if state in {"machining", "manual_robot_pause"}:
         return "machining"
     if state in {"loading", "unloading"}:
         return "loading"
@@ -91,6 +101,9 @@ class _CameraWorker:
         self.error = ""
         self.last_frame_at: str | None = None
         self.recording_file: str | None = None
+        self.actual_width: int | None = None
+        self.actual_height: int | None = None
+        self.actual_fps: float | None = None
         self._writer: Any = None
         self._segment_started = 0.0
         self._segment_phase = ""
@@ -113,6 +126,18 @@ class _CameraWorker:
             "error": self.error or None,
             "last_frame_at": self.last_frame_at,
             "recording_file": self.recording_file,
+            "requested_width": self.manager.width,
+            "requested_height": self.manager.height,
+            "requested_fps": self.manager.fps,
+            "actual_width": self.actual_width,
+            "actual_height": self.actual_height,
+            "actual_fps": self.actual_fps,
+            "mode_applied": (
+                self.actual_width == self.manager.width
+                and self.actual_height == self.manager.height
+                if self.actual_width is not None and self.actual_height is not None
+                else None
+            ),
             "stream_url": f"/api/cameras/{self.config['id']}/stream",
         }
 
@@ -142,7 +167,24 @@ class _CameraWorker:
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.manager.width)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.manager.height)
         capture.set(cv2.CAP_PROP_FPS, self.manager.fps)
+        self._update_actual_mode(capture)
         return capture
+
+    def _update_actual_mode(self, capture: Any) -> None:
+        """Read the mode negotiated by the camera driver after requested settings."""
+        if cv2 is None:
+            return
+        try:
+            width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+        except (TypeError, ValueError):
+            return
+        if width > 0 and height > 0:
+            self.actual_width = int(round(width))
+            self.actual_height = int(round(height))
+        if fps > 0:
+            self.actual_fps = round(fps, 2)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -157,6 +199,9 @@ class _CameraWorker:
                         self.status = "offline"
                         self.error = "Camera stopped returning frames."
                         break
+                    # Some DirectShow drivers report the negotiated mode only after
+                    # the first frame has been acquired.
+                    self._update_actual_mode(capture)
                     self._publish(frame)
             except Exception as exc:  # camera failures must not stop the production backend
                 self.status = "offline" if cv2 is not None else "unavailable"
@@ -320,6 +365,49 @@ class CameraManager:
         if worker is None:
             raise KeyError(camera_id)
         return worker.stream()
+
+    def probe_supported_modes(self, settings: Any) -> dict[str, Any]:
+        """Report the modes currently negotiated by the live camera workers.
+
+        Repeated DirectShow open/set/release cycles can terminate some webcam
+        drivers, so capability probing is intentionally non-invasive. The
+        live worker is the authoritative source for the mode actually used by
+        the preview.
+        """
+        result: dict[str, Any] = {
+            "common_modes": [dict(mode) for mode in COMMON_CAMERA_MODES],
+            "cameras": [],
+            "supported_resolutions": [],
+        }
+        if cv2 is None:
+            result["error"] = "OpenCV is not installed."
+            return result
+        snapshot = self.snapshot(settings)
+        cameras = snapshot["cameras"]
+        if not cameras:
+            result["message"] = "No enabled cameras are configured."
+            return result
+        for camera in cameras:
+            actual = None
+            if camera["actual_width"] and camera["actual_height"]:
+                actual = next(
+                    (
+                        dict(mode)
+                        for mode in COMMON_CAMERA_MODES
+                        if (mode["width"], mode["height"])
+                        == (camera["actual_width"], camera["actual_height"])
+                    ),
+                    {"width": camera["actual_width"], "height": camera["actual_height"], "label": "Negotiated mode"},
+                )
+            result["cameras"].append({
+                "id": camera["id"],
+                "name": camera["name"],
+                "status": camera["status"],
+                "actual_mode": actual,
+                "mode_applied": camera["mode_applied"],
+            })
+        result["message"] = "Read the mode currently negotiated by each live preview. The common resolution list was left unchanged."
+        return result
 
     def _cleanup_old_recordings(self) -> None:
         if not self.recording_path.exists():

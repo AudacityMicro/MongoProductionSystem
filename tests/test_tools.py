@@ -130,6 +130,12 @@ def test_tool_colors_use_atc_membership_then_pathpilot_length(client: TestClient
         ),
         encoding="utf-8",
     )
+    gcode = tmp_path / "Gcode"
+    gcode.mkdir()
+    (gcode / "colors.nc").write_text(
+        "(MPS-METADATA-V1)\n(MPS-TOOLS:20,20,30)\n(MPS-CYCLE-SECONDS:60)\nM30\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         "app.service.read_linuxcnc_snapshot",
         lambda *args: {
@@ -150,7 +156,7 @@ def test_tool_colors_use_atc_membership_then_pathpilot_length(client: TestClient
         "/api/settings",
         json={
             "expected_revision": board["revision"],
-            "source_folder": board["settings"]["source_folder"],
+            "source_folder": str(tmp_path),
             "program_extensions": board["settings"]["program_extensions"],
             "weight_unit": board["settings"]["weight_unit"],
             "pool_slot_count": board["settings"]["pool_slot_count"],
@@ -170,3 +176,26 @@ def test_tool_colors_use_atc_membership_then_pathpilot_length(client: TestClient
         "30": {"status": "zero", "length_offset": 0.0},
         "40": {"status": "zero", "length_offset": None},
     }
+    created = client.post(
+        "/api/pallets",
+        json={
+            "expected_revision": saved.json()["board"]["revision"],
+            "workholding": "Fixture",
+            "weight_kg": 10,
+            "content_status": "raw_stock",
+            "program_path": "colors.nc",
+        },
+    ).json()
+    usage = client.get("/api/tools").json()["program_usage"]
+    assert usage["T20"] == [{"program_path": "colors.nc", "uses": 2}]
+    assert usage["T30"] == [{"program_path": "colors.nc", "uses": 1}]
+
+    pallet = created["pallets"][0]
+    queued = client.post(
+        f"/api/pallets/{pallet['id']}/queue",
+        json={"expected_revision": created["revision"], "queue_index": 0},
+    )
+    assert queued.status_code == 200
+    queue_states = client.get("/api/dashboard").json()["queue_tool_states"]
+    assert queue_states["20"]["status"] == "measured"
+    assert queue_states["30"]["status"] == "zero"

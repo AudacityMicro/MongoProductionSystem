@@ -47,6 +47,8 @@ class AppSettings(Base):
     debug_configurable_output_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_tool_output_mask: Mapped[int] = mapped_column(Integer, default=0)
     debug_io_labels: Mapped[str] = mapped_column(String, default="{}")
+    stack_light_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    stack_light_outputs: Mapped[str] = mapped_column(String, default="{}")
     debug_program_button_count: Mapped[int] = mapped_column(Integer, default=4)
     debug_program_buttons: Mapped[str] = mapped_column(String, default="[]")
     debug_mill_program_button_count: Mapped[int] = mapped_column(Integer, default=4)
@@ -95,6 +97,8 @@ class AppSettings(Base):
     run_mode_confirmation_token: Mapped[str] = mapped_column(String(36), default="")
     run_mode_confirmation_granted: Mapped[bool] = mapped_column(Boolean, default=False)
     run_mode_start_request_id: Mapped[str] = mapped_column(String(36), default="")
+    run_mode_manual_robot_pause: Mapped[bool] = mapped_column(Boolean, default=False)
+    run_mode_program_started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     mill_file_directory: Mapped[str] = mapped_column(String(500), default="/home/operator/gcode/Gcode")
     mill_program_extensions: Mapped[str] = mapped_column(String, default='[".nc",".tap",".gcode",".cnc"]')
     mill_programs_page_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -185,6 +189,7 @@ class Pallet(Base):
     content_status: Mapped[str] = mapped_column(String(30))
     program_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     program_tools_json: Mapped[str] = mapped_column(String, default="[]")
+    program_tool_counts_json: Mapped[str] = mapped_column(String, default="{}")
     program_wcs_json: Mapped[str] = mapped_column(String, default="[]")
     expected_cycle_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     program_metadata_state: Mapped[str] = mapped_column(String(20), default="unavailable")
@@ -194,6 +199,36 @@ class Pallet(Base):
     queue_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pool_slot_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     return_pool_slot_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class ProgramCompletionStat(Base):
+    """Durable production totals, keyed by the assigned mill program."""
+
+    __tablename__ = "program_completion_stats"
+
+    program_path: Mapped[str] = mapped_column(String(500), primary_key=True)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        CheckConstraint("completed_count >= 0", name="ck_program_completion_count_nonnegative"),
+    )
+
+
+class ProgramRuntime(Base):
+    """One confirmed machining duration, retained for future cycle estimates."""
+
+    __tablename__ = "program_runtimes"
+    __table_args__ = (
+        CheckConstraint("duration_seconds > 0", name="ck_program_runtime_duration_positive"),
+        Index("ix_program_runtime_program_completed", "program_path", "completed_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    program_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    pallet_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    started_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    completed_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class RobotMotion(Base):
@@ -303,3 +338,26 @@ class RobotReliabilityRun(Base):
     started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     failure_detail: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class RecoverySession(Base):
+    __tablename__ = "recovery_sessions"
+    __table_args__ = (
+        Index(
+            "uq_active_recovery_session",
+            "status",
+            unique=True,
+            sqlite_where=text("status IN ('awaiting_safety','running','awaiting_restart','ready','handoff')"),
+        ),
+        Index("ix_recovery_sessions_updated_at", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(30), default="awaiting_safety")
+    step: Mapped[str] = mapped_column(String(50), default="safety")
+    answers_json: Mapped[str] = mapped_column(String, default="{}")
+    faults_json: Mapped[str] = mapped_column(String, default="[]")
+    actions_json: Mapped[str] = mapped_column(String, default="[]")
+    message: Mapped[str] = mapped_column(String(1000), default="")
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(40), nullable=False)

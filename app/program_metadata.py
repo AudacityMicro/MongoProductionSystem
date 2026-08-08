@@ -24,6 +24,7 @@ _GCODE_WCS_RE = re.compile(
 def unavailable_program_metadata(detail: str) -> dict[str, object]:
     return {
         "program_tools": [],
+        "program_tool_counts": {},
         "program_wcs": [],
         "expected_cycle_seconds": None,
         "program_metadata_state": "unavailable",
@@ -54,7 +55,8 @@ def parse_program_metadata(text: str) -> dict[str, object]:
         return unavailable_program_metadata("The MPS metadata header is incomplete.")
 
     try:
-        tools = sorted({int(value.strip()) for value in tools_match.group(1).split(",") if value.strip()})
+        tool_numbers = [int(value.strip()) for value in tools_match.group(1).split(",") if value.strip()]
+        tools = sorted(set(tool_numbers))
         cycle_seconds = float(cycle_match.group(1))
     except ValueError:
         return unavailable_program_metadata("The MPS metadata header contains an invalid number.")
@@ -68,6 +70,7 @@ def parse_program_metadata(text: str) -> dict[str, object]:
     wcs_match = _WCS_RE.search(text)
     return {
         "program_tools": [f"T{tool}" for tool in tools],
+        "program_tool_counts": {f"T{tool}": tool_numbers.count(tool) for tool in tools},
         "program_wcs": _work_coordinate_systems(text, wcs_match),
         "expected_cycle_seconds": int(math.ceil(cycle_seconds)),
         "program_metadata_state": "parsed",

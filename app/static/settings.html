@@ -7,7 +7,8 @@
     <title>Settings | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260801-1">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/settings.js?v=20260801-1" defer></script>
+    <script src="/static/settings.js?v=20260806-08" defer></script>
+    <script src="/static/system-status.js?v=20260806-01" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -28,6 +29,7 @@
         <span class="state-light" aria-hidden="true"></span>
         Loading
       </span>
+      <span class="system-status-details" id="system-status-details" aria-label="System connection status"></span>
     </header>
 
     <main class="settings-page">
@@ -37,14 +39,33 @@
         <p>Configuration is grouped by the system it controls. <span id="app-version">Version unknown</span></p>
       </section>
 
-      <nav class="settings-category-nav" aria-label="Settings categories">
-            <a href="#settings-general">General</a>
-        <a href="#settings-robot">Robot</a>
-        <a href="#settings-mill">Mill</a>
-        <a href="#settings-system">System</a>
+      <nav class="settings-category-nav" aria-label="Settings categories" role="tablist">
+        <button id="settings-tab-general" type="button" role="tab" aria-controls="settings-general" data-settings-tab="settings-general">General</button>
+        <button id="settings-tab-pool" type="button" role="tab" aria-controls="settings-pool" data-settings-tab="settings-pool">Pool</button>
+        <button id="settings-tab-robot" type="button" role="tab" aria-controls="settings-robot" data-settings-tab="settings-robot">Robot</button>
+        <button id="settings-tab-mill" type="button" role="tab" aria-controls="settings-mill" data-settings-tab="settings-mill">Mill</button>
+        <button id="settings-tab-system" type="button" role="tab" aria-controls="settings-system" data-settings-tab="settings-system">System</button>
       </nav>
 
       <form id="settings-form">
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">Pool locations</p>
+            <h2>Pallet locations and safe poses</h2>
+            <p>Teach pool and staging locations, align the fork for pickup, and manage the intermediate joint-safe poses used for each pool path.</p>
+          </div>
+          <div class="panel-fields" id="pool-locations-and-safe-poses-fields">
+            <div class="inline-actions">
+              <button class="button secondary" type="button" data-rebuild-motion-scripts>Save and rebuild robot scripts</button>
+              <span class="field-help" data-motion-rebuild-status>Rebuild after changing locations or safe poses.</span>
+            </div>
+            <div class="inline-actions hidden" id="save-pool-locations-during-run-row">
+              <button class="button primary" id="save-pool-locations-during-run" type="button">Save pool locations and rebuild</button>
+              <span class="field-help">Available only while Run Mode is waiting for detected manual robot control.</span>
+            </div>
+          </div>
+        </section>
+
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">01</p>
@@ -121,11 +142,23 @@
               <label>Retention days<input id="camera-recording-retention-days" type="number" min="1" max="30" step="1"></label>
             </div>
             <div class="form-row">
-              <label>Width<input id="camera-width" type="number" min="320" max="3840" step="1"></label>
-              <label>Height<input id="camera-height" type="number" min="240" max="2160" step="1"></label>
+              <label>Resolution<select id="camera-resolution">
+                <option value="320x240">320 × 240 (QVGA)</option>
+                <option value="640x480">640 × 480 (VGA)</option>
+                <option value="800x600">800 × 600 (SVGA)</option>
+                <option value="1280x720">1280 × 720 (HD / 720p)</option>
+                <option value="1280x960">1280 × 960 (SXGA−)</option>
+                <option value="1920x1080">1920 × 1080 (Full HD / 1080p)</option>
+                <option value="2560x1440">2560 × 1440 (QHD)</option>
+                <option value="3840x2160">3840 × 2160 (4K UHD)</option>
+              </select></label>
               <label>Frame rate<input id="camera-fps" type="number" min="1" max="60" step="1"></label>
             </div>
-            <p class="field-help">The live dashboard shows all enabled cameras. The current phase camera is highlighted; if it is offline, the first available camera is highlighted as a fallback.</p>
+            <div class="inline-actions">
+              <button class="button secondary" id="probe-camera-modes" type="button">Refresh actual camera mode</button>
+              <span class="field-help" id="camera-mode-status" role="status" aria-live="polite">Camera mode has not been checked yet.</span>
+            </div>
+            <p class="field-help">The live dashboard shows all enabled cameras; the current phase camera is highlighted. The camera driver may select a different mode than requested, so use detection to verify the actual modes available.</p>
           </div>
         </section>
 
@@ -164,6 +197,17 @@
               </label>
             </div>
             <p class="field-help" id="robot-connection-help">Simulated mode allows manual input/output toggles on the Debugging page. Physical mode reads only live robot data. Mongo's CB-series realtime interface uses port 30003.</p>
+            <fieldset class="location-fieldset">
+              <legend>Mongo stack light and audible alarm</legend>
+              <label class="checkbox-control"><input id="stack-light-enabled" type="checkbox"><span>Enable configured stack-light outputs<small>Disabled by default. MPS will only drive the outputs listed below; leave blank for unused functions.</small></span></label>
+              <p class="field-help">Use <code>standard:0</code>, <code>configurable:0</code>, or <code>tool:0</code>. Green = ready, blue = work active, amber = waiting/recovery, white = guided recovery, red + alarm = fault. The alarm also gives three short bursts before robot motion resumes after two idle minutes.</p>
+              <div class="form-row">
+                <label>Red<input id="stack-light-red" placeholder="standard:0"></label><label>Amber<input id="stack-light-amber" placeholder="standard:1"></label><label>Green<input id="stack-light-green" placeholder="standard:2"></label>
+              </div>
+              <div class="form-row">
+                <label>Blue<input id="stack-light-blue" placeholder="standard:3"></label><label>White<input id="stack-light-white" placeholder="standard:4"></label><label>Audible alarm<input id="stack-light-alarm" placeholder="standard:5"></label>
+              </div>
+            </fieldset>
             <fieldset class="location-fieldset supervisor-settings">
               <legend>Robot-originated supervisor</legend>
               <label class="checkbox-control">
@@ -292,6 +336,14 @@
             <p>Configure every robot position used by pallet handling in one place. Cartesian positions use millimeters in the robot base frame; tool orientation and joint poses use radians.</p>
           </div>
           <div class="panel-fields">
+            <fieldset class="location-fieldset">
+              <legend>Pallet-pick teaching</legend>
+              <p class="field-help">Rotates the fork to the saved pallet tool orientation at its current TCP position. It does not select a pool slot or capture a location.</p>
+              <div class="inline-actions">
+                <button class="button secondary" id="align-robot-pallet-pick" type="button">Align robot for pallet pick</button>
+                <span class="field-help" id="align-robot-pallet-pick-status" role="status" aria-live="polite"></span>
+              </div>
+            </fieldset>
             <div class="location-grid" id="pool-location-grid"></div>
             <div class="form-row location-stations">
               <fieldset class="location-fieldset" id="on-deck-location-fields"><legend>On deck location</legend></fieldset>
@@ -300,6 +352,10 @@
             <fieldset class="location-fieldset" id="robot-mill-load-unload-fields"></fieldset>
             <fieldset class="location-fieldset" id="robot-mill-pre-entry-fields"></fieldset>
             <fieldset class="location-fieldset" id="robot-mill-safe-entry-exit-fields"></fieldset>
+            <div class="inline-actions">
+              <button class="button secondary" type="button" data-rebuild-motion-scripts>Save and rebuild robot scripts</button>
+              <span class="field-help" data-motion-rebuild-status>Rebuild after changing mill-entry robot poses.</span>
+            </div>
             <p class="field-help">Changing any pose or motion value requires rebuilding generated scripts before physical pallet movements use the new configuration.</p>
           </div>
         </section>
@@ -534,8 +590,8 @@
               <div class="managed-library-list" id="intermediate-safe-pose-list"></div>
             </fieldset>
             <div class="inline-actions">
-              <button class="button secondary" id="rebuild-motion-scripts" type="button">Rebuild generated scripts</button>
-              <span class="field-help" id="motion-program-file-status">Saves these settings, writes local .script files, then synchronizes the same files to the robot.</span>
+              <button class="button secondary" type="button" data-rebuild-motion-scripts>Save and rebuild robot scripts</button>
+              <span class="field-help" data-motion-rebuild-status>Saves these settings, writes local .script files, then synchronizes the same files to the robot.</span>
             </div>
             <div class="managed-library-list" id="generated-motion-program-list"></div>
             <p class="field-help">The shared safe pose and intermediate safe poses are explicit J0-J5 joint configurations. Capture them from physically verified robot postures; generated scripts use joint-space <code>movej</code> transitions and never infer an arm configuration from Cartesian coordinates. Pool pick and place scripts use the Y approach clearance. Mill load and unload scripts use the dedicated X approach clearance. The pallet and mill entry poses remain Cartesian for controlled linear moves near fixtures.</p>
@@ -594,10 +650,8 @@
 
         <div class="settings-actions">
           <a class="button ghost" href="/">Cancel</a>
-          <button class="button secondary" id="relaunch-system" type="button">Close and relaunch</button>
           <button class="button primary" type="submit">Save settings</button>
         </div>
-        <div class="relaunch-status hidden" id="relaunch-status" role="status" aria-live="polite"></div>
       </form>
     </main>
     <div class="modal-shell hidden" id="pose-capture-modal" role="dialog" aria-modal="true" aria-labelledby="pose-capture-title">

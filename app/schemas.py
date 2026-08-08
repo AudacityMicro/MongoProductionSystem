@@ -10,6 +10,7 @@ Location = Literal["pool", "on_deck", "machine", "dripping", "storage", "robot_h
 WeightUnit = Literal["lb", "kg"]
 DebugSignal = Literal["complete", "out_of_spec", "error"]
 RobotConnectionMode = Literal["simulated", "physical"]
+StackLightBank = Literal["standard", "configurable", "tool"]
 
 
 def _round_three_decimals(value: float) -> float:
@@ -40,6 +41,40 @@ class UpdatePallet(PalletFields):
 
 class RevisionRequest(BaseModel):
     expected_revision: int = Field(ge=0)
+
+
+class ProgramCompletionStatUpdate(RevisionRequest):
+    program_path: str = Field(min_length=1, max_length=500)
+    completed_count: int = Field(ge=0, le=1_000_000_000)
+
+    @field_validator("program_path")
+    @classmethod
+    def strip_program_path(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Program path cannot be blank.")
+        return value
+
+
+class CustomerQueueRequest(BaseModel):
+    """Restricted request accepted from the customer-facing scheduling site."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pallet_id: str = Field(min_length=1, max_length=36)
+    program_path: str = Field(min_length=1, max_length=500)
+    queue_index: int | None = Field(default=None, ge=0)
+
+
+class RecoveryAnswer(BaseModel):
+    session_id: str = Field(min_length=36, max_length=36)
+    answers: dict[str, bool] = Field(default_factory=dict)
+    choices: dict[str, str] = Field(default_factory=dict)
+    resolution: Literal["source_pool", "robot_held", "destination_pool", "machine"] | None = None
+
+
+class RecoveryCancel(BaseModel):
+    session_id: str = Field(min_length=36, max_length=36)
 
 
 class BackupRestoreRequest(BaseModel):
@@ -300,6 +335,10 @@ class SetRunModeSafety(RevisionRequest):
     enabled: bool
 
 
+class UpdatePoolLocationsDuringRun(RevisionRequest):
+    pool_locations: list[PoolLocation] = Field(min_length=1, max_length=256)
+
+
 class ConfirmRunModeAction(RevisionRequest):
     token: str = Field(min_length=36, max_length=36)
     approved: bool
@@ -309,6 +348,18 @@ class RecoverRunMode(RevisionRequest):
     strategy: Literal[
         "retry_robot_only", "reposition_and_retry", "rerun_assigned_program", "manual_complete_and_unload",
     ]
+
+
+class StackLightOutput(BaseModel):
+    bank: StackLightBank
+    index: int = Field(ge=0, le=7)
+
+    @field_validator("index")
+    @classmethod
+    def tool_output_range(cls, value: int, info):
+        if info.data.get("bank") == "tool" and value > 1:
+            raise ValueError("Tool outputs must use channel 0 or 1.")
+        return value
 
 
 class SettingsUpdate(RevisionRequest):
@@ -331,6 +382,8 @@ class SettingsUpdate(RevisionRequest):
     # Older cached Settings pages did not send this field. Keep it optional so
     # those pages cannot silently re-lock an operator's saved I/O permission.
     manual_io_control_enabled: bool | None = None
+    stack_light_enabled: bool | None = None
+    stack_light_outputs: dict[str, StackLightOutput] | None = None
     robot_connection_mode: RobotConnectionMode | None = None
     robot_host: str | None = Field(default=None, max_length=255)
     robot_port: int | None = Field(default=None, ge=1, le=65535)

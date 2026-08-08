@@ -7,7 +7,9 @@
     <title>Debugging | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260726-08">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/debugging.js?v=20260726-13" defer></script>
+    <script src="/static/debugging.js?v=20260806-04" defer></script>
+    <script src="/static/recovery.js?v=20260806-02" defer></script>
+    <script src="/static/system-status.js?v=20260806-01" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -28,28 +30,40 @@
         <span class="state-light" aria-hidden="true"></span>
         Loading
       </span>
+      <span class="system-status-details" id="system-status-details" aria-label="System connection status"></span>
     </header>
 
     <main class="debugging-page">
       <section class="settings-heading">
-        <p class="eyebrow">Telemetry and diagnostics</p>
-        <h1>Debugging</h1>
-        <p id="debug-notes">Loading live robot and mill telemetry.</p>
+        <div>
+          <p class="eyebrow">Telemetry and diagnostics</p>
+          <h1>Debugging</h1>
+          <p id="debug-notes">Loading live robot and mill telemetry.</p>
+        </div>
+        <button class="button danger debug-recovery-launch" id="system-recovery-launch" type="button">Auto Recover</button>
       </section>
 
-      <nav class="settings-category-nav debug-category-nav" aria-label="Debugging sections">
-        <a href="#debug-connections">Connections</a>
-        <a href="#debug-system">System</a>
-        <a href="#debug-robot">Robot</a>
-        <a href="#debug-mill">Mill</a>
+      <section class="debug-category" id="debug-recovery" aria-labelledby="debug-recovery-title">
+        <header class="debug-category-heading">
+          <p>Recovery</p>
+          <h2 id="debug-recovery-title">Guided system recovery</h2>
+          <span>Safely reconnect services and reconcile observed physical conditions. Recovery never commands production motion.</span>
+        </header>
+      </section>
+
+      <nav class="settings-category-nav debug-category-nav" aria-label="Debugging sections" role="tablist">
+        <button id="debug-tab-recovery" type="button" role="tab" aria-controls="debug-recovery" data-debug-tab="debug-recovery">Recovery</button>
+        <button id="debug-tab-connections" type="button" role="tab" aria-controls="debug-connections" data-debug-tab="debug-connections">Connections</button>
+        <button id="debug-tab-system" type="button" role="tab" aria-controls="debug-system" data-debug-tab="debug-system">System</button>
+        <button id="debug-tab-robot" type="button" role="tab" aria-controls="debug-robot" data-debug-tab="debug-robot">Robot</button>
+        <button id="debug-tab-mill" type="button" role="tab" aria-controls="debug-mill" data-debug-tab="debug-mill">Mill</button>
       </nav>
 
       <section class="debug-category" id="debug-connections" aria-labelledby="debug-connections-title">
         <header class="debug-category-heading">
           <p>Cell status</p>
           <h2 id="debug-connections-title">Connections</h2>
-          <span>Robot and mill transport state, command sequence alignment, and recovery controls.</span>
-          <button class="button secondary" id="debug-auto-recover" type="button">Auto recover</button>
+          <span>Robot and mill transport state and command sequence alignment. Use the Dashboard's Recover system wizard for recovery.</span>
         </header>
         <div class="debug-connection-deck" id="debug-connection-deck"></div>
       </section>
@@ -73,7 +87,6 @@
             <div><dt>Machine state</dt><dd id="debug-machine-state">Unknown</dd></div>
             <div><dt>Updated</dt><dd id="debug-timestamp">Unknown</dd></div>
           </dl>
-          <button class="secondary-action" id="clear-mongo-fault" type="button">Clear robot fault/error</button>
         </article>
 
         <article class="debug-overview-card">
@@ -124,8 +137,8 @@
           <p class="debug-digital-help">Mongo owns this TCP connection and reports sequenced atomic command events. An uncertain or latched command must be reconciled; it is never repeated through the legacy transport.</p>
           <div class="supervisor-status-grid" id="robot-supervisor-status-grid"></div>
           <div class="inline-actions">
+            <button class="button primary hidden" id="debug-supervisor-reconnect" type="button">Reconnect Mongo</button>
              <button class="button secondary" id="debug-supervisor-maintenance" type="button">Enter Maintenance Mode</button>
-            <button class="button secondary" id="debug-supervisor-clear-latch" type="button">Clear reconciled latch</button>
             <a class="button secondary" href="/api/debug/robot-supervisor/status-document" target="_blank" rel="noopener">Open robot status document</a>
           </div>
           <div class="network-test-result" id="robot-supervisor-detail" role="status">Loading supervisor status...</div>
@@ -450,6 +463,18 @@
       </section>
       </section>
     </main>
+
+    <dialog id="system-recovery-dialog">
+      <form method="dialog" id="system-recovery-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Guided system recovery</p><h2>Return MPS to a ready state</h2></div></div>
+        <p id="system-recovery-message">Inspecting the cell...</p>
+        <div id="system-recovery-prompt"></div>
+        <div class="recovery-actions" id="system-recovery-actions"></div>
+        <div class="dialog-actions">
+          <button class="button ghost" id="system-recovery-cancel" type="button">Cancel</button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog class="debug-program-dialog" id="program-button-dialog" aria-labelledby="program-button-dialog-title">
       <form id="program-button-form">

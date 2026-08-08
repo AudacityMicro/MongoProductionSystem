@@ -6,7 +6,8 @@
     <meta name="theme-color" content="#17211d">
     <title>Dashboard | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260801-1">
-    <script src="/static/dashboard.js?v=20260801-1" defer></script>
+    <script src="/static/dashboard.js?v=20260808-01" defer></script>
+    <script src="/static/system-status.js?v=20260806-01" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -20,14 +21,14 @@
         <a class="nav-link hidden" data-mill-programs-nav href="/mill-programs">Mill Programs</a>
         <a class="nav-link" href="/settings">Settings</a>
       </nav>
-      <span class="system-state" id="system-state"><span class="state-light" aria-hidden="true"></span> Loading</span>
+      <span class="system-state" id="system-state"><span class="state-light" aria-hidden="true"></span> Loading</span><span class="system-status-details" id="system-status-details" aria-label="System connection status"></span>
     </header>
     <main class="dashboard-page">
       <section class="settings-heading"><p class="eyebrow">Production overview</p><h1>Dashboard</h1><p>Current machining demand, planned tools, and remaining time.</p></section>
       <section class="dashboard-summary">
         <article><p class="section-number">Queue remaining</p><strong id="queue-time">--</strong><span id="queue-count">0 pallets</span></article>
         <article><p class="section-number">Current part</p><strong id="current-cycle">--</strong><span id="current-pallet">No pallet in Mill</span></article>
-        <article><p class="section-number">Queued tools</p><div class="tool-chip-list" id="queue-tools"></div></article>
+        <article><p class="section-number">Active + queued tools</p><div class="tool-chip-list" id="queue-tools"></div></article>
         <article><p class="section-number">Tools in ATC</p><div class="tool-chip-list" id="atc-tools"></div></article>
       </section>
       <section class="dashboard-camera-zone">
@@ -37,6 +38,10 @@
       <section class="dashboard-queue-zone">
         <header class="zone-heading"><div><p class="section-number">Upcoming work</p><h2>Production queue</h2></div><span class="zone-count" id="dashboard-updated">Loading</span></header>
         <div class="dashboard-queue-list" id="dashboard-queue"></div>
+      </section>
+      <section class="dashboard-program-completions">
+        <header class="zone-heading"><div><p class="section-number">Production history</p><h2>Program completions</h2></div><span class="zone-count">Edit or reset totals</span></header>
+        <div class="program-completion-list" id="program-completions"></div>
       </section>
     </main>
     <div class="toast hidden" id="toast" role="status"></div>

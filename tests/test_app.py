@@ -1,12 +1,13 @@
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import pytest
 import time
 
 from app.main import create_app
-from app.models import Pallet, RobotMotion
-from app.schemas import StartRunMode
+from app.models import Pallet, ProgramRuntime, RobotMotion
+from app.schemas import QueuePallet, StartRunMode
 from app.service import build_mill_load_position_program
 from app import cnc_linuxcnc, service
 
@@ -152,16 +153,18 @@ def test_health_and_pages(client: TestClient) -> None:
     schedule_page = client.get("/").text
     assert "Pallet schedule" in schedule_page
     assert 'id="cancel-mill-putaway" type="button"' in schedule_page
-    assert 'id="cancel-motion-recovery" type="button"' in schedule_page
+    assert 'id="system-recovery-launch" type="button"' not in schedule_page
+    assert 'id="system-recovery-dialog"' in schedule_page
     debugging_page = client.get("/debugging").text
     assert "Debugging" in debugging_page
     assert "Mongo controller" in debugging_page
     assert "Tormach 1500MX / PathPilot" in debugging_page
-    assert 'id="debug-auto-recover"' in debugging_page
-    assert 'id="clear-mongo-fault"' in debugging_page
+    assert 'id="system-recovery-launch" type="button"' in debugging_page
+    assert 'id="system-recovery-dialog"' in debugging_page
+    assert 'id="clear-mongo-fault"' not in debugging_page
     settings_page = client.get("/settings").text
     assert "System settings" in settings_page
-    assert "Close and relaunch" in settings_page
+    assert "Close and relaunch" not in settings_page
     assert "Workholding library" in settings_page
     assert 'id="workholding-options"' in schedule_page
     schedule_script_response = client.get("/static/app.js")
@@ -490,6 +493,50 @@ def test_settings_update_persists_manual_io_control(client: TestClient) -> None:
     assert client.get("/api/settings").json()["settings"]["manual_io_control_enabled"] is True
 
 
+def test_settings_update_persists_stack_light_configuration(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "stack_light_enabled": True,
+            "stack_light_outputs": {
+                "red": {"bank": "standard", "index": 0},
+                "green": {"bank": "standard", "index": 1},
+                "alarm": {"bank": "tool", "index": 0},
+            },
+        },
+    )
+    assert response.status_code == 200
+    settings = response.json()["board"]["settings"]
+    assert settings["stack_light_enabled"] is True
+    assert settings["stack_light_outputs"] == {
+        "alarm": {"bank": "tool", "index": 0},
+        "green": {"bank": "standard", "index": 1},
+        "red": {"bank": "standard", "index": 0},
+    }
+
+
+def test_customer_scheduler_api_is_disabled_without_a_configured_key(client: TestClient) -> None:
+    response = client.get("/api/customer/v1/catalog")
+    assert response.status_code == 401
+
+
+def test_stack_light_configuration_rejects_duplicate_outputs(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "stack_light_outputs": {
+                "red": {"bank": "standard", "index": 0},
+                "alarm": {"bank": "standard", "index": 0},
+            },
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_legacy_settings_save_does_not_reset_manual_io_control(client: TestClient) -> None:
     board = client.get("/api/settings").json()
     enabled = client.put(
@@ -525,6 +572,143 @@ def test_dashboard_reports_pending_atc_telemetry(client: TestClient) -> None:
     assert dashboard.status_code == 200
     assert dashboard.json()["atc_tools"] == []
     assert dashboard.json()["atc_source"] == "Mill telemetry is not connected yet."
+
+
+def test_dashboard_includes_current_mill_program_tools_when_queue_is_empty(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        session.add(Pallet(
+            id="machine-pallet", name="Machine pallet", workholding="Fixture", weight_kg=10,
+            content_status="raw_stock", program_path="running.nc", program_tools_json='["T8","T20"]',
+            location="machine",
+        ))
+        session.commit()
+
+    dashboard = client.get("/api/dashboard").json()
+
+    assert dashboard["queue"] == []
+    assert dashboard["queue_tools"] == ["T8", "T20"]
+
+
+def test_dashboard_uses_measured_program_runtime_for_countdown_and_queue_estimate(client: TestClient) -> None:
+    started = datetime.now(timezone.utc) - timedelta(seconds=30)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_state = "machining"
+        settings.run_mode_program_started_at = started.isoformat()
+        session.add(Pallet(
+            id="timed-pallet", name="Timed pallet", workholding="Fixture", weight_kg=10,
+            content_status="raw_stock", program_path="measured.nc", expected_cycle_seconds=900,
+            location="machine", queue_position=0,
+        ))
+        session.add(ProgramRuntime(
+            id="runtime-one", program_path="measured.nc", pallet_id="old-pallet",
+            started_at="2026-08-08T00:00:00+00:00", completed_at="2026-08-08T00:02:00+00:00", duration_seconds=120,
+        ))
+        session.add(ProgramRuntime(
+            id="runtime-two", program_path="measured.nc", pallet_id="old-pallet",
+            started_at="2026-08-08T01:00:00+00:00", completed_at="2026-08-08T01:04:00+00:00", duration_seconds=240,
+        ))
+        session.commit()
+
+    dashboard = client.get("/api/dashboard").json()
+
+    assert dashboard["queue"][0]["estimated_cycle_seconds"] == 180
+    assert dashboard["queue"][0]["estimate_source"] == "Measured average"
+    assert dashboard["current_cycle_seconds"] == 180
+    assert 145 <= dashboard["current_cycle_remaining_seconds"] <= 150
+    assert 145 <= dashboard["queue_cycle_seconds"] <= 150
+    assert dashboard["program_completions"] == [
+        {"program_path": "measured.nc", "completed_count": 0, "measured_run_count": 2, "average_run_seconds": 180},
+    ]
+
+
+def test_confirmed_machine_cycle_records_program_runtime(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "machining"
+        settings.run_mode_start_request_id = "runtime-recording"
+        session.add(Pallet(
+            id="recorded-pallet", name="Recorded pallet", workholding="Fixture", weight_kg=10,
+            content_status="raw_stock", program_path="recorded.nc", location="machine",
+        ))
+        session.commit()
+
+    assert service._run_mode_machine_cycle(client.app.state.session_factory, "recorded-pallet", "runtime-recording") is True
+
+    with client.app.state.session_factory() as session:
+        runtime = session.scalar(service.select(ProgramRuntime).where(ProgramRuntime.program_path == "recorded.nc"))
+        assert runtime is not None
+        assert runtime.duration_seconds >= 1
+        assert service.get_settings(session).run_mode_program_started_at is None
+
+
+def test_manual_robot_pause_holds_run_mode_and_allows_pool_teaching(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "machining"
+        settings.run_mode_start_request_id = "manual-robot-pause"
+        session.commit()
+        assert service.pause_run_mode_for_manual_robot_control(session) is True
+        revision = service.get_settings(session).revision
+
+    paused = client.get("/api/board").json()
+    assert paused["run_mode"]["manual_robot_pause"] is True
+    assert paused["run_mode"]["state"] == "manual_robot_pause"
+
+    saved = client.post(
+        "/api/settings/pool-locations-during-run",
+        json={
+            "expected_revision": revision,
+            "pool_locations": [
+                {"slot": slot, "x_mm": float(slot), "y_mm": 0, "z_mm": 0}
+                for slot in range(1, 17)
+            ],
+        },
+    )
+    assert saved.status_code == 200
+    resumed = client.post(
+        "/api/run-mode/resume-after-manual-robot",
+        json={"expected_revision": saved.json()["revision"]},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["run_mode"]["manual_robot_pause"] is False
+
+
+def test_dashboard_program_completion_totals_can_be_edited_and_reset(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        session.add(Pallet(
+            id="counter-pallet", name="Counter pallet", workholding="Fixture", weight_kg=10,
+            content_status="raw_stock", program_path="jobs/customer-part.nc", location="pool", pool_slot_number=1,
+        ))
+        session.commit()
+    dashboard = client.get("/api/dashboard").json()
+    saved = client.put(
+        "/api/program-completions",
+        json={
+            "expected_revision": dashboard["revision"],
+            "program_path": "jobs/customer-part.nc",
+            "completed_count": 27,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["program_completions"] == [
+        {"program_path": "jobs/customer-part.nc", "completed_count": 27, "measured_run_count": 0, "average_run_seconds": None},
+    ]
+
+    reset = client.post(
+        "/api/program-completions/reset",
+        json={
+            "expected_revision": saved.json()["revision"],
+            "program_path": "jobs/customer-part.nc",
+            "completed_count": 0,
+        },
+    )
+    assert reset.status_code == 200
+    assert reset.json()["program_completions"] == [
+        {"program_path": "jobs/customer-part.nc", "completed_count": 0, "measured_run_count": 0, "average_run_seconds": None},
+    ]
 
 
 def test_pallet_location_positions_persist(client: TestClient) -> None:
@@ -857,13 +1041,16 @@ def test_simulated_run_mode_processes_queue_with_step_confirmations(client: Test
         )
         assert confirmed.status_code == 200
 
-    completed = wait_for_run_state(client, "complete")
+    completed = wait_for_run_state(client, "idle_waiting_queue")
     result = completed["pallets"][0]
-    assert completed["run_mode"]["enabled"] is False
+    assert completed["run_mode"]["enabled"] is True
     assert result["queue_position"] is None
     assert result["location"] == "pool"
     assert result["pool_slot_number"] == 1
     assert result["content_status"] == "complete_parts"
+    assert client.get("/api/dashboard").json()["program_completions"] == [
+        {"program_path": "job.nc", "completed_count": 1, "measured_run_count": 0, "average_run_seconds": None},
+    ]
     assert command_order == [
         "mill_load_position",
         "robot_load",
@@ -871,6 +1058,31 @@ def test_simulated_run_mode_processes_queue_with_step_confirmations(client: Test
         "mill_load_position",
         "robot_unload",
     ]
+
+
+def test_armed_run_mode_waits_for_a_later_ready_queue_entry(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        token = service.start_run_mode(session, StartRunMode(
+            expected_revision=settings.revision,
+            request_id="armed-empty-queue",
+        ))
+        assert token is None
+        settings = service.get_settings(session)
+        assert settings.run_mode_enabled is True
+        assert settings.run_mode_state == "idle_waiting_queue"
+        session.add(Pallet(
+            id="armed-later-pallet", name="Armed Later", workholding="Vise", weight_kg=1,
+            content_status="raw_stock", program_path="job.nc", location="pool", pool_slot_number=1,
+        ))
+        session.commit()
+        token = service.queue_pallet(session, "armed-later-pallet", QueuePallet(
+            expected_revision=settings.revision,
+            queue_index=0,
+        ))
+        settings = service.get_settings(session)
+        assert token == "armed-empty-queue"
+        assert settings.run_mode_state == "resuming"
 
 
 def test_run_mode_cnc_cycle_starts_program_and_waits_for_idle(client: TestClient, monkeypatch) -> None:
@@ -1677,3 +1889,15 @@ def test_settings_accept_partial_update_without_resetting_robot_connection(clien
     assert saved["weight_unit"] == "kg"
     assert saved["robot_connection_mode"] == "physical"
     assert saved["robot_host"] == "mongo"
+
+
+def test_pallet_pick_alignment_is_safe_in_simulation(client: TestClient) -> None:
+    board = client.get("/api/board").json()
+
+    response = client.post(
+        "/api/settings/robot/align-pallet-pick",
+        json={"expected_revision": board["revision"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "simulated"
