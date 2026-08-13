@@ -2,6 +2,7 @@ const ui = {
   state: document.querySelector("#system-state"),
   form: document.querySelector("#settings-form"),
   source: document.querySelector("#source-folder"),
+  backgroundStackLightIntensity: document.querySelector("#background-stack-light-intensity"), backgroundStackLightIntensityValue: document.querySelector("#background-stack-light-intensity-value"), backgroundStackLightIntensityRow: document.querySelector("#background-stack-light-intensity-row"),
   extensions: document.querySelector("#program-extensions"),
   unit: document.querySelector("#weight-unit"),
   poolSlotCount: document.querySelector("#pool-slot-count"),
@@ -30,6 +31,8 @@ const ui = {
   stackLightBlue: document.querySelector("#stack-light-blue"),
   stackLightWhite: document.querySelector("#stack-light-white"),
   stackLightAlarm: document.querySelector("#stack-light-alarm"),
+  stackLightStateFields: Array.from(document.querySelectorAll("[data-stack-light-state]")),
+  pushNotificationsEnabled: document.querySelector("#push-notifications-enabled"), pushNotificationServer: document.querySelector("#push-notification-server"), pushNotificationTopic: document.querySelector("#push-notification-topic"), pushNotificationToken: document.querySelector("#push-notification-token"), pushNotifyErrors: document.querySelector("#push-notify-errors"), pushNotifyCompletedPallets: document.querySelector("#push-notify-completed-pallets"), pushNotifyQueueEmpty: document.querySelector("#push-notify-queue-empty"), testPushNotification: document.querySelector("#test-push-notification"), testPushNotificationStatus: document.querySelector("#test-push-notification-status"), restartBackend: document.querySelector("#restart-backend"), restartBackendStatus: document.querySelector("#restart-backend-status"),
   robotConnectionMode: document.querySelector("#robot-connection-mode"),
   robotHost: document.querySelector("#robot-host"),
   robotPort: document.querySelector("#robot-port"),
@@ -176,6 +179,19 @@ let savedSettingsSignature = "";
 let savedSettingsDraft = null;
 let intermediateSafePoses = [];
 let isDirty = false;
+const STACK_LIGHT_COLORS = ["red", "amber", "green", "blue", "white", "off"];
+const DEFAULT_STACK_LIGHT_STATE_COLORS = {
+  alarm: "red",
+  idle: "green",
+  running: "blue",
+  loading: "blue",
+  machining: "blue",
+  unloading: "blue",
+  waiting: "amber",
+  automatic_recovery: "amber",
+  guided_recovery: "white",
+  manual_control: "amber",
+};
 let isLoadingSettings = false;
 let allowNavigation = false;
 let pendingNavigation = null;
@@ -192,7 +208,7 @@ function organizeSettingsPage() {
       eyebrow: "General",
       title: "Production and display",
       description: "Shared scheduling, pallet, workholding, and operator display settings.",
-      panels: ["Display", "Cameras"],
+      panels: ["Display", "Backend", "Cameras"],
       widePanels: [],
     },
     {
@@ -226,6 +242,14 @@ function organizeSettingsPage() {
       description: "Diagnostic access, test controls, saving, and backend lifecycle actions.",
       panels: ["Debugging controls", "Backup & updates"],
       widePanels: ["Debugging controls", "Backup & updates"],
+    },
+    {
+      id: "settings-notifications",
+      eyebrow: "Notifications",
+      title: "Push notifications",
+      description: "Phone push delivery for production errors and completed pallets.",
+      panels: ["Notifications"],
+      widePanels: ["Notifications"],
     },
   ];
   const actions = ui.form.querySelector(".settings-actions");
@@ -748,10 +772,15 @@ function settingsDraft() {
     if (index > (bank === "tool" ? 1 : 7)) throw new Error(`${name[0].toUpperCase()}${name.slice(1)} stack-light output is outside the ${bank} output range.`);
     stackLightOutputs[name] = {bank, index};
   });
+  const stackLightStateColors = Object.fromEntries(ui.stackLightStateFields.map(field => [
+    field.dataset.stackLightState,
+    field.value || DEFAULT_STACK_LIGHT_STATE_COLORS[field.dataset.stackLightState],
+  ]));
   return {
     source_folder: ui.source.value,
     program_extensions: programExtensions(),
     weight_unit: ui.unit.value,
+    ...(Object.prototype.hasOwnProperty.call(board.settings, "background_stack_light_intensity") ? {background_stack_light_intensity: fieldNumber(ui.backgroundStackLightIntensity, 65)} : {}),
     pool_slot_count: fieldNumber(ui.poolSlotCount, board.settings.pool_slot_count),
     on_deck_enabled: ui.onDeckEnabled.checked,
     dripping_enabled: ui.drippingEnabled.checked,
@@ -776,6 +805,16 @@ function settingsDraft() {
     manual_io_control_enabled: ui.manualIoControlEnabled.checked,
     stack_light_enabled: ui.stackLightEnabled.checked,
     stack_light_outputs: stackLightOutputs,
+    stack_light_state_colors: stackLightStateColors,
+    ...(Object.prototype.hasOwnProperty.call(board.settings, "push_notifications_enabled") ? {
+      push_notifications_enabled: ui.pushNotificationsEnabled.checked,
+      push_notification_server: ui.pushNotificationServer.value.trim() || "https://ntfy.sh",
+      push_notification_topic: ui.pushNotificationTopic.value.trim(),
+      push_notification_token: ui.pushNotificationToken.value,
+      push_notify_errors: ui.pushNotifyErrors.checked,
+      push_notify_completed_pallets: ui.pushNotifyCompletedPallets.checked,
+      push_notify_queue_empty: ui.pushNotifyQueueEmpty.checked,
+    } : {}),
     robot_connection_mode: ui.robotConnectionMode.value,
     robot_host: ui.robotHost.value.trim(),
     robot_port: fieldNumber(ui.robotPort, board.settings.robot_port || 30003),
@@ -933,10 +972,17 @@ async function loadSettings() {
     isLoadingSettings = true;
     await loadHealth();
     board = await api("/api/settings");
+    const pushSupported = Object.prototype.hasOwnProperty.call(board.settings, "push_notifications_enabled");
+    document.querySelector("#settings-tab-notifications")?.classList.toggle("hidden", !pushSupported);
+    document.querySelector("#settings-notifications")?.toggleAttribute("hidden", !pushSupported);
     ui.savePoolLocationsDuringRunRow.classList.toggle("hidden", !board.run_mode?.manual_robot_pause);
     ui.source.value = board.settings.source_folder;
     ui.extensions.value = board.settings.program_extensions.join(", ");
     ui.unit.value = board.settings.weight_unit;
+    const backgroundLightSupported = Object.prototype.hasOwnProperty.call(board.settings, "background_stack_light_intensity");
+    ui.backgroundStackLightIntensityRow.classList.toggle("hidden", !backgroundLightSupported);
+    ui.backgroundStackLightIntensity.value = board.settings.background_stack_light_intensity ?? 65;
+    ui.backgroundStackLightIntensityValue.textContent = `${ui.backgroundStackLightIntensity.value}%`;
     ui.poolSlotCount.value = board.settings.pool_slot_count;
     ui.onDeckEnabled.checked = board.settings.on_deck_enabled !== false;
     ui.drippingEnabled.checked = board.settings.dripping_enabled !== false;
@@ -958,10 +1004,24 @@ async function loadSettings() {
     ui.debugMenuEnabled.checked = board.settings.debug_menu_enabled;
     ui.manualIoControlEnabled.checked = board.settings.manual_io_control_enabled;
     ui.stackLightEnabled.checked = board.settings.stack_light_enabled === true;
+    ui.pushNotificationsEnabled.checked = board.settings.push_notifications_enabled === true;
+    ui.pushNotificationServer.value = board.settings.push_notification_server || "https://ntfy.sh";
+    ui.pushNotificationTopic.value = board.settings.push_notification_topic || "";
+    ui.pushNotificationToken.value = "";
+    ui.pushNotificationToken.placeholder = board.settings.push_notification_token_configured ? "Saved token configured — leave blank to keep it" : "Optional token";
+    ui.pushNotifyErrors.checked = board.settings.push_notify_errors !== false;
+    ui.pushNotifyCompletedPallets.checked = board.settings.push_notify_completed_pallets !== false;
+    ui.pushNotifyQueueEmpty.checked = board.settings.push_notify_queue_empty !== false;
     const stackLightOutputs = board.settings.stack_light_outputs || {};
     [["red", ui.stackLightRed], ["amber", ui.stackLightAmber], ["green", ui.stackLightGreen], ["blue", ui.stackLightBlue], ["white", ui.stackLightWhite], ["alarm", ui.stackLightAlarm]].forEach(([name, field]) => {
       const output = stackLightOutputs[name];
       field.value = output ? `${output.bank}:${output.index}` : "";
+    });
+    const stackLightStateColors = board.settings.stack_light_state_colors || DEFAULT_STACK_LIGHT_STATE_COLORS;
+    ui.stackLightStateFields.forEach(field => {
+      field.innerHTML = STACK_LIGHT_COLORS.map(color => `<option value="${color}">${color[0].toUpperCase()}${color.slice(1)}</option>`).join("");
+      const state = field.dataset.stackLightState;
+      field.value = stackLightStateColors[state] || DEFAULT_STACK_LIGHT_STATE_COLORS[state];
     });
     ui.robotConnectionMode.value = board.settings.robot_connection_mode;
     ui.robotHost.value = board.settings.robot_host || "";
@@ -1126,9 +1186,63 @@ ui.form.addEventListener("submit", async event => {
   await saveSettings();
 });
 
+ui.testPushNotification.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save notification settings before sending a test.", "error");
+    return;
+  }
+  const originalLabel = ui.testPushNotification.textContent;
+  ui.testPushNotification.disabled = true;
+  ui.testPushNotification.textContent = "Sending...";
+  ui.testPushNotificationStatus.textContent = "Queuing a test notification...";
+  try {
+    const result = await api("/api/settings/push-notification/test", {method: "POST", body: "{}"});
+    ui.testPushNotificationStatus.textContent = result.message;
+    showToast("Test notification queued.");
+  } catch (error) {
+    ui.testPushNotificationStatus.textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    ui.testPushNotification.disabled = false;
+    ui.testPushNotification.textContent = originalLabel;
+  }
+});
+
+ui.restartBackend.addEventListener("click", async () => {
+  if (hasUnsavedChanges()) {
+    showToast("Save or discard Settings changes before restarting the backend.", "error");
+    return;
+  }
+  if (await window.mpsConfirm({
+    eyebrow: "Backend restart",
+    title: "Restart MPS now?",
+    message: "MPS will close its controller connections and restart. It will not start the robot or mill. This is available only when Run Mode and robot movement are stopped.",
+    tone: "warning",
+    primaryLabel: "Restart backend",
+  }) !== "primary") return;
+  ui.restartBackend.disabled = true;
+  ui.restartBackend.textContent = "Restarting...";
+  ui.restartBackendStatus.textContent = "Requesting a safe backend restart...";
+  try {
+    const result = await api("/api/system/relaunch", {method: "POST", body: "{}"});
+    ui.restartBackendStatus.textContent = "Restart queued. Reload this page in a few seconds.";
+    showToast(result.message);
+  } catch (error) {
+    ui.restartBackendStatus.textContent = error.message;
+    ui.restartBackend.disabled = false;
+    ui.restartBackend.textContent = "Restart backend";
+    showToast(error.message, "error");
+  }
+});
+
 bindPrecisionRounding(ui.form);
 
 ui.robotConnectionMode.addEventListener("change", syncRobotModeUi);
+ui.backgroundStackLightIntensity.addEventListener("input", () => {
+  const value = fieldNumber(ui.backgroundStackLightIntensity, 65);
+  ui.backgroundStackLightIntensityValue.textContent = `${value}%`;
+  document.body.style.setProperty("--ambient-strength", `${value}%`);
+});
 ui.onDeckEnabled.addEventListener("change", syncOptionalStationUi);
 ui.drippingEnabled.addEventListener("change", syncOptionalStationUi);
 ui.alignRobotPalletPick.addEventListener("click", async () => {

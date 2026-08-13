@@ -14,6 +14,7 @@ function currentRemainingSeconds(data) {
   if (!data.machine_pallet || !Number.isFinite(data.current_cycle_seconds)) return null;
   return Math.max(0, data.current_cycle_seconds - elapsedMachiningSeconds(data));
 }
+function cycleIsCounting(data) { return Boolean(data.machine_pallet && data.current_cycle_started_at); }
 function queueRemainingSeconds(data) {
   let total = data.queue.reduce((sum, pallet) => sum + (Number(pallet.estimated_cycle_seconds ?? pallet.expected_cycle_seconds) || 0), 0);
   if (!data.machine_pallet) return total;
@@ -25,6 +26,7 @@ function renderTimers() {
   if (!dashboard) return;
   ui.queueTime.textContent = duration(queueRemainingSeconds(dashboard));
   ui.currentCycle.textContent = duration(currentRemainingSeconds(dashboard));
+  renderQueue(dashboard);
 }
 function toolChips(tools, empty, states = {}) { return tools.length ? tools.map(tool => { const status = states?.[tool.slice(1)]?.status || "unknown"; return `<span class="tool-chip tool-status-${escapeHtml(status)}">${escapeHtml(tool)}</span>`; }).join("") : `<span class="muted">${empty}</span>`; }
 function renderCameras(cameras) {
@@ -60,12 +62,24 @@ function renderProgramCompletions(items) {
     <button class="button danger" type="button" data-reset-completion>Reset</button>
   </article>`).join("");
 }
+function renderQueue(data) {
+  ui.queue.innerHTML = data.queue.length ? data.queue.map((pallet, index) => {
+    const active = data.machine_pallet?.id === pallet.id;
+    const counting = active && cycleIsCounting(data);
+    const time = active ? currentRemainingSeconds(data) : (pallet.estimated_cycle_seconds ?? pallet.expected_cycle_seconds);
+    const timingLabel = active
+      ? counting ? "Machining — live remaining" : "Paused — estimated cycle"
+      : escapeHtml(pallet.estimate_source || "Posted estimate");
+    return `<article class="dashboard-queue-item"><span class="queue-number">${index + 1}</span><div><strong>${escapeHtml(pallet.name)}</strong><small>${escapeHtml(pallet.program_path || "No program assigned")}</small><small>${timingLabel}</small></div><div>${toolChips(pallet.program_tools, "No active tools")}</div><strong>${duration(time)}</strong></article>`;
+  }).join("") : `<p class="debug-table-empty">No pallets are queued.</p>`;
+}
 function render(data) {
   dashboard = data;
   renderTimers(); ui.queueCount.textContent = `${data.queue.length} pallet${data.queue.length === 1 ? "" : "s"}`;
-  ui.currentPallet.textContent = data.machine_pallet ? `${data.machine_pallet.name}${data.current_cycle_started_at ? " — remaining" : ""}` : "No pallet in Mill";
+  ui.currentPallet.textContent = data.machine_pallet
+    ? `${data.machine_pallet.name} — ${cycleIsCounting(data) ? "live remaining" : "paused estimate"}`
+    : "No pallet in Mill";
   ui.queueTools.innerHTML = toolChips(data.queue_tools, "No queued program tools", data.queue_tool_states); ui.atcTools.innerHTML = toolChips(data.atc_tools, data.atc_source || "Mill telemetry not connected", Object.fromEntries(data.atc_tools.map(tool => [tool.slice(1), {status: "atc"}])));
-  ui.queue.innerHTML = data.queue.length ? data.queue.map((pallet, index) => { const active = data.machine_pallet?.id === pallet.id; const time = active ? currentRemainingSeconds(data) : (pallet.estimated_cycle_seconds ?? pallet.expected_cycle_seconds); return `<article class="dashboard-queue-item"><span class="queue-number">${index + 1}</span><div><strong>${escapeHtml(pallet.name)}</strong><small>${escapeHtml(pallet.program_path || "No program assigned")}</small><small>${active ? "Machining — remaining" : escapeHtml(pallet.estimate_source || "Posted estimate")}</small></div><div>${toolChips(pallet.program_tools, "No active tools")}</div><strong>${duration(time)}</strong></article>`; }).join("") : `<p class="debug-table-empty">No pallets are queued.</p>`;
   renderCameras(data.cameras);
   renderProgramCompletions(data.program_completions);
   ui.updated.textContent = `Updated ${new Date().toLocaleTimeString()}`; ui.state.classList.add("online"); ui.state.lastChild.textContent = " Online";

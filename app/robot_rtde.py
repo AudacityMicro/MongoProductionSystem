@@ -491,6 +491,60 @@ def set_robot_digital_output(host: str, port: int, timeout_seconds: float, bank:
         _MODBUS_RETRY_AFTER.pop(host, None)
 
 
+def set_robot_digital_outputs(
+    host: str,
+    port: int,
+    timeout_seconds: float,
+    outputs: list[tuple[str, int, bool]],
+) -> None:
+    """Apply a related set of auxiliary outputs atomically per Modbus bank."""
+    del port
+    updates: dict[int, dict[int, bool]] = {}
+    for bank, index, enabled in outputs:
+        if bank == "standard":
+            register, bit = 1, index
+        elif bank == "configurable":
+            register, bit = 31, index
+        elif bank == "tool":
+            register, bit = 1, index + 8
+        else:
+            raise RobotTelemetryError(f"Unknown digital output bank: {bank}")
+        if not 0 <= index <= (1 if bank == "tool" else 7):
+            raise RobotTelemetryError(f"Invalid {bank} output index: {index}")
+        updates.setdefault(register, {})[bit] = bool(enabled)
+
+    if not updates:
+        return
+
+    next_values: dict[int, int] = {}
+    with _MODBUS_IO_LOCK:
+        try:
+            connection = socket.create_connection((host, 502), timeout=timeout_seconds)
+            connection.settimeout(timeout_seconds)
+            for register, bits in updates.items():
+                current_value = _read_modbus_registers_on_connection(connection, register, 1)[0]
+                next_value = current_value
+                for bit, enabled in bits.items():
+                    next_value = (next_value | (1 << bit)) if enabled else (next_value & ~(1 << bit))
+                if next_value != current_value:
+                    _write_modbus_register_on_connection(connection, register, next_value)
+                next_values[register] = next_value
+        except (OSError, RobotTelemetryError) as exc:
+            raise RobotTelemetryError(f"Robot Modbus output update failed: {exc}") from exc
+        finally:
+            if "connection" in locals():
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+        cached = _MODBUS_IO_CACHE.get(host)
+        if cached:
+            values = dict(cached[1])
+            values.update(next_values)
+            _MODBUS_IO_CACHE[host] = (monotonic(), values)
+        _MODBUS_RETRY_AFTER.pop(host, None)
+
+
 def _read_legacy_controller_io(host: str, timeout_seconds: float) -> dict[int, int]:
     # UR CB-series Modbus registers 0/1 are standard input/output and 30/31
     # are configurable input/output. This avoids RTDE v1's unreliable masks.

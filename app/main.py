@@ -125,6 +125,7 @@ from app.service import (
     toggle_debug_io,
     update_pallet,
     update_settings,
+    queue_push_notification_test,
     start_pallet_motion,
     start_mill_pallet_transfer,
     start_automatic_put_away,
@@ -134,6 +135,7 @@ from app.service import (
     interrupt_active_pallet_motion,
     interrupt_robot_reliability_test,
     interrupt_run_mode,
+    refresh_stack_light,
     execute_run_mode,
     start_run_mode,
     stop_run_mode,
@@ -311,6 +313,9 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
                 start_robot_supervisor_recovery_watchdog(application.state.session_factory)
                 start_mill_supervisor_listener(session)
                 start_mill_supervisor_recovery_watchdog(application.state.session_factory)
+                # Reassert the complete configured light state after every backend
+                # start so controller outputs cannot retain a stale prior color.
+                refresh_stack_light(session)
         diagnostics().record(
             "application",
             "started",
@@ -1013,6 +1018,10 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     ) -> dict:
         cleared = update_settings(session, payload)
         return {"board": board_snapshot(session), "cleared_assignments": cleared}
+
+    @application.post("/api/settings/push-notification/test", status_code=status.HTTP_202_ACCEPTED)
+    def test_push_notification(session: Session = Depends(get_session)) -> dict[str, str]:
+        return queue_push_notification_test(session)
 
     @application.post("/api/programs/refresh")
     def scan_programs(

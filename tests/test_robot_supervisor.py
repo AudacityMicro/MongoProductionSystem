@@ -30,6 +30,41 @@ def event_frame(sequence: int, event: int) -> bytes:
     return encode_frame(KIND_EVENT, [9001, sequence, event, 0, 1, sequence])
 
 
+def test_only_terminal_no_motion_maintenance_gap_is_automatically_repairable(client) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_last_sequence = 8
+        command = RobotSupervisorCommand(
+            id="maintenance-gap",
+            sequence=8,
+            robot_session=9001,
+            robot_motion_id=None,
+            operation="bootstrap_restart",
+            opcode=21,
+            argument=0,
+            value=0,
+            payload_g=0,
+            transport="supervisor",
+            status="operator_completed",
+            attempted=True,
+            created_at="2026-08-10T00:00:00+00:00",
+        )
+        session.add(command)
+        session.commit()
+        live = {
+            "connected": True,
+            "latched": False,
+            "robot_last_sequence": 7,
+            "telemetry": {"safety_mode": 1, "runtime_state": 1},
+        }
+
+        assert service._repairable_supervisor_maintenance_gap(session, settings, live) is command
+
+        command.operation = "pick_pool"
+        session.commit()
+        assert service._repairable_supervisor_maintenance_gap(session, settings, live) is None
+
+
 def test_fragmented_numeric_frames_are_reassembled() -> None:
     frame = event_frame(7, EVENT_COMPLETED)
     buffer = FrameBuffer()

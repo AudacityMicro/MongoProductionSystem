@@ -13,7 +13,9 @@
   --warning: #d99b28;
   --danger: #b9342b;
   --shadow: 0 16px 42px rgba(23, 33, 29, 0.1);
-  --ambient-tint: rgba(104, 151, 79, 0.055);
+  --ambient-strength: 65%;
+  --ambient-tint: color-mix(in srgb, rgba(61, 126, 207, 0.18) var(--ambient-strength), transparent);
+  --ambient-tint-secondary: color-mix(in srgb, rgba(61, 126, 207, 0.07) var(--ambient-strength), transparent);
 }
 
 * {
@@ -25,22 +27,23 @@ body {
   margin: 0;
   color: var(--ink);
   background:
-    radial-gradient(110% 90% at 50% 0%, var(--ambient-tint), transparent 74%),
+    radial-gradient(100% 90% at 50% -10%, var(--ambient-tint), transparent 71%),
+    radial-gradient(72% 70% at 100% 112%, var(--ambient-tint-secondary), transparent 76%),
     linear-gradient(90deg, transparent 49.9%, rgba(23, 33, 29, 0.045) 50%),
     var(--paper);
-  background-size: 140% 140%, auto, auto;
-  animation: ambient-stack-light 14s ease-in-out infinite alternate;
-  transition: background-color 1.8s ease;
+  background-size: 150% 145%, 145% 145%, auto, auto;
+  animation: ambient-stack-light 11s ease-in-out infinite alternate;
+  transition: background-color 1.2s ease;
   font-family: "Manrope", "Trebuchet MS", sans-serif;
 }
 
-body.ambient-running,
-body.ambient-idle { --ambient-tint: rgba(104, 151, 79, 0.065); }
-body.ambient-alarm { --ambient-tint: rgba(185, 67, 48, 0.08); }
+body.ambient-running { --ambient-tint: color-mix(in srgb, rgba(90, 165, 78, 0.22) var(--ambient-strength), transparent); --ambient-tint-secondary: color-mix(in srgb, rgba(90, 165, 78, 0.085) var(--ambient-strength), transparent); }
+body.ambient-idle { --ambient-tint: color-mix(in srgb, rgba(61, 126, 207, 0.20) var(--ambient-strength), transparent); --ambient-tint-secondary: color-mix(in srgb, rgba(61, 126, 207, 0.075) var(--ambient-strength), transparent); }
+body.ambient-alarm { --ambient-tint: color-mix(in srgb, rgba(205, 57, 43, 0.28) var(--ambient-strength), transparent); --ambient-tint-secondary: color-mix(in srgb, rgba(205, 57, 43, 0.10) var(--ambient-strength), transparent); }
 
 @keyframes ambient-stack-light {
-  from { background-position: 0% 0%, 0 0, 0 0; }
-  to { background-position: 100% 12%, 0 0, 0 0; }
+  from { background-position: 0% 0%, 100% 100%, 0 0, 0 0; }
+  to { background-position: 100% 18%, 0% 82%, 0 0, 0 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -439,6 +442,8 @@ p {
 .managed-library-row span { overflow-wrap: anywhere; }
 .location-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: 0.65rem; }
 .location-fieldset { min-width: 0; margin: 0; padding: 0.6rem; border: 1px solid var(--line); background: #f7f4eb; }
+.stack-light-state-settings { margin-top: 0.75rem; }
+.stack-light-state-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.65rem; }
 .location-fieldset legend { padding: 0 0.25rem; color: var(--signal); font: 0.72rem "DM Mono", Consolas, monospace; }
 .motion-pose-heading { display: grid; gap: 0.2rem; margin: 0 0 0.65rem; }
 .motion-pose-heading strong { color: var(--signal); font: 0.82rem "DM Mono", Consolas, monospace; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -932,7 +937,7 @@ p {
 }
 
 .pool-position .pallet-card.content-empty { background: #edf0ea; }
-.pool-position .pallet-card.content-raw_stock { background: rgba(217, 155, 40, 0.18); }
+.pool-position .pallet-card.content-raw_stock { background: rgba(61, 126, 207, 0.18); }
 .pool-position .pallet-card.content-complete_parts { background: rgba(115, 169, 66, 0.16); }
 .pool-position .pallet-card.content-defective_parts { background: rgba(228, 86, 43, 0.15); }
 
@@ -1085,7 +1090,7 @@ p {
 }
 
 .content-raw_stock {
-  border-top-color: #d99b28;
+  border-top-color: #3d7ecf;
 }
 
 .content-complete_parts {

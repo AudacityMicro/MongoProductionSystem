@@ -13,6 +13,8 @@
     const mode = hasAlarm ? "alarm" : run.enabled ? "running" : "idle";
     document.body.classList.remove("ambient-running", "ambient-idle", "ambient-alarm");
     document.body.classList.add(`ambient-${mode}`);
+    const intensity = Number(board?.settings?.background_stack_light_intensity);
+    document.body.style.setProperty("--ambient-strength", `${Number.isFinite(intensity) ? intensity : 65}%`);
   };
   const load = async () => {
     try {

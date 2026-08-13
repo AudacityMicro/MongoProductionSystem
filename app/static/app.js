@@ -904,7 +904,7 @@ async function previewAutoschedule() {
 document.querySelector("#create-pallet").addEventListener("click", () => openPalletDialog());
 document.querySelector("#autoschedule-queue").addEventListener("click", previewAutoschedule);
 
-ui.runModeToggle.addEventListener("click", () => {
+ui.runModeToggle.addEventListener("click", async () => {
   if (runModeStartPending && !board.run_mode?.enabled) {
     runModeStopQueued = true;
     renderRunMode();
@@ -920,50 +920,64 @@ ui.runModeToggle.addEventListener("click", () => {
     return;
   }
   const queued = board.pallets.filter(item => item.queue_position !== null).length;
-  const startMessage = queued
-    ? `Run ${queued} queued pallet${queued === 1 ? "" : "s"} in order, then remain armed for later pallets?`
-    : "Arm Run Mode and wait for pallets added to the production queue?";
-  askConfirmation("Start run mode", startMessage, async () => {
-    runModeStartPending = true;
-    runModeStopQueued = false;
-    pendingRunModeRequestId = newRunModeRequestId();
-    renderRunMode();
-    try {
-      board = await api("/api/run-mode/start", {
+  const machine = board.pallets.find(item => item.location === "machine");
+  let loadedMachineAction = null;
+  if (machine) {
+    const choice = await window.mpsConfirm({
+      eyebrow: "Pallet already in mill",
+      title: `What should MPS do with ${machine.name}?`,
+      message: "Choose the first action. MPS returns this pallet to its reserved pool slot, then continues the queue. It will still check that PathPilot is idle before moving the mill or robot.",
+      tone: "warning",
+      secondaryLabel: "Unload, then start queue",
+      primaryLabel: "Run program, then unload",
+    });
+    if (!choice) return;
+    loadedMachineAction = choice === "primary" ? "run_machine_program" : "unload_then_queue";
+  } else {
+    const startMessage = queued
+      ? `Run ${queued} queued pallet${queued === 1 ? "" : "s"} in order, then remain armed for later pallets?`
+      : "Arm Run Mode and wait for pallets added to the production queue?";
+    if (await window.mpsConfirm({title: "Start run mode", message: startMessage}) !== "primary") return;
+  }
+  runModeStartPending = true;
+  runModeStopQueued = false;
+  pendingRunModeRequestId = newRunModeRequestId();
+  renderRunMode();
+  try {
+    board = await api("/api/run-mode/start", {
+      method: "POST",
+      body: JSON.stringify({expected_revision: board.revision, request_id: pendingRunModeRequestId, loaded_machine_action: loadedMachineAction}),
+    });
+    renderBoard();
+    if (runModeStopQueued) {
+      board = await api("/api/run-mode/stop", {
         method: "POST",
-        body: JSON.stringify({expected_revision: board.revision, request_id: pendingRunModeRequestId}),
+        body: JSON.stringify({expected_revision: board.revision}),
       });
       renderBoard();
-      if (runModeStopQueued) {
-        board = await api("/api/run-mode/stop", {
-          method: "POST",
-          body: JSON.stringify({expected_revision: board.revision}),
-        });
-        renderBoard();
-        showToast("Run Mode start cancelled.");
-      } else {
-        showToast("Run mode start requested. Controller checks are running.");
-      }
-    } catch (error) {
-      showToast(error.message, "error");
-      try {
-        board = await api("/api/board");
-        renderBoard();
-        if (reconcilePendingRunModeStart(board)) {
-          renderRunMode();
-          showToast("Run Mode did not start. The control is ready to try again.", "error");
-          return;
-        }
-      } catch (_refreshError) {
-        showToast("Run Mode start status is unknown. The control remains locked until the connection is restored.", "error");
+      showToast("Run Mode start cancelled.");
+    } else {
+      showToast("Run mode start requested. Controller checks are running.");
+    }
+  } catch (error) {
+    showToast(error.message, "error");
+    try {
+      board = await api("/api/board");
+      renderBoard();
+      if (reconcilePendingRunModeStart(board)) {
+        renderRunMode();
+        showToast("Run Mode did not start. The control is ready to try again.", "error");
         return;
       }
+    } catch (_refreshError) {
+      showToast("Run Mode start status is unknown. The control remains locked until the connection is restored.", "error");
+      return;
     }
-    runModeStartPending = false;
-    runModeStopQueued = false;
-    pendingRunModeRequestId = null;
-    renderRunMode();
-  });
+  }
+  runModeStartPending = false;
+  runModeStopQueued = false;
+  pendingRunModeRequestId = null;
+  renderRunMode();
 });
 
 ui.resumeQueueAfterManualRobot.addEventListener("click", async () => {

@@ -287,6 +287,30 @@ def test_output_toggle_updates_cached_register(monkeypatch) -> None:
     assert robot_rtde._MODBUS_IO_CACHE[host][1][1] == 17
 
 
+def test_related_output_update_writes_one_combined_value_per_register(monkeypatch) -> None:
+    host = "192.0.2.21"
+    robot_rtde._MODBUS_IO_CACHE[host] = (0.0, {1: 0b1011, 31: 0})
+    connection = FakeModbusConnection()
+    monkeypatch.setattr(robot_rtde.socket, "create_connection", lambda *_args, **_kwargs: connection)
+
+    robot_rtde.set_robot_digital_outputs(
+        host,
+        30003,
+        0.5,
+        [
+            ("standard", 0, False),
+            ("standard", 1, False),
+            ("standard", 2, False),
+            ("standard", 3, False),
+            ("standard", 5, True),
+            ("standard", 7, False),
+        ],
+    )
+
+    assert connection.requests == 2
+    assert robot_rtde._MODBUS_IO_CACHE[host][1][1] == 0b100000
+
+
 def test_telemetry_failure_uses_bounded_automatic_reconnect_backoff(monkeypatch) -> None:
     host = "192.0.2.30"
     key = (host, 30003)

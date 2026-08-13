@@ -14,6 +14,15 @@ def _start(client: TestClient) -> dict:
     return response.json()
 
 
+def _skip_controller_program_rebuilds(monkeypatch) -> None:
+    """Keep recovery workflow tests independent of physical controller file access."""
+    monkeypatch.setattr(
+        service,
+        "_rebuild_generated_programs_for_recovery",
+        lambda _session, _actions, _progress: None,
+    )
+
+
 def test_recovery_wizard_persists_happy_path_until_final_approval(client: TestClient) -> None:
     initial = client.get("/api/recovery/status")
     assert initial.status_code == 200
@@ -50,7 +59,8 @@ def test_recovery_wizard_persists_happy_path_until_final_approval(client: TestCl
 
     persisted = client.get("/api/recovery/status").json()
     assert persisted["active"] is False
-    assert persisted["session"] is None
+    assert persisted["session"]["id"] == session["id"]
+    assert persisted["session"]["status"] == "completed"
 
 
 def test_recovery_start_is_idempotent_while_a_session_is_active(client: TestClient) -> None:
@@ -96,6 +106,7 @@ def test_recovery_reconciles_verified_pallet_location_and_supervisor_command(
     client: TestClient,
     monkeypatch,
 ) -> None:
+    _skip_controller_program_rebuilds(monkeypatch)
     motion_id = str(uuid4())
     pallet_id = str(uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -187,6 +198,7 @@ def test_recovery_guides_and_reconciles_uncertain_robot_command_without_motion(
     client: TestClient,
     monkeypatch,
 ) -> None:
+    _skip_controller_program_rebuilds(monkeypatch)
     now = datetime.now(timezone.utc).isoformat()
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
@@ -244,6 +256,7 @@ def test_recovery_guides_and_reconciles_uncertain_mill_command(
     client: TestClient,
     monkeypatch,
 ) -> None:
+    _skip_controller_program_rebuilds(monkeypatch)
     now = datetime.now(timezone.utc).isoformat()
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
@@ -341,15 +354,7 @@ def test_recovery_preserves_machine_pallet_during_guided_run_stop(client: TestCl
         json={"session_id": started["session"]["id"], "choices": {"run_mode": "request_stop"}},
     )
     assert stopping.status_code == 200
-    assert stopping.json()["session"]["status"] == "handoff"
-    assert any(item["key"] == "run_mode_fault" for item in stopping.json()["guidance"])
-
-    recovered = client.post(
-        "/api/recovery/answer",
-        json={"session_id": started["session"]["id"], "choices": {"run_mode_fault": "stop_keep_machine"}},
-    )
-    assert recovered.status_code == 200
-    assert recovered.json()["session"]["status"] == "ready"
+    assert stopping.json()["session"]["status"] == "ready"
     with client.app.state.session_factory() as session:
         pallet = session.get(Pallet, pallet_id)
         assert pallet.location == "machine"

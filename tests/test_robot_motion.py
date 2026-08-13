@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -93,6 +94,33 @@ def test_pre_motion_alarm_emits_three_short_bursts_after_idle(client: TestClient
 
     assert [call[-1] for call in output_calls] == [True, False, True, False, True, False]
     assert all(call[3:5] == ("standard", 5) for call in output_calls)
+
+
+def test_recent_mill_motion_suppresses_duplicate_robot_warning(client: TestClient, monkeypatch) -> None:
+    output_calls: list[tuple] = []
+    monkeypatch.setattr(service, "set_robot_digital_output", lambda *args: output_calls.append(args))
+
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.0.2.10"
+        settings.stack_light_enabled = True
+        settings.stack_light_outputs = json.dumps({"alarm": {"bank": "standard", "index": 5}})
+        session.add(service.RobotMotion(
+            id="old-system-motion", pallet_id="pallet", operation="pick", source_slot=1,
+            program_path="/programs/pick.urp", status="succeeded",
+            created_at="2020-01-01T00:00:00+00:00", completed_at="2020-01-01T00:00:00+00:00",
+        ))
+        now = datetime.now(timezone.utc).isoformat()
+        session.add(service.MillSupervisorCommand(
+            id="recent-mill-motion", sequence=1, operation="run_program",
+            status="completed", attempted=True, created_at=now, completed_at=now,
+        ))
+        session.commit()
+
+        assert service.emit_pre_motion_alarm(session, "robot:load_mill") is False
+
+    assert output_calls == []
 
 
 def test_physical_motion_interlock_reads_live_telemetry_directly(client: TestClient, monkeypatch) -> None:

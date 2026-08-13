@@ -329,6 +329,7 @@ class ClearRobotFault(RevisionRequest):
 class StartRunMode(RevisionRequest):
     safety_confirm: bool | None = None
     request_id: str = Field(default="", max_length=36)
+    loaded_machine_action: Literal["unload_then_queue", "run_machine_program"] | None = None
 
 
 class SetRunModeSafety(RevisionRequest):
@@ -384,6 +385,15 @@ class SettingsUpdate(RevisionRequest):
     manual_io_control_enabled: bool | None = None
     stack_light_enabled: bool | None = None
     stack_light_outputs: dict[str, StackLightOutput] | None = None
+    stack_light_state_colors: dict[str, Literal["red", "amber", "green", "blue", "white", "off"]] | None = None
+    push_notifications_enabled: bool | None = None
+    push_notification_server: str | None = Field(default=None, max_length=500)
+    push_notification_topic: str | None = Field(default=None, max_length=200)
+    push_notification_token: str | None = Field(default=None, max_length=500)
+    push_notify_errors: bool | None = None
+    push_notify_completed_pallets: bool | None = None
+    push_notify_queue_empty: bool | None = None
+    background_stack_light_intensity: int | None = Field(default=None, ge=0, le=100)
     robot_connection_mode: RobotConnectionMode | None = None
     robot_host: str | None = Field(default=None, max_length=255)
     robot_port: int | None = Field(default=None, ge=1, le=65535)

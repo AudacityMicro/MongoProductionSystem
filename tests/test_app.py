@@ -147,7 +147,7 @@ def test_health_and_pages(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert payload["status"] == "ok"
-    assert payload["version"] == "0.3.0"
+    assert payload["version"] == "0.4.0"
     assert isinstance(payload["process_id"], int)
     assert payload["started_at"]
     schedule_page = client.get("/").text
@@ -164,7 +164,7 @@ def test_health_and_pages(client: TestClient) -> None:
     assert 'id="clear-mongo-fault"' not in debugging_page
     settings_page = client.get("/settings").text
     assert "System settings" in settings_page
-    assert "Close and relaunch" not in settings_page
+    assert 'id="restart-backend"' in settings_page
     assert "Workholding library" in settings_page
     assert 'id="workholding-options"' in schedule_page
     schedule_script_response = client.get("/static/app.js")
@@ -517,9 +517,148 @@ def test_settings_update_persists_stack_light_configuration(client: TestClient) 
     }
 
 
+def test_background_robot_recovery_uses_amber_stack_light(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        service._SUPERVISOR_BACKGROUND_RECOVERY.set()
+        try:
+            state = service._effective_stack_light_state(session, settings)
+        finally:
+            service._SUPERVISOR_BACKGROUND_RECOVERY.clear()
+
+    assert state == {
+        "red": False,
+        "amber": True,
+        "green": False,
+        "blue": False,
+        "white": False,
+        "alarm": False,
+    }
+
+
+def test_stack_light_colors_are_configurable_by_system_state(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+    colors = {
+        "alarm": "white",
+        "idle": "blue",
+        "running": "green",
+        "loading": "amber",
+        "machining": "green",
+        "unloading": "amber",
+        "waiting": "white",
+        "automatic_recovery": "amber",
+        "guided_recovery": "blue",
+        "manual_control": "off",
+    }
+    response = client.put(
+        "/api/settings",
+        json={"expected_revision": board["revision"], "stack_light_state_colors": colors},
+    )
+
+    assert response.status_code == 200
+    settings = response.json()["board"]["settings"]
+    assert settings["stack_light_state_colors"] == colors
+    assert settings["stack_light_state"]["blue"] is True
+    assert settings["stack_light_state"]["green"] is False
+
+    with client.app.state.session_factory() as session:
+        saved = service.get_settings(session)
+        saved.run_mode_state = "faulted"
+        saved.run_mode_enabled = False
+        state = service._stack_light_state(saved)
+    assert state["white"] is True
+    assert state["red"] is False
+    assert state["alarm"] is False
+
+
+def test_stack_light_state_colors_reject_unknown_states(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+    response = client.put(
+        "/api/settings",
+        json={"expected_revision": board["revision"], "stack_light_state_colors": {"mystery": "red"}},
+    )
+    assert response.status_code == 422
+
+
 def test_customer_scheduler_api_is_disabled_without_a_configured_key(client: TestClient) -> None:
     response = client.get("/api/customer/v1/catalog")
     assert response.status_code == 401
+
+
+def test_push_notification_settings_require_a_topic_and_hide_token(client: TestClient) -> None:
+    board = client.get("/api/settings").json()
+
+    missing_topic = client.put(
+        "/api/settings",
+        json={"expected_revision": board["revision"], "push_notifications_enabled": True},
+    )
+    assert missing_topic.status_code == 422
+
+    saved = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "push_notifications_enabled": True,
+            "push_notification_server": "https://ntfy.sh/",
+            "push_notification_topic": "mongo-test-private-topic",
+            "push_notification_token": "test-token",
+            "push_notify_errors": True,
+            "push_notify_completed_pallets": False,
+            "push_notify_queue_empty": False,
+        },
+    )
+    assert saved.status_code == 200
+    settings = saved.json()["board"]["settings"]
+    assert settings["push_notifications_enabled"] is True
+    assert settings["push_notification_server"] == "https://ntfy.sh/"
+    assert settings["push_notification_topic"] == "mongo-test-private-topic"
+    assert settings["push_notification_token_configured"] is True
+    assert "push_notification_token" not in settings
+    assert settings["push_notify_completed_pallets"] is False
+    assert settings["push_notify_queue_empty"] is False
+
+
+def test_push_notification_test_uses_saved_destination(client: TestClient, monkeypatch) -> None:
+    calls: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        service,
+        "_send_push_notification",
+        lambda _settings, event, message, *, force=False: calls.append((event, message, force)),
+    )
+
+    missing_destination = client.post("/api/settings/push-notification/test")
+    assert missing_destination.status_code == 422
+
+    with client.app.state.session_factory() as session:
+        service.get_settings(session).push_notification_topic = "mongo-test-private-topic"
+        session.commit()
+
+    response = client.post("/api/settings/push-notification/test")
+    assert response.status_code == 202
+    assert calls == [("test", "MPS test notification: push alerts are configured.", True)]
+
+
+def test_queue_complete_sends_one_push_notification(client: TestClient, monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(service, "_prepare_run_mode", lambda *_args: True)
+    monkeypatch.setattr(
+        service,
+        "_send_push_notification",
+        lambda _settings, event, message, **_kwargs: calls.append((event, message)),
+    )
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_start_request_id = "queue-complete-test"
+        settings.push_notifications_enabled = True
+        settings.push_notification_topic = "mongo-test-private-topic"
+        settings.push_notify_queue_empty = True
+        session.commit()
+
+    service.execute_run_mode(client.app.state.session_factory, "queue-complete-test")
+
+    assert calls == [("queue_empty", "MPS: the production queue is complete and waiting for the next pallet.")]
+    assert client.get("/api/board").json()["run_mode"]["state"] == "idle_waiting_queue"
 
 
 def test_stack_light_configuration_rejects_duplicate_outputs(client: TestClient) -> None:
@@ -641,6 +780,37 @@ def test_confirmed_machine_cycle_records_program_runtime(client: TestClient) -> 
         assert runtime is not None
         assert runtime.duration_seconds >= 1
         assert service.get_settings(session).run_mode_program_started_at is None
+
+
+def test_camera_settings_can_save_while_run_mode_is_active(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "machining"
+        session.commit()
+
+    board = client.get("/api/settings").json()
+    camera_save = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": board["revision"],
+            "camera_fps": 15,
+            "background_stack_light_intensity": 35,
+        },
+    )
+    assert camera_save.status_code == 200
+    assert camera_save.json()["board"]["settings"]["camera_fps"] == 15
+    assert camera_save.json()["board"]["settings"]["background_stack_light_intensity"] == 35
+
+    blocked = client.put(
+        "/api/settings",
+        json={
+            "expected_revision": camera_save.json()["board"]["revision"],
+            "robot_host": "192.168.1.50",
+        },
+    )
+    assert blocked.status_code == 409
+    assert "Run Mode is active" in blocked.json()["detail"]
 
 
 def test_manual_robot_pause_holds_run_mode_and_allows_pool_teaching(client: TestClient) -> None:
@@ -1085,6 +1255,42 @@ def test_armed_run_mode_waits_for_a_later_ready_queue_entry(client: TestClient) 
         assert settings.run_mode_state == "resuming"
 
 
+def test_start_run_mode_requires_an_explicit_choice_for_loaded_pallet(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        session.add(Pallet(
+            id="loaded-start-pallet", name="Loaded start", workholding="Vise", weight_kg=1,
+            content_status="raw_stock", program_path="loaded.nc", location="machine", return_pool_slot_number=2,
+        ))
+        settings = service.get_settings(session)
+        revision = settings.revision
+
+        with pytest.raises(HTTPException, match="Choose whether to unload"):
+            service.start_run_mode(session, StartRunMode(expected_revision=revision, request_id="loaded-no-choice"))
+
+        token = service.start_run_mode(session, StartRunMode(
+            expected_revision=revision,
+            request_id="loaded-run-program",
+            loaded_machine_action="run_machine_program",
+        ))
+        assert token == "loaded-run-program"
+        assert service.get_settings(session).run_mode_loaded_machine_action == "run_machine_program"
+
+
+def test_current_pathpilot_loading_program_repairs_stale_local_copy(client: TestClient, monkeypatch, tmp_path) -> None:
+    local_path = tmp_path / "mongo_mill_load_position.nc"
+    local_path.write_text("G53 G1 X0 Y0\n", encoding="ascii")
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        expected = service.build_mill_load_position_program(
+            service.pallet_location_positions(settings)["mill_load_unload_g53"]
+        )
+        monkeypatch.setattr(service, "_mill_load_position_local_path", lambda: local_path)
+        monkeypatch.setattr(service, "read_robot_file", lambda **_kwargs: {"binary": False, "too_large": False, "text": expected})
+        assert service._assert_mill_load_position_program_current(settings).endswith("mongo_mill_load_position.nc")
+
+    assert local_path.read_text(encoding="ascii") == expected
+
+
 def test_run_mode_cnc_cycle_starts_program_and_waits_for_idle(client: TestClient, monkeypatch) -> None:
     calls = []
     telemetry = iter((
@@ -1471,6 +1677,54 @@ def test_run_mode_retries_cnc_pre_dispatch_telemetry_without_starting_program(cl
     assert len(attempts) == 2
 
 
+def test_run_mode_restarts_idle_mill_helper_after_prolonged_pre_dispatch_outage(client: TestClient, monkeypatch) -> None:
+    attempts = []
+    helper_restarts = []
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        session.commit()
+
+    def run_cycle(*_args, **_kwargs):
+        attempts.append(True)
+        if len(attempts) <= 5:
+            raise service.CncPreDispatchTelemetryError("PathPilot telemetry unavailable")
+        return True
+
+    monkeypatch.setattr(service, "_run_cnc_cycle", run_cycle)
+    monkeypatch.setattr(
+        service,
+        "_recover_idle_mill_supervisor_for_pre_dispatch",
+        lambda _settings: helper_restarts.append(True) or "Idle helper restart requested.",
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _seconds: None)
+
+    assert service._run_mode_cnc_cycle(
+        client.app.state.session_factory,
+        "/home/operator/gcode/Gcode/job.nc",
+        cycle_label="The assigned program",
+    ) is True
+    assert len(attempts) == 6
+    assert helper_restarts == [True]
+
+
+def test_idle_mill_helper_restart_never_runs_when_pathpilot_is_not_idle(client: TestClient, monkeypatch) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.cnc_host = "tormach"
+        settings.cnc_ssh_password = "secret"
+        session.commit()
+        settings = service.get_settings(session)
+
+        monkeypatch.setattr(service, "read_linuxcnc_cycle_state", lambda *_args: {"interp_state": 2})
+        monkeypatch.setattr(service, "stop_mill_supervisor_agent", lambda *_args: pytest.fail("must not stop helper"))
+        monkeypatch.setattr(service, "start_mill_supervisor_agent", lambda *_args: pytest.fail("must not start helper"))
+
+        detail = service._recover_idle_mill_supervisor_for_pre_dispatch(settings)
+
+    assert "not Idle" in detail
+
+
 def test_mill_status_file_path_is_inside_pathpilot_data_root(client: TestClient) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)
@@ -1771,7 +2025,7 @@ def test_stop_override_cancels_pending_run_start_before_any_motion(client: TestC
         service.stop_run_mode(session, revision)
         settings = service.get_settings(session)
         assert settings.run_mode_enabled is False
-        assert settings.run_mode_state == "stopping"
+        assert settings.run_mode_state == "stopped"
         assert settings.run_mode_start_request_id == token
 
     service.execute_run_mode(client.app.state.session_factory, token)

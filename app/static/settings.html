@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260801-1">
+    <link rel="stylesheet" href="/static/styles.css?v=20260808-03">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/settings.js?v=20260806-08" defer></script>
+    <script src="/static/settings.js?v=20260808-05" defer></script>
     <script src="/static/system-status.js?v=20260806-01" defer></script>
   </head>
   <body>
@@ -44,10 +44,34 @@
         <button id="settings-tab-pool" type="button" role="tab" aria-controls="settings-pool" data-settings-tab="settings-pool">Pool</button>
         <button id="settings-tab-robot" type="button" role="tab" aria-controls="settings-robot" data-settings-tab="settings-robot">Robot</button>
         <button id="settings-tab-mill" type="button" role="tab" aria-controls="settings-mill" data-settings-tab="settings-mill">Mill</button>
+        <button id="settings-tab-notifications" type="button" role="tab" aria-controls="settings-notifications" data-settings-tab="settings-notifications">Notifications</button>
         <button id="settings-tab-system" type="button" role="tab" aria-controls="settings-system" data-settings-tab="settings-system">System</button>
       </nav>
 
       <form id="settings-form">
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">13</p>
+            <h2>Notifications</h2>
+            <p>Send phone push alerts when MPS encounters a production error or completes a pallet.</p>
+          </div>
+          <div class="panel-fields">
+            <label class="checkbox-control"><input id="push-notifications-enabled" type="checkbox"><span>Enable push notifications<small>Install the free ntfy app on each phone, then subscribe to the topic below.</small></span></label>
+            <div class="form-row">
+              <label>ntfy server<input id="push-notification-server" maxlength="500" value="https://ntfy.sh"></label>
+              <label>Private topic<input id="push-notification-topic" maxlength="200" placeholder="e.g. mongo-cell-7f3c91d8"></label>
+            </div>
+            <label>Optional ntfy access token<input id="push-notification-token" type="password" maxlength="500" autocomplete="new-password" placeholder="Leave blank to keep saved token"></label>
+            <div class="form-row">
+              <label class="checkbox-control"><input id="push-notify-errors" type="checkbox"><span>Errors<small>Run Mode faults and unrecoverable production errors.</small></span></label>
+              <label class="checkbox-control"><input id="push-notify-completed-pallets" type="checkbox"><span>Completed pallets<small>Sent after a pallet successfully finishes its assigned program.</small></span></label>
+              <label class="checkbox-control"><input id="push-notify-queue-empty" type="checkbox"><span>Queue complete<small>Sent once when the last queued pallet finishes and Run Mode is waiting for more work.</small></span></label>
+            </div>
+            <div class="inline-actions"><button id="test-push-notification" class="button secondary" type="button">Send test notification</button><span id="test-push-notification-status" class="field-help">Save your notification settings, then send a test to the subscribed phone.</span></div>
+            <p class="field-help">Use a long, unguessable topic. The default public ntfy server needs no account; an optional token supports a protected or self-hosted server. Delivery is non-blocking and never stops the cell.</p>
+          </div>
+        </section>
+
         <section class="settings-panel">
           <div class="panel-intro">
             <p class="section-number">Pool locations</p>
@@ -99,6 +123,11 @@
                 <option value="kg">Kilograms (kg)</option>
               </select>
             </label>
+            <label id="background-stack-light-intensity-row">
+              Background stack-light strength <output id="background-stack-light-intensity-value">65%</output>
+              <input id="background-stack-light-intensity" type="range" min="0" max="100" step="5" value="65">
+              <small>0% disables the background color. The default idle color is blue; running is green and alarms are red.</small>
+            </label>
             <label class="checkbox-control">
               <input id="debug-menu-enabled" type="checkbox">
               <span>
@@ -113,6 +142,18 @@
                 <small>Allows output LEDs on the Debugging page to write to the configured physical robot. Press Save settings to apply this change. Locked by default.</small>
               </span>
             </label>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-intro">
+            <p class="section-number">Backend</p>
+            <h2>Backend</h2>
+            <p>Restart the MPS web service without rebooting the computer.</p>
+          </div>
+          <div class="panel-fields">
+            <div class="inline-actions"><button id="restart-backend" class="button secondary" type="button">Restart backend</button><span id="restart-backend-status" class="field-help">Available only when Run Mode and robot movement are stopped.</span></div>
+            <p class="field-help">The restart does not start the robot or mill. It closes MPS connections and relaunches the backend after its safety check passes.</p>
           </div>
         </section>
 
@@ -200,13 +241,29 @@
             <fieldset class="location-fieldset">
               <legend>Mongo stack light and audible alarm</legend>
               <label class="checkbox-control"><input id="stack-light-enabled" type="checkbox"><span>Enable configured stack-light outputs<small>Disabled by default. MPS will only drive the outputs listed below; leave blank for unused functions.</small></span></label>
-              <p class="field-help">Use <code>standard:0</code>, <code>configurable:0</code>, or <code>tool:0</code>. Green = ready, blue = work active, amber = waiting/recovery, white = guided recovery, red + alarm = fault. The alarm also gives three short bursts before robot motion resumes after two idle minutes.</p>
+              <p class="field-help">Assign each lamp and the horn to a robot output using <code>standard:0</code>, <code>configurable:0</code>, or <code>tool:0</code>. Choose when each color is used below. The horn also gives three short bursts before robot motion resumes after two idle minutes.</p>
               <div class="form-row">
                 <label>Red<input id="stack-light-red" placeholder="standard:0"></label><label>Amber<input id="stack-light-amber" placeholder="standard:1"></label><label>Green<input id="stack-light-green" placeholder="standard:2"></label>
               </div>
               <div class="form-row">
                 <label>Blue<input id="stack-light-blue" placeholder="standard:3"></label><label>White<input id="stack-light-white" placeholder="standard:4"></label><label>Audible alarm<input id="stack-light-alarm" placeholder="standard:5"></label>
               </div>
+              <fieldset class="location-fieldset stack-light-state-settings">
+                <legend>Color by system state</legend>
+                <p class="field-help">Choose the physical light color for each state. “Off” leaves all color lamps off. Faults are visual only; the horn is reserved for the three-burst warning before machine or robot movement resumes after two idle minutes.</p>
+                <div class="stack-light-state-grid">
+                  <label>Alarm / fault<select id="stack-light-state-alarm" data-stack-light-state="alarm"></select></label>
+                  <label>Idle / ready<select id="stack-light-state-idle" data-stack-light-state="idle"></select></label>
+                  <label>Running / transitioning<select id="stack-light-state-running" data-stack-light-state="running"></select></label>
+                  <label>Loading<select id="stack-light-state-loading" data-stack-light-state="loading"></select></label>
+                  <label>Machining<select id="stack-light-state-machining" data-stack-light-state="machining"></select></label>
+                  <label>Unloading<select id="stack-light-state-unloading" data-stack-light-state="unloading"></select></label>
+                  <label>Waiting for work/operator<select id="stack-light-state-waiting" data-stack-light-state="waiting"></select></label>
+                  <label>Automatic recovery<select id="stack-light-state-automatic-recovery" data-stack-light-state="automatic_recovery"></select></label>
+                  <label>Guided recovery<select id="stack-light-state-guided-recovery" data-stack-light-state="guided_recovery"></select></label>
+                  <label>Manual robot control<select id="stack-light-state-manual-control" data-stack-light-state="manual_control"></select></label>
+                </div>
+              </fieldset>
             </fieldset>
             <fieldset class="location-fieldset supervisor-settings">
               <legend>Robot-originated supervisor</legend>

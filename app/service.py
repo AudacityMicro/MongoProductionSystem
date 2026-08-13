@@ -8,6 +8,8 @@ import random
 import re
 import subprocess
 import time
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from copy import deepcopy
 from threading import Event, RLock, Thread
 from io import BytesIO
@@ -107,6 +109,7 @@ from app.robot_rtde import (
     read_robot_snapshot,
     reset_robot_connections,
     set_robot_digital_output,
+    set_robot_digital_outputs,
     toggle_robot_digital_output,
 )
 from app.schemas import (
@@ -147,6 +150,12 @@ _CNC_TELEMETRY_RETRY_MAX_SECONDS = 30.0
 _CNC_TELEMETRY_STATUS_INTERVAL_SECONDS = 30.0
 _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS = 8
 _RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS = 30.0
+# Before a program is dispatched, the mill is still Idle and the robot is
+# waiting.  A lossy network is therefore safe to wait out for longer than the
+# initial Run Mode startup check.  No machining command is retried here.
+_RUN_MODE_CNC_PRE_DISPATCH_RECOVERY_ATTEMPTS = 20
+_RUN_MODE_CNC_PRE_DISPATCH_HELPER_RESTART_ATTEMPT = 5
+_RUN_MODE_CNC_PRE_DISPATCH_HELPER_RESTART_INTERVAL = 4
 
 
 class CncPreDispatchTelemetryError(CncTelemetryError):
@@ -190,6 +199,46 @@ def check_revision(settings: AppSettings, expected: int) -> None:
 def assert_run_mode_inactive(settings: AppSettings) -> None:
     if settings.run_mode_enabled:
         raise problem(409, "Stop run mode before making manual schedule or controller changes.")
+
+
+_RUN_MODE_SAFE_SETTINGS_FIELDS = frozenset({
+    "weight_unit",
+    "camera_devices",
+    "camera_idle_id",
+    "camera_loading_id",
+    "camera_machining_id",
+    "camera_recording_enabled",
+    "camera_recording_path",
+    "camera_recording_retention_days",
+    "camera_width",
+    "camera_height",
+    "camera_fps",
+    "camera_segment_seconds",
+    "push_notifications_enabled",
+    "push_notification_server",
+    "push_notification_topic",
+    "push_notification_token",
+    "push_notify_errors",
+    "push_notify_completed_pallets",
+    "push_notify_queue_empty",
+    "background_stack_light_intensity",
+    "fusion_tool_library_path",
+    "workholding_library",
+})
+
+
+def assert_settings_safe_during_run(settings: AppSettings, payload: SettingsUpdate) -> None:
+    """Allow only settings that cannot change robot or mill behavior while Run Mode owns the cell."""
+    if not settings.run_mode_enabled:
+        return
+    requested = payload.model_fields_set - {"expected_revision"}
+    unsafe = requested - _RUN_MODE_SAFE_SETTINGS_FIELDS
+    if unsafe:
+        raise problem(
+            409,
+            "Run Mode is active. Save camera, notification, display-unit, tool-library, or workholding changes separately; "
+            "stop Run Mode before changing robot, mill, pool, queue, stack-light, or controller settings.",
+        )
 
 
 def assert_pallet_manageable_during_run(settings: AppSettings, pallet: Pallet) -> None:
@@ -1685,6 +1734,23 @@ def store_pallet_location_positions(
 
 
 _STACK_LIGHT_CHANNELS = ("red", "amber", "green", "blue", "white", "alarm")
+_STACK_LIGHT_COLORS = ("red", "amber", "green", "blue", "white")
+_STACK_LIGHT_SYSTEM_STATES = (
+    "alarm", "idle", "running", "loading", "machining", "unloading",
+    "waiting", "automatic_recovery", "guided_recovery", "manual_control",
+)
+_DEFAULT_STACK_LIGHT_STATE_COLORS = {
+    "alarm": "red",
+    "idle": "green",
+    "running": "blue",
+    "loading": "blue",
+    "machining": "blue",
+    "unloading": "blue",
+    "waiting": "amber",
+    "automatic_recovery": "amber",
+    "guided_recovery": "white",
+    "manual_control": "amber",
+}
 _PRE_MOTION_ALARM_IDLE_SECONDS = 120
 _PRE_MOTION_ALARM_BURSTS = 3
 _PRE_MOTION_ALARM_BURST_SECONDS = 0.25
@@ -1704,30 +1770,59 @@ def _stack_light_outputs(settings: AppSettings) -> dict[str, dict[str, object]]:
     }
 
 
-def _stack_light_state(settings: AppSettings) -> dict[str, bool]:
-    active = {name: False for name in _STACK_LIGHT_CHANNELS}
+def _stack_light_state_colors(settings: AppSettings) -> dict[str, str]:
+    try:
+        raw = json.loads(settings.stack_light_state_colors or "{}")
+    except (json.JSONDecodeError, TypeError):
+        raw = {}
+    return {
+        name: str(raw.get(name, default))
+        if raw.get(name, default) in {*_STACK_LIGHT_COLORS, "off"}
+        else default
+        for name, default in _DEFAULT_STACK_LIGHT_STATE_COLORS.items()
+    }
+
+
+def _stack_light_system_state(settings: AppSettings) -> str:
     state = settings.run_mode_state
     if state in {"faulted", "interrupted"}:
-        active["red"] = active["alarm"] = True
-    elif settings.run_mode_enabled and state in {"loading", "machining", "unloading", "preparing", "positioning_mill", "advancing"}:
-        active["blue"] = True
-    elif settings.run_mode_enabled and state in {"waiting_confirmation", "start_requested", "resuming", "recovering_startup_telemetry", "recovering_cnc_telemetry", "recovering_robot_telemetry"}:
-        active["amber"] = True
-    else:
-        active["green"] = True
+        return "alarm"
+    if state == "manual_robot_pause":
+        return "manual_control"
+    if state == "loading":
+        return "loading"
+    if state in {"machining", "telemetry_unavailable", "telemetry_restored"}:
+        return "machining"
+    if state == "unloading":
+        return "unloading"
+    if state in {"recovering_startup_telemetry", "recovering_cnc_telemetry", "recovering_robot_telemetry", "recovery_requested"}:
+        return "automatic_recovery"
+    if settings.run_mode_enabled and state in {"waiting_confirmation", "idle_waiting_queue", "start_requested", "resuming"}:
+        return "waiting"
+    if settings.run_mode_enabled:
+        return "running"
+    return "idle"
+
+
+def _stack_light_state(settings: AppSettings, system_state: str | None = None) -> dict[str, bool]:
+    active = {name: False for name in _STACK_LIGHT_CHANNELS}
+    selected_state = system_state or _stack_light_system_state(settings)
+    color = _stack_light_state_colors(settings).get(selected_state, "off")
+    if color in _STACK_LIGHT_COLORS:
+        active[color] = True
     return active
 
 
 def _effective_stack_light_state(session: Session, settings: AppSettings) -> dict[str, bool]:
-    active = _stack_light_state(settings)
+    system_state = _stack_light_system_state(settings)
     recovery_active = session.scalar(
         select(RecoverySession.id).where(RecoverySession.status.in_(_RECOVERY_ACTIVE_STATUSES)).limit(1)
     )
-    if recovery_active and not active["red"]:
-        active["amber"] = False
-        active["green"] = False
-        active["white"] = True
-    return active
+    if system_state != "alarm" and recovery_active:
+        system_state = "guided_recovery"
+    elif system_state != "alarm" and _SUPERVISOR_BACKGROUND_RECOVERY.is_set():
+        system_state = "automatic_recovery"
+    return _stack_light_state(settings, system_state)
 
 
 def apply_stack_light(session: Session) -> None:
@@ -1736,11 +1831,11 @@ def apply_stack_light(session: Session) -> None:
     if not (settings.stack_light_enabled and settings.robot_connection_mode == "physical" and settings.robot_host.strip()):
         return
     state = _effective_stack_light_state(session, settings)
-    for name, output in _stack_light_outputs(settings).items():
-        set_robot_digital_output(
-            settings.robot_host.strip(), settings.robot_port, settings.robot_timeout_seconds,
-            str(output["bank"]), int(output["index"]), state[name],
-        )
+    outputs = _stack_light_outputs(settings)
+    set_robot_digital_outputs(
+        settings.robot_host.strip(), settings.robot_port, settings.robot_timeout_seconds,
+        [(str(output["bank"]), int(output["index"]), state[name]) for name, output in outputs.items()],
+    )
 
 
 def refresh_stack_light(session: Session) -> None:
@@ -1751,21 +1846,42 @@ def refresh_stack_light(session: Session) -> None:
 
 
 def _pre_motion_alarm_required(session: Session) -> bool:
-    """Warn before resuming after a known, sustained period without robot motion."""
-    last_completed = session.scalar(
-        select(RobotMotion.completed_at)
-        .where(RobotMotion.completed_at.is_not(None))
-        .order_by(RobotMotion.completed_at.desc())
-        .limit(1)
-    )
-    if not last_completed:
+    """Warn before either controller moves after known system-wide inactivity."""
+    completed_values = [
+        session.scalar(
+            select(RobotMotion.completed_at)
+            .where(RobotMotion.completed_at.is_not(None))
+            .order_by(RobotMotion.completed_at.desc())
+            .limit(1)
+        ),
+        session.scalar(
+            select(MillSupervisorCommand.completed_at)
+            .where(
+                MillSupervisorCommand.operation == "run_program",
+                MillSupervisorCommand.completed_at.is_not(None),
+            )
+            .order_by(MillSupervisorCommand.completed_at.desc())
+            .limit(1)
+        ),
+        session.scalar(
+            select(ProgramRuntime.completed_at)
+            .where(ProgramRuntime.completed_at.is_not(None))
+            .order_by(ProgramRuntime.completed_at.desc())
+            .limit(1)
+        ),
+    ]
+    completed_at = []
+    for value in completed_values:
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        completed_at.append(parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc))
+    if not completed_at:
         return False
-    try:
-        idle_since = datetime.fromisoformat(last_completed.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if idle_since.tzinfo is None:
-        idle_since = idle_since.replace(tzinfo=timezone.utc)
+    idle_since = max(completed_at)
     return (datetime.now(timezone.utc) - idle_since).total_seconds() >= _PRE_MOTION_ALARM_IDLE_SECONDS
 
 
@@ -1783,7 +1899,7 @@ def emit_pre_motion_alarm(session: Session, operation: str) -> bool:
         return False
     diagnostics().record(
         "stack_light", "pre_motion_alarm",
-        "Emitting three short audible warnings before robot movement resumes after two idle minutes.",
+        "Emitting three short audible warnings before machine movement resumes after two idle minutes.",
         details={"operation": operation, "bursts": _PRE_MOTION_ALARM_BURSTS},
     )
     for _ in range(_PRE_MOTION_ALARM_BURSTS):
@@ -1828,7 +1944,17 @@ def board_snapshot(session: Session) -> dict:
             "manual_io_control_enabled": settings.manual_io_control_enabled,
             "stack_light_enabled": settings.stack_light_enabled,
             "stack_light_outputs": _stack_light_outputs(settings),
+            "stack_light_state_colors": _stack_light_state_colors(settings),
+            "stack_light_system_state": _stack_light_system_state(settings),
             "stack_light_state": _effective_stack_light_state(session, settings),
+            "push_notifications_enabled": settings.push_notifications_enabled,
+            "push_notification_server": settings.push_notification_server,
+            "push_notification_topic": settings.push_notification_topic,
+            "push_notification_token_configured": bool(settings.push_notification_token),
+            "push_notify_errors": settings.push_notify_errors,
+            "push_notify_completed_pallets": settings.push_notify_completed_pallets,
+            "push_notify_queue_empty": settings.push_notify_queue_empty,
+            "background_stack_light_intensity": settings.background_stack_light_intensity,
             "machine_state": settings.machine_state,
             "robot_connection_mode": settings.robot_connection_mode,
             "robot_host": settings.robot_host,
@@ -1902,6 +2028,7 @@ def board_snapshot(session: Session) -> dict:
             "current_pallet_name": current_run_pallet.name if current_run_pallet else None,
             "return_slot": settings.run_mode_return_slot,
             "pending_action": settings.run_mode_pending_action or None,
+            "loaded_machine_action": settings.run_mode_loaded_machine_action or None,
             "confirmation_token": settings.run_mode_confirmation_token or None,
             "manual_robot_pause": settings.run_mode_manual_robot_pause,
         },
@@ -2337,6 +2464,50 @@ def mark_pallet_program_completed(session: Session, pallet: Pallet) -> None:
         session.add(ProgramCompletionStat(program_path=program_path, completed_count=1))
     else:
         stat.completed_count += 1
+    _send_push_notification(
+        get_settings(session),
+        "completed_pallet",
+        f"MPS: pallet {pallet.name} completed {program_path}.",
+    )
+
+
+def _send_push_notification(settings: AppSettings, event: str, message: str, *, force: bool = False) -> None:
+    """Queue an optional ntfy push notification; delivery never stops production."""
+    enabled = force or (settings.push_notifications_enabled and (
+        (event == "error" and settings.push_notify_errors)
+        or (event == "completed_pallet" and settings.push_notify_completed_pallets)
+        or (event == "queue_empty" and settings.push_notify_queue_empty)
+    ))
+    if not enabled or not settings.push_notification_topic.strip():
+        return
+    server = settings.push_notification_server.strip().rstrip("/") or "https://ntfy.sh"
+    topic = settings.push_notification_topic.strip()
+    token = settings.push_notification_token.strip()
+
+    def deliver() -> None:
+        try:
+            title = "MPS test notification" if event == "test" else "MPS error" if event == "error" else "MPS queue complete" if event == "queue_empty" else "MPS pallet complete"
+            tags = "test_tube" if event == "test" else "warning" if event == "error" else "white_check_mark"
+            headers = {"Title": title, "Tags": tags}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            request = Request(f"{server}/{quote(topic, safe='')}", data=message[:1500].encode("utf-8"), headers=headers, method="POST")
+            with urlopen(request, timeout=10):
+                pass
+            diagnostics().record("push_notification", "sent", f"Sent {event} push notification.")
+        except Exception as exc:  # Notification delivery is non-critical.
+            diagnostics().record("push_notification", "failed", "Could not send push notification.", severity="warning", details={"event": event, "error": str(exc)})
+
+    Thread(target=deliver, daemon=True, name="mps-push-notification").start()
+
+
+def queue_push_notification_test(session: Session) -> dict[str, str]:
+    """Queue a sample push using the saved notification destination."""
+    settings = get_settings(session)
+    if not settings.push_notification_topic.strip():
+        raise problem(422, "Save a private ntfy topic before sending a test notification.")
+    _send_push_notification(settings, "test", "MPS test notification: push alerts are configured.", force=True)
+    return {"message": "Test notification queued. Check the subscribed phone."}
 
 
 def autoschedule_queue_preview(session: Session, expected_revision: int) -> dict:
@@ -2893,6 +3064,7 @@ _ROBOT_TELEMETRY_LOCK = RLock()
 _ROBOT_TELEMETRY_STALE_GRACE_SECONDS = 60.0
 _SUPERVISOR_RECOVERY_STOP = Event()
 _SUPERVISOR_RECOVERY_THREAD: Thread | None = None
+_SUPERVISOR_BACKGROUND_RECOVERY = Event()
 _SUPERVISOR_RECOVERY_COOLDOWN_SECONDS = 15.0
 _SUPERVISOR_RECOVERY_GRACE_SECONDS = 10.0
 _SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS = 30.0
@@ -3927,6 +4099,12 @@ def _finish_motion(session: Session, motion: RobotMotion, success: bool, detail:
                 "failure_detail": motion.failure_detail,
             },
         )
+        if not success:
+            _send_push_notification(
+                settings,
+                "error",
+                f"MPS robot error: {motion.operation} for pallet {pallet.name if pallet else motion.pallet_id} failed. {motion.failure_detail or 'Inspect the cell.'}",
+            )
         return
 
 
@@ -4086,7 +4264,22 @@ def auto_recover_controller_connections(session: Session, progress=None) -> dict
             results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo supervisor recovery waits for Run Mode and pallet motion to become idle."})
         elif robot_status.get("connected"):
             if robot_status.get("reconciliation_required"):
-                results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo is connected, but its command sequence requires physical reconciliation before routing can be enabled."})
+                repairable = _repairable_supervisor_maintenance_gap(session, settings, robot_status)
+                if repairable is None:
+                    results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo is connected, but its command sequence requires physical reconciliation before routing can be enabled."})
+                else:
+                    bootstrap_robot_supervisor(session)
+                    current = get_settings(session)
+                    current.robot_supervisor_enabled = True
+                    current.robot_supervisor_activation_verified = True
+                    bump(current)
+                    commit_or_conflict(session)
+                    robot_status = robot_supervisor_status(session)
+                    results.append({
+                        "controller": "Mongo",
+                        "action": "Recovered",
+                        "detail": "Closed the interrupted no-motion maintenance sequence and restored verified supervisor routing.",
+                    })
             else:
                 settings.robot_supervisor_enabled = True
                 settings.robot_supervisor_activation_verified = True
@@ -4718,6 +4911,7 @@ def start_system_recovery(session: Session) -> dict[str, object]:
         severity="warning",
         details={"session_id": recovery.id, "faults": faults},
     )
+    refresh_stack_light(session)
     return _recovery_snapshot(session, recovery)
 
 
@@ -4743,6 +4937,10 @@ def _save_recovery(
         recovery.actions_json = json.dumps(actions, separators=(",", ":"))
     recovery.updated_at = datetime.now(timezone.utc).isoformat()
     session.commit()
+    # Recovery owns the white indication only while its persisted state is
+    # active. Reapply all outputs after every transition so completion or
+    # cancellation cannot leave white latched on the controller.
+    refresh_stack_light(session)
 
 
 def _supervisor_operation_completed(operation: str, resolution: str) -> bool:
@@ -5178,8 +5376,14 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
                     settings = get_settings(session)
                     listener_age = float(status.get("listener_age_seconds") or 0)
                     if status.get("connected"):
+                        if _SUPERVISOR_BACKGROUND_RECOVERY.is_set():
+                            _SUPERVISOR_BACKGROUND_RECOVERY.clear()
+                            refresh_stack_light(session)
                         listener_recovery_count = 0
                         continue
+                    if not _SUPERVISOR_BACKGROUND_RECOVERY.is_set():
+                        _SUPERVISOR_BACKGROUND_RECOVERY.set()
+                        refresh_stack_light(session)
                     if pause_run_mode_for_manual_robot_control(session):
                         # The mill owns its active cycle. Do not restart Mongo
                         # while an operator is teaching it by hand.
@@ -5227,6 +5431,7 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
 
 def stop_robot_supervisor_recovery_watchdog() -> None:
     _SUPERVISOR_RECOVERY_STOP.set()
+    _SUPERVISOR_BACKGROUND_RECOVERY.clear()
 
 
 def robot_supervisor_status(session: Session) -> dict[str, object]:
@@ -5361,6 +5566,44 @@ def robot_supervisor_status_document() -> dict[str, object]:
     return robot_supervisor().status_document()
 
 
+def _repairable_supervisor_maintenance_gap(
+    session: Session,
+    settings: AppSettings,
+    status: dict[str, object],
+) -> RobotSupervisorCommand | None:
+    """Return the sole no-motion command that may safely close a one-step gap.
+
+    An E-stop can interrupt the supervisor's own maintenance/restart command
+    after the backend reserved its sequence but before the robot recorded it.
+    Replaying pallet or alignment commands is never allowed here.
+    """
+    if not status.get("connected") or status.get("latched"):
+        return None
+    telemetry = status.get("telemetry") or {}
+    if telemetry.get("safety_mode") != 1 or telemetry.get("runtime_state") != 1:
+        return None
+    try:
+        robot_sequence = int(status.get("robot_last_sequence"))
+    except (TypeError, ValueError):
+        return None
+    expected_sequence = int(settings.robot_supervisor_last_sequence)
+    if expected_sequence != robot_sequence + 1:
+        return None
+    command = session.scalar(
+        select(RobotSupervisorCommand).where(RobotSupervisorCommand.sequence == expected_sequence)
+    )
+    if not command:
+        return None
+    if (
+        command.robot_motion_id is not None
+        or command.operation != "bootstrap_restart"
+        or command.opcode != OP_ENTER_MAINTENANCE
+        or command.status not in {"completed", "operator_completed", "operator_faulted"}
+    ):
+        return None
+    return command
+
+
 def bootstrap_robot_supervisor(
     session: Session,
     *,
@@ -5393,14 +5636,29 @@ def bootstrap_robot_supervisor(
         raise problem(409, str(listener.get("last_disconnect_detail") or "Supervisor listener did not start."))
     previous_generation = int(listener.get("connection_generation") or 0)
     if listener.get("connected"):
+        maintenance = None
         if listener.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
-            raise problem(409, "The connected supervisor sequence does not match the backend. Reconcile it before restarting the supervisor.")
-        maintenance = _new_supervisor_command(
-            session,
-            motion=None,
-            operation="bootstrap_restart",
-            opcode=OP_ENTER_MAINTENANCE,
-        )
+            maintenance = _repairable_supervisor_maintenance_gap(session, settings, listener)
+            if maintenance is None:
+                raise problem(409, "The connected supervisor sequence does not match the backend. Reconcile it before restarting the supervisor.")
+            # This command cannot move the robot. Bind its retry to the current
+            # live supervisor session and preserve the original sequence.
+            maintenance.robot_session = listener.get("robot_session")
+            maintenance.app_session = listener.get("app_session")
+            diagnostics().record(
+                "robot_supervisor",
+                "maintenance_sequence_repair",
+                "Replaying an interrupted no-motion supervisor maintenance command after E-stop recovery.",
+                severity="warning",
+                details={"sequence": maintenance.sequence, "robot_sequence": listener.get("robot_last_sequence")},
+            )
+        else:
+            maintenance = _new_supervisor_command(
+                session,
+                motion=None,
+                operation="bootstrap_restart",
+                opcode=OP_ENTER_MAINTENANCE,
+            )
         outcome, detail = _dispatch_supervisor_command(
             session,
             maintenance,
@@ -6470,9 +6728,8 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                 _finish_motion(session, motion, False, "The pallet no longer exists.")
                 return
 
-            emit_pre_motion_alarm(session, motion.operation)
-
             mill_position_already_run = False
+            robot_warning_emitted = False
             if settings.robot_supervisor_enabled:
                 if motion.operation in {"load_mill", "unload_mill"} and MILL_LOAD_POSITION_PROGRAM_NAME in motion.program_path:
                     try:
@@ -6482,6 +6739,7 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                         _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
                         return
+                robot_warning_emitted = emit_pre_motion_alarm(session, f"robot:{motion.operation}")
                 supervisor_outcome = _execute_motion_via_supervisor(session, motion, pallet)
                 if supervisor_outcome != "fallback":
                     return
@@ -6572,6 +6830,8 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                         _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
                         return
+                if not robot_warning_emitted:
+                    emit_pre_motion_alarm(session, f"robot:{motion.operation}")
                 if motion.source_slot and not run_and_wait(_motion_program(settings, motion.source_slot, "pick"), True):
                     return
                 if not run_and_wait(_mill_motion_program(settings, "load"), False):
@@ -6586,6 +6846,8 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
                         _finish_motion(session, motion, False, f"Mill loading-position move failed: {detail}")
                         return
+                if not robot_warning_emitted:
+                    emit_pre_motion_alarm(session, f"robot:{motion.operation}")
                 if not run_and_wait(_mill_motion_program(settings, "unload"), True):
                     return
                 if not run_and_wait(_motion_program(settings, motion.destination_slot or 0, "put"), False):
@@ -6593,6 +6855,8 @@ def execute_pallet_motion(session_factory, motion_id: str) -> None:
                 _finish_motion(session, motion, True)
                 return
 
+            if not robot_warning_emitted:
+                emit_pre_motion_alarm(session, f"robot:{motion.operation}")
             started = False
             for attempt in range(2):
                 try:
@@ -6716,6 +6980,7 @@ def _finish_run_mode(session_factory, state: str, detail: str, run_token: str | 
         settings.run_mode_manual_robot_pause = False
         settings.run_mode_program_started_at = None
         settings.run_mode_start_request_id = ""
+        settings.run_mode_loaded_machine_action = ""
         settings.run_mode_current_pallet_id = None
         settings.run_mode_return_slot = None
         bump(settings)
@@ -6727,6 +6992,8 @@ def _finish_run_mode(session_factory, state: str, detail: str, run_token: str | 
         detail,
         severity="error" if state == "faulted" else "warning" if state == "interrupted" else "info",
     )
+    if state == "faulted":
+        _send_push_notification(settings, "error", f"MPS error: {detail}")
 
 
 def interrupt_run_mode(session: Session) -> None:
@@ -6743,6 +7010,7 @@ def interrupt_run_mode(session: Session) -> None:
     settings.run_mode_manual_robot_pause = False
     settings.run_mode_program_started_at = None
     settings.run_mode_start_request_id = ""
+    settings.run_mode_loaded_machine_action = ""
     bump(settings)
     commit_or_conflict(session)
 
@@ -6762,16 +7030,9 @@ def _mill_load_position_local_path() -> Path:
 
 
 def _assert_mill_load_position_program_current(settings: AppSettings) -> str:
-    """Require the local and PathPilot copies to match the saved G53 coordinates."""
+    """Verify PathPilot's generated program and repair a stale local cache copy."""
     expected = build_mill_load_position_program(pallet_location_positions(settings)["mill_load_unload_g53"])
     local_path = _mill_load_position_local_path()
-    try:
-        local_content = local_path.read_text(encoding="ascii")
-    except OSError as exc:
-        raise problem(409, "The mill loading-position program is missing locally. Build it from Settings before starting run mode.") from exc
-    if local_content.replace("\r\n", "\n") != expected:
-        raise problem(409, "The local mill loading-position program does not match Settings. Rebuild it before starting run mode.")
-
     remote_path = str(_mill_program_root(settings) / MILL_LOAD_POSITION_PROGRAM_NAME)
     try:
         remote = read_robot_file(
@@ -6784,6 +7045,16 @@ def _assert_mill_load_position_program_current(settings: AppSettings) -> str:
         raise problem(409, f"The PathPilot loading-position program could not be verified: {exc}") from exc
     if remote.get("binary") or remote.get("too_large") or str(remote.get("text", "")).replace("\r\n", "\n") != expected:
         raise problem(409, "The PathPilot mill loading-position program does not match Settings. Rebuild it before starting run mode.")
+    try:
+        local_content = local_path.read_text(encoding="ascii")
+    except OSError:
+        local_content = ""
+    if local_content.replace("\r\n", "\n") != expected:
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text(expected, encoding="ascii", newline="\n")
+        except OSError as exc:
+            raise problem(409, f"PathPilot is current, but MPS could not repair its local loading-position cache: {exc}") from exc
     return remote_path
 
 
@@ -6800,6 +7071,8 @@ def _assert_run_mode_files_ready(settings: AppSettings, queue: list[Pallet]) -> 
 
     required_local_scripts = {"load_mill.script", "unload_mill.script"}
     for pallet in queue:
+        if not pallet.pool_slot_number:
+            continue
         for operation in ("pick", "put"):
             program = _motion_program(settings, pallet.pool_slot_number or 0, operation)
             if PurePosixPath(program).suffix.lower() == ".script":
@@ -6922,8 +7195,14 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     _assert_reliability_inactive(session)
     if _locked_motion(session):
         raise problem(409, "Resolve or wait for the active robot pallet movement before starting run mode.")
-    if session.scalar(select(Pallet).where(Pallet.location == "machine")):
-        raise problem(409, "Empty the mill before starting run mode.")
+    machine_pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+    if machine_pallet:
+        if payload.loaded_machine_action is None:
+            raise problem(409, "A pallet is recorded in the mill. Choose whether to unload it before the queue or run its assigned program.")
+        if not machine_pallet.return_pool_slot_number:
+            raise problem(409, f"{machine_pallet.name} has no reserved return pool position. Reconcile its pallet location before starting Run Mode.")
+        if payload.loaded_machine_action == "run_machine_program" and not machine_pallet.program_path:
+            raise problem(409, f"{machine_pallet.name} has no assigned mill program to run.")
     queue = session.scalars(
         select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
     ).all()
@@ -6934,6 +7213,8 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
             raise problem(409, f"Assign a mill program to {pallet.name} before starting run mode.")
         if pallet.content_status in {"complete_parts", "defective_parts"}:
             raise problem(409, f"{pallet.name} is already marked {pallet.content_status.replace('_', ' ')}.")
+    if machine_pallet and payload.loaded_machine_action == "unload_then_queue" and not queue:
+        raise problem(409, "Add a ready pallet to the queue before choosing unload and start next.")
     if settings.robot_connection_mode == "physical" and not settings.pallet_motion_enabled:
         raise problem(403, "Enable physical pallet movements before starting run mode.")
     if settings.robot_connection_mode == "physical" and (not settings.cnc_telemetry_enabled or not settings.cnc_host.strip()):
@@ -6947,9 +7228,13 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     if payload.safety_confirm is not None:
         settings.run_mode_safety_confirm = payload.safety_confirm
     settings.run_mode_start_request_id = request_id
-    settings.run_mode_state = "start_requested" if queue else "idle_waiting_queue"
+    settings.run_mode_loaded_machine_action = payload.loaded_machine_action or ""
+    initial_work = bool(queue) or machine_pallet is not None
+    settings.run_mode_state = "start_requested" if initial_work else "idle_waiting_queue"
     settings.run_mode_detail = (
-        f"Start requested. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+        f"Start requested. Checking the pallet already in the mill and {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
+        if machine_pallet
+        else f"Start requested. Checking {len(queue)} queued pallet{'s' if len(queue) != 1 else ''}."
         if queue
         else "Run Mode is armed and waiting for a pallet to be added to the production queue."
     )
@@ -6964,7 +7249,7 @@ def start_run_mode(session: Session, payload: StartRunMode) -> str | None:
     bump(settings)
     commit_or_conflict(session)
     refresh_stack_light(session)
-    return request_id if queue else None
+    return request_id if initial_work else None
 
 
 def resume_armed_run_mode(session: Session) -> str | None:
@@ -7005,12 +7290,16 @@ def stop_run_mode(session: Session, expected_revision: int) -> None:
     if not settings.run_mode_enabled and settings.run_mode_state != "stopping":
         return
     settings.run_mode_enabled = False
-    settings.run_mode_state = "stopping"
+    # Stopping is logical and immediate: the worker observes the disabled token
+    # before it can dispatch another action. Do not leave the operator-facing
+    # state stuck on an acknowledgement from a slow controller I/O call.
+    settings.run_mode_state = "stopped"
     settings.run_mode_detail = (
-        "Stop requested. No pending or subsequent automated step may start; "
+        "Stop acknowledged. No pending or subsequent automated step may start; "
         "an already-running mill program is not aborted."
     )
     settings.run_mode_pending_action = ""
+    settings.run_mode_loaded_machine_action = ""
     settings.run_mode_confirmation_token = ""
     settings.run_mode_confirmation_granted = False
     settings.run_mode_manual_robot_pause = False
@@ -7178,6 +7467,7 @@ def _run_cnc_cycle_via_supervisor(
     if telemetry.get("estop") is True or telemetry.get("enabled") is False:
         raise CncPreDispatchTelemetryError("PathPilot is disabled or in E-stop; no supervisor command was sent.")
 
+    emit_pre_motion_alarm(session, f"mill:{cycle_label}")
     command = _new_mill_supervisor_command(
         session,
         "run_program",
@@ -7323,6 +7613,8 @@ def _run_cnc_cycle(
         ) from exc
     baseline_interpreter_error = baseline.get("interpreter_error")
 
+    if session is not None:
+        emit_pre_motion_alarm(session, f"mill:{cycle_label}")
     start_result = run_linuxcnc_program(*connection, remote_program, require_a)
     if not isinstance(start_result, dict) or start_result.get("started") is not True:
         raise CncProgramFault(
@@ -7474,6 +7766,45 @@ def _run_manual_mill_load_position_cycle(session: Session, settings: AppSettings
     )
 
 
+def _recover_idle_mill_supervisor_for_pre_dispatch(settings: AppSettings) -> str:
+    """Restart only the telemetry helper after an independent Idle check.
+
+    This never sends a LinuxCNC command.  It is used only before a Run Mode
+    program is dispatched, so an unavailable helper cannot turn a short
+    network interruption into a production fault.
+    """
+    connection = (
+        settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+        settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+    )
+    try:
+        cycle = read_linuxcnc_cycle_state(*connection)
+    except CncTelemetryError as exc:
+        return f"PathPilot could not be checked yet ({exc}); helper restart was not attempted."
+    if cycle.get("interp_state") != 1:
+        return "PathPilot is not Idle; helper restart was not attempted."
+    try:
+        mill_supervisor().start(settings.mill_supervisor_listen_host, settings.mill_supervisor_port)
+        stop_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds, _MILL_SUPERVISOR_PID_PATH,
+        )
+        start_mill_supervisor_agent(
+            settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+            settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+            _MILL_SUPERVISOR_AGENT_PATH, _MILL_SUPERVISOR_CONFIG_PATH, _MILL_SUPERVISOR_PID_PATH,
+        )
+    except (CncTelemetryError, RobotFileAccessError) as exc:
+        return f"The Idle helper restart could not be sent ({exc})."
+    diagnostics().record(
+        "mill_supervisor",
+        "pre_dispatch_helper_restart",
+        "Restarted the idle PathPilot telemetry helper after a prolonged pre-dispatch outage.",
+        severity="warning",
+    )
+    return "PathPilot was confirmed Idle; its telemetry helper was restarted and is reconnecting."
+
+
 def _run_mode_cnc_cycle(
     session_factory,
     remote_program: str,
@@ -7518,21 +7849,28 @@ def _run_mode_cnc_cycle(
                 )
         except CncPreDispatchTelemetryError as exc:
             pre_dispatch_attempt += 1
-            if pre_dispatch_attempt <= _RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS:
+            if pre_dispatch_attempt <= _RUN_MODE_CNC_PRE_DISPATCH_RECOVERY_ATTEMPTS:
                 delay = min(
                     _RUN_MODE_PRE_DISPATCH_RECOVERY_MAX_SECONDS,
                     2 ** (pre_dispatch_attempt - 1),
                 )
+                recovery_note = ""
                 with session_factory() as session:
                     settings = get_settings(session)
                     if not _run_mode_token_is_active(settings, run_token):
                         return False
+                    if (
+                        pre_dispatch_attempt >= _RUN_MODE_CNC_PRE_DISPATCH_HELPER_RESTART_ATTEMPT
+                        and (pre_dispatch_attempt - _RUN_MODE_CNC_PRE_DISPATCH_HELPER_RESTART_ATTEMPT)
+                        % _RUN_MODE_CNC_PRE_DISPATCH_HELPER_RESTART_INTERVAL == 0
+                    ):
+                        recovery_note = " " + _recover_idle_mill_supervisor_for_pre_dispatch(settings)
                     _set_run_mode_status(
                         session,
                         "recovering_cnc_telemetry",
                         f"PathPilot telemetry is unavailable before {cycle_label}. "
                         f"No program was sent. Retrying automatically in {delay} seconds "
-                        f"({pre_dispatch_attempt}/{_RUN_MODE_PRE_DISPATCH_RECOVERY_ATTEMPTS}).",
+                        f"({pre_dispatch_attempt}/{_RUN_MODE_CNC_PRE_DISPATCH_RECOVERY_ATTEMPTS}).{recovery_note}",
                     )
                 diagnostics().record(
                     "run_mode",
@@ -7544,6 +7882,7 @@ def _run_mode_cnc_cycle(
                         "attempt": pre_dispatch_attempt,
                         "delay_seconds": delay,
                         "error": str(exc),
+                        "recovery_note": recovery_note.strip() or None,
                     },
                 )
                 time.sleep(delay)
@@ -7851,6 +8190,7 @@ def clear_stale_run_mode_status(session: Session, expected_revision: int) -> Non
         "Operator cleared a stale Run Mode status banner.",
         details={"previous_state": previous_state, "previous_detail": previous_detail},
     )
+    refresh_stack_light(session)
 
 
 def start_run_mode_recovery(session: Session, payload) -> str:
@@ -7984,7 +8324,9 @@ def _prepare_run_mode(session_factory, run_token: str | None) -> bool:
             queue = session.scalars(
                 select(Pallet).where(Pallet.queue_position.is_not(None)).order_by(Pallet.queue_position)
             ).all()
-            if not queue:
+            machine_pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+            machine_action = settings.run_mode_loaded_machine_action
+            if not queue and not (machine_pallet and machine_action):
                 raise problem(409, "The production queue became empty while Run Mode was starting.")
             if settings.robot_connection_mode != "physical":
                 break
@@ -8010,7 +8352,8 @@ def _prepare_run_mode(session_factory, run_token: str | None) -> bool:
                     raise problem(409, "PathPilot is not idle. Stop or finish its active program before starting run mode.")
                 for pallet in queue:
                     _assert_pool_motion_position_configured(settings, pallet.pool_slot_number or 0)
-                _assert_run_mode_files_ready(settings, queue)
+                checked_programs = [*queue, *([machine_pallet] if machine_action == "run_machine_program" and machine_pallet else [])]
+                _assert_run_mode_files_ready(settings, checked_programs)
                 break
 
             recovery_attempt += 1
@@ -8061,10 +8404,83 @@ def _finalize_stop_request(session_factory, run_token: str | None) -> None:
         commit_or_conflict(session)
 
 
+def _run_mode_handle_loaded_machine_pallet(session_factory, run_token: str | None) -> bool:
+    """Complete the explicit operator-selected disposition of a pallet already in the mill."""
+    with session_factory() as session:
+        settings = get_settings(session)
+        if not _run_mode_token_is_active(settings, run_token):
+            return False
+        action = settings.run_mode_loaded_machine_action
+        pallet = session.scalar(select(Pallet).where(Pallet.location == "machine"))
+        if not action or not pallet:
+            return True
+        if action not in {"unload_then_queue", "run_machine_program"} or not pallet.return_pool_slot_number:
+            raise problem(409, "The loaded-pallet start choice is no longer valid. Stop Run Mode and reconcile the pallet state.")
+        pallet_id, pallet_name, return_slot = pallet.id, pallet.name, pallet.return_pool_slot_number
+
+    if action == "run_machine_program":
+        if not _await_run_mode_action(
+            session_factory,
+            "machining",
+            f"Run {pallet_name}'s assigned mill program before returning it to Pool {return_slot:02d}?",
+            run_token=run_token,
+        ):
+            return False
+        if not _run_mode_machine_cycle(session_factory, pallet_id, run_token):
+            return False
+        if not _wait_for_manual_robot_pause(session_factory, run_token):
+            return False
+
+    if not _await_run_mode_action(
+        session_factory,
+        "unloading",
+        f"Move the mill to its loading position and return {pallet_name} to Pool {return_slot:02d}?",
+        run_token=run_token,
+    ):
+        return False
+    with session_factory() as session:
+        _set_run_mode_status(
+            session,
+            "positioning_mill",
+            f"Moving the mill to its loading position before returning {pallet_name} to Pool {return_slot:02d}.",
+            pallet_id=pallet_id,
+            return_slot=return_slot,
+        )
+    if not _run_mode_load_position_cycle(session_factory, run_token):
+        return False
+    transfer_ready, motion_id = _run_mode_start_robot_transfer(
+        session_factory,
+        operation="unload",
+        pallet_id=pallet_id,
+        pallet_name=pallet_name,
+        return_slot=return_slot,
+        run_token=run_token,
+    )
+    if not transfer_ready:
+        return False
+    if not _run_mode_motion_succeeded(session_factory, motion_id):
+        raise problem(409, f"Mongo could not return {pallet_name}. Resolve the robot-motion fault before continuing Run Mode.")
+    with session_factory() as session:
+        settings = get_settings(session)
+        pallet = session.get(Pallet, pallet_id)
+        if action == "run_machine_program" and pallet:
+            mark_pallet_program_completed(session, pallet)
+        settings.run_mode_loaded_machine_action = ""
+        settings.run_mode_current_pallet_id = None
+        settings.run_mode_return_slot = None
+        settings.run_mode_state = "advancing"
+        settings.run_mode_detail = f"{pallet_name} was returned to the pool. Continuing the production queue."
+        bump(settings)
+        commit_or_conflict(session)
+    return True
+
+
 def execute_run_mode(session_factory, run_token: str | None = None) -> None:
     """Process queued pallets serially, stopping on the first uncertain state."""
     try:
         if not _prepare_run_mode(session_factory, run_token):
+            return
+        if not _run_mode_handle_loaded_machine_pallet(session_factory, run_token):
             return
         while True:
             with session_factory() as session:
@@ -8085,6 +8501,11 @@ def execute_run_mode(session_factory, run_token: str | None = None) -> None:
                         "run_mode",
                         "idle_waiting_queue",
                         "Run Mode completed its queue and remains armed for newly queued pallets.",
+                    )
+                    _send_push_notification(
+                        settings,
+                        "queue_empty",
+                        "MPS: the production queue is complete and waiting for the next pallet.",
                     )
                     return
                 if pallet.location != "pool" or not pallet.pool_slot_number or not pallet.program_path:
@@ -8594,7 +9015,7 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
     _assert_reliability_inactive(session)
     settings = get_settings(session)
     check_revision(settings, payload.expected_revision)
-    assert_run_mode_inactive(settings)
+    assert_settings_safe_during_run(settings, payload)
     program_catalog_changed = (
         payload.source_folder is not None or payload.program_extensions is not None
     )
@@ -8713,6 +9134,31 @@ def update_settings(session: Session, payload: SettingsUpdate) -> list[str]:
             {name: item.model_dump() for name, item in payload.stack_light_outputs.items()},
             separators=(",", ":"), sort_keys=True,
         )
+    if payload.stack_light_state_colors is not None:
+        unknown = set(payload.stack_light_state_colors) - set(_STACK_LIGHT_SYSTEM_STATES)
+        if unknown:
+            raise problem(422, "Stack-light colors contain an unknown system state.")
+        colors = _DEFAULT_STACK_LIGHT_STATE_COLORS | payload.stack_light_state_colors
+        settings.stack_light_state_colors = json.dumps(colors, separators=(",", ":"), sort_keys=True)
+    if payload.push_notifications_enabled is not None:
+        settings.push_notifications_enabled = payload.push_notifications_enabled
+    for field_name in ("push_notification_server", "push_notification_topic"):
+        value = getattr(payload, field_name)
+        if value is not None:
+            setattr(settings, field_name, value.strip())
+    # An empty token field from the browser means "leave the saved token".
+    if payload.push_notification_token:
+        settings.push_notification_token = payload.push_notification_token.strip()
+    if payload.push_notify_errors is not None:
+        settings.push_notify_errors = payload.push_notify_errors
+    if payload.push_notify_completed_pallets is not None:
+        settings.push_notify_completed_pallets = payload.push_notify_completed_pallets
+    if payload.push_notify_queue_empty is not None:
+        settings.push_notify_queue_empty = payload.push_notify_queue_empty
+    if payload.background_stack_light_intensity is not None:
+        settings.background_stack_light_intensity = payload.background_stack_light_intensity
+    if settings.push_notifications_enabled and not settings.push_notification_topic.strip():
+        raise problem(422, "Enter a private ntfy topic before enabling push notifications.")
     if payload.debug_program_button_count is not None:
         settings.debug_program_button_count = payload.debug_program_button_count
     if payload.debug_mill_program_button_count is not None:
