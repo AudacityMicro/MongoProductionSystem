@@ -761,6 +761,64 @@ def test_dashboard_uses_measured_program_runtime_for_countdown_and_queue_estimat
     ]
 
 
+def test_dashboard_production_timers_track_idle_run_and_alarm_records(client: TestClient) -> None:
+    started = datetime.now(timezone.utc) - timedelta(seconds=90)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "machining"
+        metrics = service._update_production_runtime_metrics(session, settings, now=started)
+        session.commit()
+
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=40))
+        session.commit()
+        assert metrics.alarm_free_run_seconds == pytest.approx(40)
+
+        settings.run_mode_enabled = False
+        settings.run_mode_state = "faulted"
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=60))
+        session.commit()
+        assert metrics.alarm_free_run_seconds == 0
+        assert metrics.alarm_free_run_record_seconds == pytest.approx(60)
+
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "loading"
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=70))
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=90))
+        session.commit()
+
+    timers = client.get("/api/dashboard").json()["production_timers"]
+    assert timers["time_since_last_idle_counting"] is True
+    assert 89 <= timers["time_since_last_idle_seconds"] <= 92
+    assert timers["time_since_last_idle_record_seconds"] >= timers["time_since_last_idle_seconds"]
+    assert timers["run_time_since_last_alarm_counting"] is True
+    assert 19 <= timers["run_time_since_last_alarm_seconds"] <= 22
+    assert timers["run_time_since_last_alarm_record_seconds"] >= 60
+
+
+def test_production_timers_reset_current_non_idle_time_and_preserve_record(client: TestClient) -> None:
+    started = datetime.now(timezone.utc) - timedelta(seconds=75)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "loading"
+        metrics = service._update_production_runtime_metrics(session, settings, now=started)
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=75))
+
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "idle_waiting_queue"
+        service._update_production_runtime_metrics(session, settings, now=started + timedelta(seconds=75))
+        session.commit()
+
+        snapshot = service._production_runtime_snapshot(metrics, started + timedelta(seconds=75))
+
+    assert snapshot["time_since_last_idle_seconds"] == 0
+    assert snapshot["time_since_last_idle_counting"] is False
+    assert snapshot["time_since_last_idle_record_seconds"] == 75
+    assert snapshot["run_time_since_last_alarm_seconds"] == 75
+    assert snapshot["run_time_since_last_alarm_counting"] is False
+
+
 def test_confirmed_machine_cycle_records_program_runtime(client: TestClient) -> None:
     with client.app.state.session_factory() as session:
         settings = service.get_settings(session)

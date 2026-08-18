@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#17211d">
     <title>Dashboard | Mongo Production System</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260808-03">
-    <script src="/static/dashboard.js?v=20260813-01" defer></script>
+    <script src="/static/dashboard.js?v=20260813-02" defer></script>
     <script src="/static/system-status.js?v=20260806-01" defer></script>
   </head>
   <body>
@@ -28,6 +28,8 @@
       <section class="dashboard-summary">
         <article><p class="section-number">Queue remaining</p><strong id="queue-time">--</strong><span id="queue-count">0 pallets</span></article>
         <article><p class="section-number">Current part</p><strong id="current-cycle">--</strong><span id="current-pallet">No pallet in Mill</span></article>
+        <article><p class="section-number">Time since last idle</p><strong id="since-idle-time">--</strong><span>Record: <span id="since-idle-record">--</span></span></article>
+        <article><p class="section-number">Run time since last alarm</p><strong id="since-alarm-time">--</strong><span>Record: <span id="since-alarm-record">--</span></span></article>
         <article><p class="section-number">Active + queued tools</p><div class="tool-chip-list" id="queue-tools"></div></article>
         <article><p class="section-number">Tools in ATC</p><div class="tool-chip-list" id="atc-tools"></div></article>
       </section>

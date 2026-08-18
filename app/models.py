@@ -142,6 +142,18 @@ class AppSettings(Base):
     }
 
 
+class ProductionRuntimeMetrics(Base):
+    __tablename__ = "production_runtime_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    last_mode: Mapped[str] = mapped_column(String(20), default="idle")
+    last_updated_at: Mapped[str] = mapped_column(String(40), default="")
+    non_idle_started_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    non_idle_record_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    alarm_free_run_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    alarm_free_run_record_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class Pallet(Base):
     __tablename__ = "pallets"
     __table_args__ = (
