@@ -31,6 +31,7 @@ from app.models import (
     MillSupervisorCommand,
     Pallet,
     ProgramCompletionStat,
+    ProductionRuntimeMetrics,
     ProgramRuntime,
     RecoverySession,
     RobotMotion,
@@ -1756,6 +1757,95 @@ _PRE_MOTION_ALARM_BURSTS = 3
 _PRE_MOTION_ALARM_BURST_SECONDS = 0.25
 
 
+def _production_runtime_mode(settings: AppSettings) -> str:
+    """Classify production without counting operator/recovery waits as run time."""
+    system_state = _stack_light_system_state(settings)
+    if system_state == "alarm":
+        return "alarm"
+    if not settings.run_mode_enabled or settings.run_mode_state == "idle_waiting_queue":
+        return "idle"
+    if system_state in {"running", "loading", "machining", "unloading"}:
+        return "running"
+    return "paused"
+
+
+def _metric_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _update_production_runtime_metrics(
+    session: Session,
+    settings: AppSettings,
+    *,
+    now: datetime | None = None,
+) -> ProductionRuntimeMetrics:
+    """Advance persistent production timers and capture state transitions."""
+    current_at = now or datetime.now(timezone.utc)
+    current_mode = _production_runtime_mode(settings)
+    metrics = session.get(ProductionRuntimeMetrics, 1)
+    if metrics is None:
+        metrics = ProductionRuntimeMetrics(
+            id=1,
+            last_mode=current_mode,
+            last_updated_at=current_at.isoformat(),
+            non_idle_started_at=current_at.isoformat() if current_mode != "idle" else None,
+        )
+        session.add(metrics)
+        return metrics
+
+    previous_at = _metric_datetime(metrics.last_updated_at) or current_at
+    elapsed = max(0.0, (current_at - previous_at).total_seconds())
+    previous_mode = metrics.last_mode or "idle"
+    if previous_mode == "running":
+        metrics.alarm_free_run_seconds += elapsed
+
+    non_idle_started = _metric_datetime(metrics.non_idle_started_at)
+    if current_mode == "idle":
+        if non_idle_started is not None:
+            metrics.non_idle_record_seconds = max(
+                metrics.non_idle_record_seconds,
+                max(0.0, (current_at - non_idle_started).total_seconds()),
+            )
+        metrics.non_idle_started_at = None
+    elif non_idle_started is None:
+        metrics.non_idle_started_at = current_at.isoformat()
+
+    if current_mode == "alarm" and previous_mode != "alarm":
+        metrics.alarm_free_run_record_seconds = max(
+            metrics.alarm_free_run_record_seconds,
+            metrics.alarm_free_run_seconds,
+        )
+        metrics.alarm_free_run_seconds = 0.0
+
+    metrics.alarm_free_run_record_seconds = max(
+        metrics.alarm_free_run_record_seconds,
+        metrics.alarm_free_run_seconds,
+    )
+    metrics.last_mode = current_mode
+    metrics.last_updated_at = current_at.isoformat()
+    return metrics
+
+
+def _production_runtime_snapshot(metrics: ProductionRuntimeMetrics, now: datetime) -> dict[str, object]:
+    non_idle_started = _metric_datetime(metrics.non_idle_started_at)
+    since_idle = max(0.0, (now - non_idle_started).total_seconds()) if non_idle_started else 0.0
+    run_time = max(0.0, metrics.alarm_free_run_seconds)
+    return {
+        "time_since_last_idle_seconds": round(since_idle),
+        "time_since_last_idle_record_seconds": round(max(since_idle, metrics.non_idle_record_seconds)),
+        "time_since_last_idle_counting": non_idle_started is not None,
+        "run_time_since_last_alarm_seconds": round(run_time),
+        "run_time_since_last_alarm_record_seconds": round(max(run_time, metrics.alarm_free_run_record_seconds)),
+        "run_time_since_last_alarm_counting": metrics.last_mode == "running",
+    }
+
+
 def _stack_light_outputs(settings: AppSettings) -> dict[str, dict[str, object]]:
     try:
         raw = json.loads(settings.stack_light_outputs or "{}")
@@ -2336,6 +2426,9 @@ def _tool_color_states(
 
 def dashboard_snapshot(session: Session) -> dict:
     settings = get_settings(session)
+    metrics_now = datetime.now(timezone.utc)
+    runtime_metrics = _update_production_runtime_metrics(session, settings, now=metrics_now)
+    session.commit()
     pallets = session.scalars(select(Pallet)).all()
     queue = sorted((item for item in pallets if item.queue_position is not None), key=lambda item: item.queue_position or 0)
     machine = next((item for item in pallets if item.location == "machine"), None)
@@ -2430,6 +2523,7 @@ def dashboard_snapshot(session: Session) -> dict:
             }
             for path in sorted(program_paths, key=str.casefold)
         ],
+        "production_timers": _production_runtime_snapshot(runtime_metrics, metrics_now),
         "summary": _board_summary(settings, pallets),
     }
 
@@ -3473,6 +3567,7 @@ def bump(settings: AppSettings) -> None:
 
 def commit_or_conflict(session: Session) -> None:
     try:
+        _update_production_runtime_metrics(session, get_settings(session))
         session.commit()
     except (IntegrityError, StaleDataError) as exc:
         session.rollback()

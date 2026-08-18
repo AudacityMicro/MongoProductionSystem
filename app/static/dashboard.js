@@ -1,8 +1,9 @@
 const ui = {
-  state: document.querySelector("#system-state"), queueTime: document.querySelector("#queue-time"), queueCount: document.querySelector("#queue-count"), currentCycle: document.querySelector("#current-cycle"), currentPallet: document.querySelector("#current-pallet"), queueTools: document.querySelector("#queue-tools"), atcTools: document.querySelector("#atc-tools"), queue: document.querySelector("#dashboard-queue"), updated: document.querySelector("#dashboard-updated"), cameraGrid: document.querySelector("#camera-grid"), cameraPhase: document.querySelector("#camera-phase"), completions: document.querySelector("#program-completions"), toast: document.querySelector("#toast"),
+  state: document.querySelector("#system-state"), queueTime: document.querySelector("#queue-time"), queueCount: document.querySelector("#queue-count"), currentCycle: document.querySelector("#current-cycle"), currentPallet: document.querySelector("#current-pallet"), sinceIdleTime: document.querySelector("#since-idle-time"), sinceIdleRecord: document.querySelector("#since-idle-record"), sinceAlarmTime: document.querySelector("#since-alarm-time"), sinceAlarmRecord: document.querySelector("#since-alarm-record"), queueTools: document.querySelector("#queue-tools"), atcTools: document.querySelector("#atc-tools"), queue: document.querySelector("#dashboard-queue"), updated: document.querySelector("#dashboard-updated"), cameraGrid: document.querySelector("#camera-grid"), cameraPhase: document.querySelector("#camera-phase"), completions: document.querySelector("#program-completions"), toast: document.querySelector("#toast"),
 };
 let cameraRenderSignature = "";
 let dashboard = null;
+let dashboardReceivedAt = 0;
 function escapeHtml(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
 function duration(seconds) { if (!Number.isFinite(seconds)) return "--"; const whole = Math.max(0, Math.round(seconds)); return `${Math.floor(whole / 60)}m ${String(whole % 60).padStart(2, "0")}s`; }
 function elapsedMachiningSeconds(data) {
@@ -26,6 +27,14 @@ function renderTimers() {
   if (!dashboard) return;
   ui.queueTime.textContent = duration(queueRemainingSeconds(dashboard));
   ui.currentCycle.textContent = duration(currentRemainingSeconds(dashboard));
+  const timers = dashboard.production_timers || {};
+  const localElapsed = Math.max(0, Math.floor((Date.now() - dashboardReceivedAt) / 1000));
+  const sinceIdle = (Number(timers.time_since_last_idle_seconds) || 0) + (timers.time_since_last_idle_counting ? localElapsed : 0);
+  const sinceAlarm = (Number(timers.run_time_since_last_alarm_seconds) || 0) + (timers.run_time_since_last_alarm_counting ? localElapsed : 0);
+  ui.sinceIdleTime.textContent = duration(sinceIdle);
+  ui.sinceIdleRecord.textContent = duration(Math.max(sinceIdle, Number(timers.time_since_last_idle_record_seconds) || 0));
+  ui.sinceAlarmTime.textContent = duration(sinceAlarm);
+  ui.sinceAlarmRecord.textContent = duration(Math.max(sinceAlarm, Number(timers.run_time_since_last_alarm_record_seconds) || 0));
   renderQueue(dashboard);
 }
 function toolChips(tools, empty, states = {}) { return tools.length ? tools.map(tool => { const status = states?.[tool.slice(1)]?.status || "unknown"; return `<span class="tool-chip tool-status-${escapeHtml(status)}">${escapeHtml(tool)}</span>`; }).join("") : `<span class="muted">${empty}</span>`; }
@@ -75,6 +84,7 @@ function renderQueue(data) {
 }
 function render(data) {
   dashboard = data;
+  dashboardReceivedAt = Date.now();
   renderTimers(); ui.queueCount.textContent = `${data.queue.length} pallet${data.queue.length === 1 ? "" : "s"}`;
   ui.currentPallet.textContent = data.machine_pallet
     ? `${data.machine_pallet.name} — ${cycleIsCounting(data) ? "live remaining" : "paused estimate"}`
