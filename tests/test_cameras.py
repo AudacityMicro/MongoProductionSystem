@@ -1,8 +1,9 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from app.cameras import CameraManager, parse_camera_devices, phase_for_run_state
+from app.cameras import CameraManager, CameraStorageError, camera_manager, parse_camera_devices, phase_for_run_state
 
 
 def test_camera_phase_mapping() -> None:
@@ -92,3 +93,90 @@ def test_camera_settings_persist(client: TestClient) -> None:
     assert saved["settings"]["camera_devices"][0]["name"] == "Front"
     assert saved["settings"]["camera_recording_enabled"] is True
     assert client.get("/api/cameras").json()["assigned_camera_id"] == "front"
+
+
+def test_camera_recording_folder_can_be_purged_without_removing_folder(tmp_path) -> None:
+    manager = CameraManager()
+    recording_path = tmp_path / "recordings"
+    nested = recording_path / "nested"
+    nested.mkdir(parents=True)
+    (recording_path / "clip.mp4").write_bytes(b"video")
+    (nested / "metadata.txt").write_bytes(b"details")
+    settings = SimpleNamespace(
+        camera_devices_json="[]",
+        camera_idle_id="",
+        camera_loading_id="",
+        camera_machining_id="",
+        camera_recording_enabled=True,
+        camera_recording_path=str(recording_path),
+        camera_recording_retention_days=7,
+        camera_width=1920,
+        camera_height=1080,
+        camera_fps=30,
+        camera_segment_seconds=300,
+        run_mode_state="idle",
+    )
+
+    result = manager.purge_recording_folder(settings)
+
+    assert result["deleted_files"] == 2
+    assert result["deleted_directories"] == 1
+    assert result["freed_bytes"] == 12
+    assert recording_path.exists()
+    assert list(recording_path.iterdir()) == []
+    assert manager.recording_enabled is True
+
+
+def test_camera_recording_purge_refuses_home_folder() -> None:
+    manager = CameraManager()
+    settings = SimpleNamespace(
+        camera_devices_json="[]",
+        camera_idle_id="",
+        camera_loading_id="",
+        camera_machining_id="",
+        camera_recording_enabled=False,
+        camera_recording_path=str(Path.home()),
+        camera_recording_retention_days=7,
+        camera_width=1920,
+        camera_height=1080,
+        camera_fps=30,
+        camera_segment_seconds=300,
+        run_mode_state="idle",
+    )
+
+    try:
+        manager.purge_recording_folder(settings)
+    except CameraStorageError as exc:
+        assert "too broad" in str(exc)
+    else:
+        raise AssertionError("Expected the home-folder purge guard to reject the request.")
+
+
+def test_camera_recording_folder_endpoints_require_confirmation(client: TestClient, monkeypatch) -> None:
+    manager = camera_manager()
+    monkeypatch.setattr(
+        manager,
+        "open_recording_folder",
+        lambda settings: {"status": "opened", "path": "C:\\recordings"},
+    )
+    monkeypatch.setattr(
+        manager,
+        "purge_recording_folder",
+        lambda settings: {
+            "status": "purged",
+            "path": "C:\\recordings",
+            "deleted_files": 2,
+            "deleted_directories": 0,
+            "freed_bytes": 42,
+        },
+    )
+
+    open_response = client.post("/api/cameras/recordings/open")
+    refused_response = client.post("/api/cameras/recordings/purge", json={"confirmed": False})
+    purge_response = client.post("/api/cameras/recordings/purge", json={"confirmed": True})
+
+    assert open_response.status_code == 200
+    assert open_response.json()["status"] == "opened"
+    assert refused_response.status_code == 400
+    assert purge_response.status_code == 200
+    assert purge_response.json()["deleted_files"] == 2

@@ -270,6 +270,110 @@ def test_pathpilot_abort_waits_for_idle(monkeypatch) -> None:
     assert captured["marker"] == "MONGO_CNC_ABORT="
 
 
+def test_pathpilot_optional_stop_control_confirms_disabled_state(monkeypatch) -> None:
+    captured = {}
+
+    def fake_remote(host, port, username, password, timeout, remote_script, marker):
+        captured["script"] = remote_script
+        captured["marker"] = marker
+        return {"optional_stop": False, "interp_state": 1}
+
+    monkeypatch.setattr(cnc_linuxcnc, "_read_remote_payload", fake_remote)
+
+    result = cnc_linuxcnc.set_linuxcnc_optional_stop("mill", 22, "operator", "secret", 10, False)
+
+    assert result["optional_stop"] is False
+    assert "command.set_optional_stop(0)" in captured["script"]
+    assert "did not confirm the requested Optional Stop state" in captured["script"]
+    assert captured["marker"] == "MONGO_CNC_OPTIONAL_STOP="
+    compile(captured["script"], "<pathpilot-optional-stop-script>", "exec")
+
+
+def test_pathpilot_feed_hold_requires_active_program_and_confirms_pause(monkeypatch) -> None:
+    captured = {}
+
+    def fake_remote(host, port, username, password, timeout, remote_script, marker):
+        captured["script"] = remote_script
+        captured["marker"] = marker
+        return {"paused": True, "interp_state": 3}
+
+    monkeypatch.setattr(cnc_linuxcnc, "_read_remote_payload", fake_remote)
+
+    result = cnc_linuxcnc.feed_hold_linuxcnc_program("mill", 22, "operator", "secret", 10)
+
+    assert result["paused"] is True
+    assert "command.auto(linuxcnc.AUTO_PAUSE)" in captured["script"]
+    assert "there is no active program to feed hold" in captured["script"]
+    assert "PathPilot did not confirm Feed Hold" in captured["script"]
+    assert captured["marker"] == "MONGO_CNC_FEED_HOLD="
+    compile(captured["script"], "<pathpilot-feed-hold-script>", "exec")
+
+
+def test_mill_control_api_turns_off_optional_stop_and_feed_holds(client: TestClient, monkeypatch) -> None:
+    calls: list[str] = []
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.cnc_telemetry_enabled = True
+        settings.cnc_host = "mill"
+        settings.cnc_ssh_username = "operator"
+        settings.cnc_ssh_password = "secret"
+        session.commit()
+        revision = settings.revision
+
+    monkeypatch.setattr(service, "set_linuxcnc_optional_stop", lambda *args: calls.append("optional_stop") or {"optional_stop": False})
+    monkeypatch.setattr(service, "feed_hold_linuxcnc_program", lambda *args: calls.append("feed_hold") or {"paused": True})
+    monkeypatch.setattr(service, "mill_control_snapshot", lambda settings: {"connected": True, "can_control": True, "optional_stop": False, "paused": True, "interp_state": 3, "running": True, "source": "test"})
+
+    optional_stop = client.post(
+        "/api/cnc/control/optional_stop_off",
+        json={"expected_revision": revision, "confirmed": False},
+    )
+    feed_hold = client.post(
+        "/api/cnc/control/feed_hold",
+        json={"expected_revision": revision, "confirmed": False},
+    )
+
+    assert optional_stop.status_code == 200
+    assert optional_stop.json()["message"] == "Optional Stop is off."
+    assert feed_hold.status_code == 200
+    assert feed_hold.json()["message"].startswith("Feed Hold is active")
+    assert calls == ["optional_stop", "feed_hold"]
+
+
+def test_stop_mill_requires_confirmation_and_disarms_run_mode(client: TestClient, monkeypatch) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.cnc_telemetry_enabled = True
+        settings.cnc_host = "mill"
+        settings.cnc_ssh_username = "operator"
+        settings.cnc_ssh_password = "secret"
+        settings.run_mode_enabled = True
+        settings.run_mode_state = "machining"
+        settings.run_mode_start_request_id = "active-run"
+        session.commit()
+        revision = settings.revision
+
+    aborts: list[bool] = []
+    monkeypatch.setattr(service, "abort_linuxcnc_program", lambda *args: aborts.append(True) or {"aborted": True, "interp_state": 1})
+    monkeypatch.setattr(service, "refresh_stack_light", lambda session: None)
+    monkeypatch.setattr(service, "mill_control_snapshot", lambda settings: {"connected": True, "can_control": True, "optional_stop": False, "paused": False, "interp_state": 1, "running": False, "source": "test"})
+
+    refused = client.post(
+        "/api/cnc/control/stop",
+        json={"expected_revision": revision, "confirmed": False},
+    )
+    stopped = client.post(
+        "/api/cnc/control/stop",
+        json={"expected_revision": revision, "confirmed": True},
+    )
+
+    assert refused.status_code == 422
+    assert stopped.status_code == 200
+    assert stopped.json()["board"]["run_mode"]["enabled"] is False
+    assert stopped.json()["board"]["run_mode"]["state"] == "stopped"
+    assert aborts == [True]
+
+
 def test_cnc_debug_reports_extended_machine_diagnostics(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(
         "app.service.read_linuxcnc_snapshot",

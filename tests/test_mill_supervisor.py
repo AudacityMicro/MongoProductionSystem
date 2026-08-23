@@ -71,6 +71,7 @@ def test_staged_agent_contains_a_hard_execution_gate() -> None:
     assert '"Stale command sequence was rejected."' in source
     assert 'operation == "probe"' in source
     assert 'active.get("require_completion_status", False)' in source
+    assert '"optional_stop": bool(getattr(status, "optional_stop", False))' in source
 
 
 def test_staged_agent_loads_the_selected_program_without_a_temporary_copy() -> None:

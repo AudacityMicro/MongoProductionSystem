@@ -147,6 +147,23 @@ nav {
 .system-status-item.offline i { background: var(--danger); }
 @media (max-width: 980px) { .system-status-details { display: none; } }
 
+.optional-stop-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  min-height: 3rem;
+  padding: 0.55rem 1rem;
+  border-bottom: 2px solid #9a6500;
+  background: #f7c95f;
+  color: #332100;
+  text-align: center;
+}
+
+.optional-stop-banner strong { font-size: 0.9rem; }
+.optional-stop-banner span { font-size: 0.82rem; }
+.optional-stop-banner .button { min-height: 2rem; padding: 0.35rem 0.65rem; }
+
 .board-page,
 .settings-page {
   width: min(1600px, 100%);
@@ -194,6 +211,7 @@ nav {
 
 .run-mode-controls input { accent-color: var(--healthy); }
 .run-mode-button.active { color: var(--paper); background: var(--danger); }
+.mill-control-buttons { display: flex; gap: 0.45rem; align-items: center; }
 
 .notification-center {
   margin: 0 0 0.85rem;

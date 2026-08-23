@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Schedule | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260808-03">
+    <link rel="stylesheet" href="/static/styles.css?v=20260822-01">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/app.js?v=20260809-01" defer></script>
-    <script src="/static/system-status.js?v=20260806-01" defer></script>
+    <script src="/static/app.js?v=20260822-01" defer></script>
+    <script src="/static/system-status.js?v=20260822-01" defer></script>
   </head>
   <body class="schedule-page">
     <header class="topbar">
@@ -42,6 +42,11 @@
           <div class="run-mode-controls">
             <button class="button run-mode-button" id="run-mode-toggle" type="button">Start run mode</button>
             <button class="button secondary hidden" id="resume-queue-after-manual-robot" type="button">Resume queue</button>
+          </div>
+          <div class="mill-control-buttons" aria-label="Mill controls">
+            <button class="button warning hidden" id="mill-optional-stop-off" type="button">Turn off Optional Stop</button>
+            <button class="button secondary" id="mill-feed-hold" type="button">Feed Hold</button>
+            <button class="button danger" id="mill-stop" type="button">Stop mill</button>
           </div>
           <button class="button secondary" id="autoschedule-queue" type="button">Optimize by tools</button>
           <button class="button primary" id="create-pallet">+ New pallet</button>

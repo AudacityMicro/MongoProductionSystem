@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import threading
 import time
 from typing import Any
@@ -29,6 +31,43 @@ COMMON_CAMERA_MODES = (
     {"width": 2560, "height": 1440, "label": "2560 × 1440 (QHD)"},
     {"width": 3840, "height": 2160, "label": "3840 × 2160 (4K UHD)"},
 )
+
+
+class CameraStorageError(RuntimeError):
+    """Raised when a camera recording-folder action cannot be completed safely."""
+
+
+def resolve_recording_path(value: str | None) -> Path:
+    path = Path(value or "data/camera-recordings").expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _validate_purge_path(path: Path) -> None:
+    protected = {Path(path.anchor).resolve(), PROJECT_ROOT.resolve(), Path.home().resolve()}
+    if path.resolve() in protected:
+        raise CameraStorageError("The configured recording folder is too broad to purge safely.")
+
+
+def _open_folder(path: Path) -> None:
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    subprocess.Popen(["xdg-open", str(path)], start_new_session=True)
+
+
+def _folder_usage(path: Path) -> tuple[int, int]:
+    file_count = 0
+    byte_count = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file() and not child.is_symlink():
+                file_count += 1
+                byte_count += child.stat().st_size
+        except OSError:
+            continue
+    return file_count, byte_count
 
 
 def phase_for_run_state(run_mode_state: str | None) -> str:
@@ -105,6 +144,7 @@ class _CameraWorker:
         self.actual_height: int | None = None
         self.actual_fps: float | None = None
         self._writer: Any = None
+        self._recording_lock = threading.RLock()
         self._segment_started = 0.0
         self._segment_phase = ""
 
@@ -226,46 +266,48 @@ class _CameraWorker:
         self._record(frame)
 
     def _record(self, frame: Any) -> None:
-        if not self.manager.recording_enabled:
-            self._close_writer()
-            return
-        self.manager.recording_path.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(self.manager.recording_path)
-        if usage.free / max(usage.total, 1) < 0.10:
-            self._close_writer()
-            self.status = "online-low-disk"
-            self.error = "Recording paused because free disk space is below 10%."
-            return
-        phase = self.manager.phase
-        now = time.monotonic()
-        if self._writer is None or phase != self._segment_phase or now - self._segment_started >= self.manager.segment_seconds:
-            self._close_writer()
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            path = self.manager.recording_path / f"{self.config['id']}_{phase}_{stamp}.mp4"
-            writer = cv2.VideoWriter(
-                str(path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                self.manager.fps,
-                (self.manager.width, self.manager.height),
-            )
-            if not writer.isOpened():
-                writer.release()
-                self.error = "The configured MP4 recording codec could not be opened."
+        with self._recording_lock:
+            if not self.manager.recording_enabled:
+                self._close_writer()
                 return
-            self._writer = writer
-            self._segment_started = now
-            self._segment_phase = phase
-            self.recording_file = str(path)
-        if frame.shape[1] != self.manager.width or frame.shape[0] != self.manager.height:
-            frame = cv2.resize(frame, (self.manager.width, self.manager.height))
-        self._writer.write(frame)
+            self.manager.recording_path.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(self.manager.recording_path)
+            if usage.free / max(usage.total, 1) < 0.10:
+                self._close_writer()
+                self.status = "online-low-disk"
+                self.error = "Recording paused because free disk space is below 10%."
+                return
+            phase = self.manager.phase
+            now = time.monotonic()
+            if self._writer is None or phase != self._segment_phase or now - self._segment_started >= self.manager.segment_seconds:
+                self._close_writer()
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                path = self.manager.recording_path / f"{self.config['id']}_{phase}_{stamp}.mp4"
+                writer = cv2.VideoWriter(
+                    str(path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.manager.fps,
+                    (self.manager.width, self.manager.height),
+                )
+                if not writer.isOpened():
+                    writer.release()
+                    self.error = "The configured MP4 recording codec could not be opened."
+                    return
+                self._writer = writer
+                self._segment_started = now
+                self._segment_phase = phase
+                self.recording_file = str(path)
+            if frame.shape[1] != self.manager.width or frame.shape[0] != self.manager.height:
+                frame = cv2.resize(frame, (self.manager.width, self.manager.height))
+            self._writer.write(frame)
 
     def _close_writer(self) -> None:
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
-        self.recording_file = None
-        self._segment_phase = ""
+        with self._recording_lock:
+            if self._writer is not None:
+                self._writer.release()
+                self._writer = None
+            self.recording_file = None
+            self._segment_phase = ""
 
 
 class CameraManager:
@@ -287,9 +329,7 @@ class CameraManager:
 
     def apply(self, settings: Any) -> None:
         configs = parse_camera_devices(settings.camera_devices_json)
-        path = Path(settings.camera_recording_path or "data/camera-recordings")
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
+        path = resolve_recording_path(settings.camera_recording_path)
         signature = (
             tuple((item["id"], item["name"], item["device_index"], item["enabled"]) for item in configs),
             settings.camera_recording_enabled,
@@ -408,6 +448,48 @@ class CameraManager:
             })
         result["message"] = "Read the mode currently negotiated by each live preview. The common resolution list was left unchanged."
         return result
+
+    def open_recording_folder(self, settings: Any) -> dict[str, Any]:
+        path = resolve_recording_path(settings.camera_recording_path)
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            _open_folder(path)
+        except OSError as exc:
+            raise CameraStorageError(f"The video folder could not be opened: {exc}") from exc
+        return {"status": "opened", "path": str(path)}
+
+    def purge_recording_folder(self, settings: Any) -> dict[str, Any]:
+        requested_path = resolve_recording_path(settings.camera_recording_path)
+        _validate_purge_path(requested_path)
+        self.apply(settings)
+        with self.lock:
+            path = self.recording_path.resolve()
+            path.mkdir(parents=True, exist_ok=True)
+            recording_was_enabled = self.recording_enabled
+            self.recording_enabled = False
+            workers = list(self.workers.values())
+            try:
+                for worker in workers:
+                    worker._close_writer()
+                deleted_files, freed_bytes = _folder_usage(path)
+                deleted_directories = 0
+                for child in list(path.iterdir()):
+                    if child.is_symlink() or child.is_file():
+                        child.unlink()
+                    elif child.is_dir():
+                        shutil.rmtree(child)
+                        deleted_directories += 1
+            except OSError as exc:
+                raise CameraStorageError(f"The video folder could not be purged: {exc}") from exc
+            finally:
+                self.recording_enabled = recording_was_enabled
+        return {
+            "status": "purged",
+            "path": str(path),
+            "deleted_files": deleted_files,
+            "deleted_directories": deleted_directories,
+            "freed_bytes": freed_bytes,
+        }
 
     def _cleanup_old_recordings(self) -> None:
         if not self.recording_path.exists():

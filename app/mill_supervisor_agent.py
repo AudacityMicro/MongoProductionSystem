@@ -70,6 +70,7 @@ def snapshot(status):
         "estop": bool(getattr(status, "estop", False)),
         "enabled": bool(getattr(status, "enabled", False)),
         "paused": bool(getattr(status, "paused", False)),
+        "optional_stop": bool(getattr(status, "optional_stop", False)),
         "actual_position": list(getattr(status, "actual_position", [])),
     }
 

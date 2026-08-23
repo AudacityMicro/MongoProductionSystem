@@ -518,6 +518,14 @@ class MillSupervisorActivation(RevisionRequest):
     confirmed: bool = False
 
 
+class PurgeCameraRecordings(BaseModel):
+    confirmed: bool = False
+
+
+class MillControlRequest(RevisionRequest):
+    confirmed: bool = False
+
+
 class MillSupervisorReconcile(RevisionRequest):
     sequence: int = Field(ge=1)
     resolution: Literal["accept_completed", "mark_faulted"]

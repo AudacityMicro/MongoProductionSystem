@@ -29,6 +29,7 @@ from app.schemas import (
     CreatePallet,
     ClearRobotFault,
     CncTelemetryConnectionTest,
+    MillControlRequest,
     CustomerQueueRequest,
     MovePallet,
     MillSupervisorActivation,
@@ -46,6 +47,7 @@ from app.schemas import (
     ReorderQueue,
     RevisionRequest,
     ProgramCompletionStatUpdate,
+    PurgeCameraRecordings,
     BackupRestoreRequest,
     RobotFileAction,
     SettingsUpdate,
@@ -70,6 +72,7 @@ from app.service import (
     autoschedule_queue_preview,
     cnc_debug_snapshot,
     cnc_io_labels_snapshot,
+    control_mill,
     test_cnc_telemetry_connection,
     test_mill_status_file_access,
     bootstrap_mill_supervisor,
@@ -173,7 +176,7 @@ from app.service import (
     execute_robot_reliability_test,
 )
 from app.diagnostics import diagnostics
-from app.cameras import camera_manager, discover_cameras
+from app.cameras import CameraStorageError, camera_manager, discover_cameras
 from app.robot_files import (
     RobotFileAccessError,
     RobotFileConflict,
@@ -598,6 +601,20 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     def get_dashboard(session: Session = Depends(get_session)) -> dict:
         return dashboard_snapshot(session)
 
+    @application.post("/api/cnc/control/{action}")
+    def request_mill_control(
+        action: str,
+        payload: MillControlRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        result = control_mill(
+            session,
+            action,
+            payload.expected_revision,
+            confirmed=payload.confirmed,
+        )
+        return {**result, "board": board_snapshot(session)}
+
     @application.put("/api/program-completions")
     def edit_program_completion(
         payload: ProgramCompletionStatUpdate,
@@ -630,6 +647,25 @@ def create_app(database_url: str | None = None, *, external_services: bool = Tru
     @application.get("/api/cameras/modes")
     def probe_camera_modes(session: Session = Depends(get_session)) -> dict:
         return camera_manager().probe_supported_modes(get_settings(session))
+
+    @application.post("/api/cameras/recordings/open")
+    def open_camera_recording_folder(session: Session = Depends(get_session)) -> dict:
+        try:
+            return camera_manager().open_recording_folder(get_settings(session))
+        except CameraStorageError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post("/api/cameras/recordings/purge")
+    def purge_camera_recording_folder(
+        payload: PurgeCameraRecordings,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        if not payload.confirmed:
+            raise HTTPException(status_code=400, detail="Confirm that all video-folder contents should be permanently deleted.")
+        try:
+            return camera_manager().purge_recording_folder(get_settings(session))
+        except CameraStorageError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.get("/api/cameras/{camera_id}/stream")
     def stream_camera(camera_id: str, session: Session = Depends(get_session)) -> StreamingResponse:

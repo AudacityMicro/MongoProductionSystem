@@ -40,13 +40,16 @@ from app.models import (
 )
 from app.autoschedule import ScheduleJob, optimize_tool_schedule, simulate_tool_plan
 from app.cnc_linuxcnc import (
+    abort_linuxcnc_program,
     CncProgramFault,
     CncTelemetryError,
+    feed_hold_linuxcnc_program,
     read_linuxcnc_cycle_state,
     read_linuxcnc_io_labels,
     read_linuxcnc_snapshot,
     run_linuxcnc_network_ping_matrix,
     run_linuxcnc_program,
+    set_linuxcnc_optional_stop,
     start_mill_supervisor_agent,
     stop_mill_supervisor_agent,
     test_mill_supervisor_runtime,
@@ -1093,7 +1096,7 @@ def mill_supervisor_status(session: Session) -> dict[str, object]:
     return status
 
 
-def topbar_connection_status(session: Session) -> dict[str, dict[str, str]]:
+def topbar_connection_status(session: Session) -> dict[str, dict[str, object]]:
     """Cheap local supervisor-status summary for the persistent page header."""
     settings = get_settings(session)
     robot_configured = settings.robot_connection_mode == "physical" and bool(settings.robot_host.strip())
@@ -1120,6 +1123,7 @@ def topbar_connection_status(session: Session) -> dict[str, dict[str, str]]:
         "backend": {"state": "online", "label": "Backend: Online"},
         "robot": status(robot_configured, bool(robot.get("connected")), robot_live, "Robot", settings.robot_connection_mode == "simulated"),
         "mill": status(mill_configured, bool(mill.get("connected")), mill_live, "Mill"),
+        "mill_control": mill_control_snapshot(settings),
     }
 
 
@@ -2122,6 +2126,7 @@ def board_snapshot(session: Session) -> dict:
             "confirmation_token": settings.run_mode_confirmation_token or None,
             "manual_robot_pause": settings.run_mode_manual_robot_pause,
         },
+        "mill_control": mill_control_snapshot(settings),
         "programs": programs,
         "program_warning": warning,
         "robot_motion": _motion_snapshot(session),
@@ -2372,6 +2377,49 @@ def _configured_cnc_telemetry(settings: AppSettings) -> tuple[dict | None, str]:
     if refreshed and refreshed[2]:
         return None, f"PathPilot telemetry is unavailable: {refreshed[2]}"
     return None, "PathPilot telemetry refresh is in progress."
+
+
+def mill_control_snapshot(settings: AppSettings) -> dict[str, object]:
+    """Return the freshest inexpensive state used by mill warnings and controls."""
+    supervisor_status = mill_supervisor().status()
+    telemetry = supervisor_status.get("telemetry") or {}
+    age = supervisor_status.get("telemetry_age_seconds")
+    freshness_limit = max(5.0, settings.mill_supervisor_heartbeat_seconds * 3)
+    source = "mill_supervisor"
+    connected = bool(
+        supervisor_status.get("connected")
+        and age is not None
+        and float(age) <= freshness_limit
+    )
+    if not connected or "optional_stop" not in telemetry:
+        fallback, _detail = _configured_cnc_telemetry(settings)
+        if fallback is not None:
+            telemetry = fallback
+            connected = True
+            source = "pathpilot_ssh"
+
+    program_execution = telemetry.get("program_execution") or {}
+    optional_stop = telemetry.get("optional_stop")
+    if optional_stop is None:
+        optional_stop = program_execution.get("optional_stop")
+    paused = telemetry.get("paused")
+    if paused is None:
+        paused = telemetry.get("feed_hold")
+    interp_state = telemetry.get("interp_state")
+    return {
+        "connected": connected,
+        "can_control": bool(
+            settings.cnc_telemetry_enabled
+            and settings.cnc_host.strip()
+            and settings.cnc_ssh_username
+            and settings.cnc_ssh_password
+        ),
+        "optional_stop": bool(optional_stop) if optional_stop is not None else None,
+        "paused": bool(paused) if paused is not None else None,
+        "interp_state": interp_state,
+        "running": interp_state in {2, 3, 4},
+        "source": source if connected else "unavailable",
+    }
 
 
 def _atc_inventory(telemetry: dict | None, descriptions: dict[int, dict] | None = None) -> list[dict]:
@@ -3148,6 +3196,59 @@ def test_cnc_telemetry_connection(host: str, port: int, username: str, password:
         "task_state": telemetry.get("task_state"),
         "axis_count": axes,
     }
+
+
+def control_mill(
+    session: Session,
+    action: str,
+    expected_revision: int,
+    *,
+    confirmed: bool = False,
+) -> dict[str, object]:
+    """Execute one explicitly requested, idempotent PathPilot control action."""
+    settings = get_settings(session)
+    check_revision(settings, expected_revision)
+    if not (
+        settings.cnc_telemetry_enabled
+        and settings.cnc_host.strip()
+        and settings.cnc_ssh_username
+        and settings.cnc_ssh_password
+    ):
+        raise problem(409, "Configure and enable the PathPilot connection before using mill controls.")
+    if action == "stop" and not confirmed:
+        raise problem(422, "Confirm that the active mill program should be stopped.")
+
+    connection = (
+        settings.cnc_host.strip(), settings.cnc_ssh_port, settings.cnc_ssh_username,
+        settings.cnc_ssh_password, settings.cnc_timeout_seconds,
+    )
+    if action == "stop" and settings.run_mode_enabled:
+        stop_run_mode(session, expected_revision)
+        settings = get_settings(session)
+    try:
+        if action == "optional_stop_off":
+            result = set_linuxcnc_optional_stop(*connection, False)
+            message = "Optional Stop is off."
+        elif action == "feed_hold":
+            result = feed_hold_linuxcnc_program(*connection)
+            message = "Feed Hold is active. Resume from PathPilot when it is safe."
+        elif action == "stop":
+            result = abort_linuxcnc_program(*connection)
+            message = "The mill program was stopped. Run Mode will not advance automatically."
+        else:
+            raise problem(404, "Unknown mill control action.")
+    except CncTelemetryError as exc:
+        raise problem(502, f"PathPilot did not complete the requested mill control: {exc}") from exc
+
+    with _CNC_TELEMETRY_LOCK:
+        _CNC_TELEMETRY_CACHE.pop(_cnc_telemetry_key(settings), None)
+    diagnostics().record(
+        "mill_control",
+        action,
+        message,
+        details={"result": result},
+    )
+    return {"action": action, "message": message, "result": result}
 
 
 _ROBOT_TELEMETRY_CACHE: dict[
@@ -4217,7 +4318,22 @@ def stop_robot_supervisor_listener() -> None:
     robot_supervisor().stop()
 
 
-def recover_robot_supervisor_connection(session: Session, *, trigger: str, allow_run_mode_paused: bool = False) -> bool:
+def _robot_supervisor_connection_is_fresh(status: dict[str, object], settings: AppSettings) -> bool:
+    age = status.get("telemetry_age_seconds")
+    return bool(
+        status.get("connected")
+        and age is not None
+        and float(age) <= max(5.0, settings.robot_supervisor_heartbeat_seconds * 4)
+    )
+
+
+def recover_robot_supervisor_connection(
+    session: Session,
+    *,
+    trigger: str,
+    allow_run_mode_paused: bool = False,
+    allow_unverified: bool = False,
+) -> bool:
     """Reset only the desktop listener so Mongo's existing supervisor reconnects.
 
     This has no Dashboard, RTDE, file-transfer, or motion side effect. It is
@@ -4225,13 +4341,21 @@ def recover_robot_supervisor_connection(session: Session, *, trigger: str, allow
     must be reconciled, never treated as a normal reconnect.
     """
     settings = get_settings(session)
-    if not (settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified):
+    verified = settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified
+    unverified_recovery_allowed = bool(
+        allow_unverified
+        and settings.robot_connection_mode == "physical"
+        and settings.robot_host.strip()
+    )
+    if not (verified or unverified_recovery_allowed):
         return False
     active_motion = session.scalar(select(RobotMotion).where(RobotMotion.status.in_(("requested", "running"))))
     if active_motion or (settings.run_mode_enabled and not (allow_run_mode_paused and _run_mode_allows_robot_reconnect(settings))):
         return False
-    if robot_supervisor().status().get("connected"):
+    status = robot_supervisor().status()
+    if _robot_supervisor_connection_is_fresh(status, settings):
         return False
+    stale_socket = bool(status.get("connected"))
     robot_supervisor().stop()
     robot_supervisor().start(
         settings.robot_supervisor_listen_host,
@@ -4241,10 +4365,15 @@ def recover_robot_supervisor_connection(session: Session, *, trigger: str, allow
     )
     diagnostics().record(
         "robot_supervisor",
-        "listener_recovery",
-        "Reset the local supervisor listener and is waiting for Mongo to reconnect.",
+        "stale_listener_recovery" if stale_socket else "listener_recovery",
+        "Closed a stale supervisor socket and restarted the local listener."
+        if stale_socket else "Reset the local supervisor listener and is waiting for Mongo to reconnect.",
         severity="warning",
-        details={"trigger": trigger, "port": settings.robot_supervisor_port},
+        details={
+            "trigger": trigger,
+            "port": settings.robot_supervisor_port,
+            "telemetry_age_seconds": status.get("telemetry_age_seconds"),
+        },
     )
     return True
 
@@ -4351,6 +4480,32 @@ def auto_recover_controller_connections(session: Session, progress=None) -> dict
     robot_status = robot_supervisor_status(session)
     robot_configured = settings.robot_connection_mode == "physical" and bool(settings.robot_host.strip())
     robot_recovery_handled = False
+    stale_socket = bool(robot_status.get("connected") and not _robot_supervisor_connection_is_fresh(robot_status, settings))
+    if robot_configured and stale_socket:
+        if not automation_idle:
+            results.append({
+                "controller": "Mongo",
+                "action": "Deferred",
+                "detail": "Mongo telemetry is stale; the socket reset waits for Run Mode and pallet motion to become idle.",
+            })
+        else:
+            recover_robot_supervisor_connection(
+                session,
+                trigger="auto_recover",
+                allow_unverified=True,
+            )
+            results.append({
+                "controller": "Mongo",
+                "action": "Stale socket reset",
+                "detail": "Closed the half-open supervisor socket and restarted the local listener without sending a motion command.",
+            })
+            deadline = time.monotonic() + max(3.0, settings.robot_supervisor_heartbeat_seconds * 3)
+            while time.monotonic() < deadline:
+                refreshed = robot_supervisor().status()
+                if _robot_supervisor_connection_is_fresh(refreshed, settings):
+                    break
+                time.sleep(0.2)
+            robot_status = robot_supervisor_status(session)
     if robot_configured and not (
         settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified
     ):
@@ -4386,7 +4541,7 @@ def auto_recover_controller_connections(session: Session, progress=None) -> dict
                 controller = robot_program_status(settings.robot_host.strip(), settings.robot_timeout_seconds)
                 loaded_program = str(controller.get("loaded_program") or "").strip()
                 supervisor_program = "mongo_supervisor" in loaded_program.casefold()
-                if controller.get("running"):
+                if controller.get("running") and not supervisor_program:
                     results.append({"controller": "Mongo", "action": "Deferred", "detail": "Mongo is running a controller program; recovery will not interrupt it."})
                 else:
                     if loaded_program and not supervisor_program:
@@ -5470,7 +5625,12 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
                     status = robot_supervisor().status()
                     settings = get_settings(session)
                     listener_age = float(status.get("listener_age_seconds") or 0)
-                    if status.get("connected"):
+                    fresh = _robot_supervisor_connection_is_fresh(status, settings)
+                    active_motion = session.scalar(
+                        select(RobotMotion.id).where(RobotMotion.status.in_(("requested", "running")))
+                    )
+                    automation_idle = not settings.run_mode_enabled and active_motion is None
+                    if fresh and settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
                         if _SUPERVISOR_BACKGROUND_RECOVERY.is_set():
                             _SUPERVISOR_BACKGROUND_RECOVERY.clear()
                             refresh_stack_light(session)
@@ -5487,6 +5647,11 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
                     now = time.monotonic()
                     if not status.get("listening") or listener_age < _SUPERVISOR_RECOVERY_GRACE_SECONDS:
                         continue
+                    if fresh and automation_idle:
+                        if now - last_program_recovery >= _SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS:
+                            auto_recover_controller_connections(session)
+                            last_program_recovery = now
+                        continue
                     # A listener reset cannot revive a supervisor program that
                     # PolyScope stopped for manual jogging. After one bounded
                     # listener retry, restart only when Dashboard proves that
@@ -5497,7 +5662,14 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
                         and now - last_program_recovery >= _SUPERVISOR_PROGRAM_RECOVERY_COOLDOWN_SECONDS
                     ):
                         try:
-                            recover_robot_supervisor_program(session, trigger="watchdog")
+                            if settings.robot_supervisor_enabled and settings.robot_supervisor_activation_verified:
+                                recover_robot_supervisor_program(session, trigger="watchdog")
+                            else:
+                                # A prior interrupted bootstrap may have left
+                                # routing unverified. The full bounded recovery
+                                # path can restore only Mongo's own no-motion
+                                # supervisor; it still preserves operator programs.
+                                auto_recover_controller_connections(session)
                             last_program_recovery = now
                             listener_recovery_count = 0
                         except HTTPException as exc:
@@ -5511,7 +5683,11 @@ def start_robot_supervisor_recovery_watchdog(session_factory) -> None:
                             last_program_recovery = now
                         continue
                     if now - last_listener_recovery >= _SUPERVISOR_RECOVERY_COOLDOWN_SECONDS:
-                        if recover_robot_supervisor_connection(session, trigger="watchdog"):
+                        if recover_robot_supervisor_connection(
+                            session,
+                            trigger="watchdog",
+                            allow_unverified=True,
+                        ):
                             last_listener_recovery = now
                             listener_recovery_count += 1
             except Exception as exc:  # A diagnostic helper must never affect production control.
@@ -5718,16 +5894,31 @@ def bootstrap_robot_supervisor(
     ):
         raise problem(409, "Stop Run Mode and resolve all pallet movements before bootstrapping the supervisor.")
     restore_enabled_after_success = settings.robot_supervisor_enabled
-    settings.robot_supervisor_enabled = False
-    settings.robot_supervisor_activation_verified = False
+    original_activation_verified = settings.robot_supervisor_activation_verified
+    original_maintenance_mode = settings.robot_supervisor_maintenance_mode
+    # Maintenance Mode blocks new MPS motion dispatch while bootstrap is in
+    # progress. Do not erase the last verified activation state before the
+    # replacement supervisor has actually connected and matched its sequence.
+    settings.robot_supervisor_maintenance_mode = True
     bump(settings)
     commit_or_conflict(session)
+
+    def restore_configuration_after_failure() -> None:
+        current = get_settings(session)
+        current.robot_supervisor_enabled = restore_enabled_after_success
+        current.robot_supervisor_activation_verified = original_activation_verified
+        current.robot_supervisor_maintenance_mode = original_maintenance_mode
+        bump(current)
+        commit_or_conflict(session)
+
     local_script = generated_script_directory(Path(__file__).parents[1]) / "mongo_supervisor.script"
     if not local_script.is_file():
+        restore_configuration_after_failure()
         raise problem(409, "Rebuild generated scripts before bootstrapping the supervisor.")
     start_robot_supervisor_listener(session)
     listener = robot_supervisor().status()
     if not listener.get("listening"):
+        restore_configuration_after_failure()
         raise problem(409, str(listener.get("last_disconnect_detail") or "Supervisor listener did not start."))
     previous_generation = int(listener.get("connection_generation") or 0)
     if listener.get("connected"):
@@ -5735,6 +5926,7 @@ def bootstrap_robot_supervisor(
         if listener.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
             maintenance = _repairable_supervisor_maintenance_gap(session, settings, listener)
             if maintenance is None:
+                restore_configuration_after_failure()
                 raise problem(409, "The connected supervisor sequence does not match the backend. Reconcile it before restarting the supervisor.")
             # This command cannot move the robot. Bind its retry to the current
             # live supervisor session and preserve the original sequence.
@@ -5754,13 +5946,18 @@ def bootstrap_robot_supervisor(
                 operation="bootstrap_restart",
                 opcode=OP_ENTER_MAINTENANCE,
             )
-        outcome, detail = _dispatch_supervisor_command(
-            session,
-            maintenance,
-            max(5.0, settings.robot_timeout_seconds * 4),
-            allow_pre_dispatch_fallback=False,
-        )
+        try:
+            outcome, detail = _dispatch_supervisor_command(
+                session,
+                maintenance,
+                max(5.0, settings.robot_timeout_seconds * 4),
+                allow_pre_dispatch_fallback=False,
+            )
+        except Exception:
+            restore_configuration_after_failure()
+            raise
         if outcome != "completed":
+            restore_configuration_after_failure()
             raise problem(409, f"The existing supervisor did not stop cleanly: {detail}")
         settings = get_settings(session)
     script_content = with_supervisor_sequence(
@@ -5774,10 +5971,12 @@ def bootstrap_robot_supervisor(
             settings.robot_timeout_seconds,
         )
     except RobotFileAccessError as exc:
+        restore_configuration_after_failure()
         raise problem(502, f"Supervisor bootstrap could not reach Mongo: {exc}") from exc
     wait_seconds = max(10.0, settings.robot_timeout_seconds * 4)
     connected = robot_supervisor().wait_for_connection_generation(previous_generation, wait_seconds)
     if not connected:
+        restore_configuration_after_failure()
         raise problem(
             504,
             "URControl accepted the no-motion script transfer, but Mongo did not connect to the supervisor listener. "
@@ -5786,9 +5985,7 @@ def bootstrap_robot_supervisor(
         )
     status = robot_supervisor().status()
     if status.get("robot_last_sequence") != settings.robot_supervisor_last_sequence:
-        settings.robot_supervisor_activation_verified = False
-        bump(settings)
-        commit_or_conflict(session)
+        restore_configuration_after_failure()
         raise problem(
             409,
             f"Supervisor connected, but Mongo reports sequence {status.get('robot_last_sequence')} while the backend expects {settings.robot_supervisor_last_sequence}. Reconcile before enabling it.",

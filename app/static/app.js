@@ -39,6 +39,9 @@ const ui = {
   runModeToggle: document.querySelector("#run-mode-toggle"),
   resumeQueueAfterManualRobot: document.querySelector("#resume-queue-after-manual-robot"),
   runModeStatus: document.querySelector("#run-mode-status"),
+  millOptionalStopOff: document.querySelector("#mill-optional-stop-off"),
+  millFeedHold: document.querySelector("#mill-feed-hold"),
+  millStop: document.querySelector("#mill-stop"),
   runConfirmDialog: document.querySelector("#run-confirm-dialog"),
   recoveryLaunch: document.querySelector("#system-recovery-launch"),
   recoveryDialog: document.querySelector("#system-recovery-dialog"),
@@ -355,6 +358,7 @@ function renderBoard() {
     .map(workholding => `<option value="${escapeHtml(workholding)}"></option>`).join("");
   renderRobotMotionStatus();
   renderRunMode();
+  renderMillControls();
 
   const runAlert = board.run_mode?.alert || "";
   if (runAlert !== dismissedProgramWarning) dismissedProgramWarning = null;
@@ -499,6 +503,64 @@ function renderRunMode() {
     if (ui.runConfirmDialog.open) ui.runConfirmDialog.close();
   }
 }
+
+function renderMillControls() {
+  const mill = board?.mill_control || {};
+  const active = Boolean(mill.running || mill.paused);
+  ui.millOptionalStopOff.classList.toggle("hidden", mill.optional_stop !== true);
+  ui.millOptionalStopOff.disabled = !mill.can_control;
+  ui.millFeedHold.disabled = !mill.can_control || !active || mill.paused === true;
+  ui.millStop.disabled = !mill.can_control || !active;
+}
+
+async function requestMillControl(action, confirmed = false) {
+  const result = await api(`/api/cnc/control/${action}`, {
+    method: "POST",
+    body: JSON.stringify({expected_revision: board.revision, confirmed}),
+  });
+  board = result.board;
+  renderBoard();
+  showToast(result.message);
+  return result;
+}
+
+ui.millOptionalStopOff.addEventListener("click", async () => {
+  ui.millOptionalStopOff.disabled = true;
+  try {
+    await requestMillControl("optional_stop_off");
+  } catch (error) {
+    showToast(error.message, "error");
+    renderMillControls();
+  }
+});
+
+ui.millFeedHold.addEventListener("click", async () => {
+  ui.millFeedHold.disabled = true;
+  try {
+    await requestMillControl("feed_hold");
+  } catch (error) {
+    showToast(error.message, "error");
+    renderMillControls();
+  }
+});
+
+ui.millStop.addEventListener("click", async () => {
+  const choice = await window.mpsConfirm({
+    eyebrow: "Immediate mill control",
+    title: "Stop the mill program?",
+    message: "PathPilot will abort the active program. Run Mode will stop and will not move the pallet or start another program.",
+    tone: "danger",
+    primaryLabel: "Stop mill",
+  });
+  if (choice !== "primary") return;
+  ui.millStop.disabled = true;
+  try {
+    await requestMillControl("stop", true);
+  } catch (error) {
+    showToast(error.message, "error");
+    renderMillControls();
+  }
+});
 
 function recoveryList(items, service = false) {
   if (!items?.length) return `<p class="field-help">${service ? "No enabled service faults detected." : "No blocking conditions detected."}</p>`;
@@ -918,6 +980,25 @@ ui.runModeToggle.addEventListener("click", async () => {
       }, "Run mode stop requested.");
     });
     return;
+  }
+  if (board.mill_control?.optional_stop === true) {
+    const optionalStopChoice = await window.mpsConfirm({
+      eyebrow: "PathPilot warning",
+      title: "Optional Stop is on",
+      message: "The mill will pause at M01. Turn Optional Stop off now, or continue starting Run Mode with it enabled.",
+      tone: "warning",
+      secondaryLabel: "Turn off Optional Stop",
+      primaryLabel: "Continue with it on",
+    });
+    if (!optionalStopChoice) return;
+    if (optionalStopChoice === "secondary") {
+      try {
+        await requestMillControl("optional_stop_off");
+      } catch (error) {
+        showToast(error.message, "error");
+        return;
+      }
+    }
   }
   const queued = board.pallets.filter(item => item.queue_position !== null).length;
   const machine = board.pallets.find(item => item.location === "machine");

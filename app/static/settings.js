@@ -139,6 +139,9 @@ const ui = {
   cameraRecordingEnabled: document.querySelector("#camera-recording-enabled"),
   cameraRecordingPath: document.querySelector("#camera-recording-path"),
   cameraRecordingRetentionDays: document.querySelector("#camera-recording-retention-days"),
+  openCameraRecordingFolder: document.querySelector("#open-camera-recording-folder"),
+  purgeCameraRecordingFolder: document.querySelector("#purge-camera-recording-folder"),
+  cameraRecordingFolderStatus: document.querySelector("#camera-recording-folder-status"),
   cameraResolution: document.querySelector("#camera-resolution"),
   cameraFps: document.querySelector("#camera-fps"),
   probeCameraModes: document.querySelector("#probe-camera-modes"),
@@ -525,6 +528,42 @@ ui.probeCameraModes.addEventListener("click", async () => {
     ui.cameraModeStatus.textContent = `Mode detection failed: ${error.message}`;
   } finally {
     ui.probeCameraModes.disabled = false;
+  }
+});
+
+ui.openCameraRecordingFolder.addEventListener("click", async () => {
+  ui.openCameraRecordingFolder.disabled = true;
+  ui.cameraRecordingFolderStatus.textContent = "Opening the saved video folder...";
+  try {
+    const result = await api("/api/cameras/recordings/open", {method: "POST"});
+    ui.cameraRecordingFolderStatus.textContent = `Opened ${result.path}`;
+  } catch (error) {
+    ui.cameraRecordingFolderStatus.textContent = error.message;
+  } finally {
+    ui.openCameraRecordingFolder.disabled = false;
+  }
+});
+
+ui.purgeCameraRecordingFolder.addEventListener("click", async () => {
+  const confirmed = window.confirm("Permanently delete every file and subfolder in the saved video folder? This cannot be undone.");
+  if (!confirmed) return;
+  ui.purgeCameraRecordingFolder.disabled = true;
+  ui.cameraRecordingFolderStatus.textContent = "Purging the saved video folder...";
+  try {
+    const result = await api("/api/cameras/recordings/purge", {
+      method: "POST",
+      body: JSON.stringify({confirmed: true}),
+    });
+    const freed = result.freed_bytes >= 1073741824
+      ? `${(result.freed_bytes / 1073741824).toFixed(1)} GB`
+      : result.freed_bytes >= 1048576
+        ? `${(result.freed_bytes / 1048576).toFixed(1)} MB`
+        : `${Math.round(result.freed_bytes / 1024)} KB`;
+    ui.cameraRecordingFolderStatus.textContent = `Deleted ${result.deleted_files} file${result.deleted_files === 1 ? "" : "s"} and reclaimed ${freed}.`;
+  } catch (error) {
+    ui.cameraRecordingFolderStatus.textContent = error.message;
+  } finally {
+    ui.purgeCameraRecordingFolder.disabled = false;
   }
 });
 

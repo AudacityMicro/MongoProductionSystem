@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#17211d">
     <title>Settings | Mongo Production System</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260808-03">
+    <link rel="stylesheet" href="/static/styles.css?v=20260822-01">
     <script src="/static/popup.js?v=20260726-01" defer></script>
-    <script src="/static/settings.js?v=20260808-05" defer></script>
-    <script src="/static/system-status.js?v=20260806-01" defer></script>
+    <script src="/static/settings.js?v=20260819-01" defer></script>
+    <script src="/static/system-status.js?v=20260822-01" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -181,6 +181,11 @@
             <div class="form-row">
               <label>Recording folder<input id="camera-recording-path" maxlength="1000" placeholder="data/camera-recordings"></label>
               <label>Retention days<input id="camera-recording-retention-days" type="number" min="1" max="30" step="1"></label>
+            </div>
+            <div class="inline-actions">
+              <button class="button secondary" id="open-camera-recording-folder" type="button">Open video folder</button>
+              <button class="button danger" id="purge-camera-recording-folder" type="button">Purge video folder</button>
+              <span class="field-help" id="camera-recording-folder-status" role="status" aria-live="polite">Actions use the saved recording folder.</span>
             </div>
             <div class="form-row">
               <label>Resolution<select id="camera-resolution">

@@ -65,6 +65,90 @@ def test_only_terminal_no_motion_maintenance_gap_is_automatically_repairable(cli
         assert service._repairable_supervisor_maintenance_gap(session, settings, live) is None
 
 
+def test_stale_connected_supervisor_is_not_treated_as_fresh(client) -> None:
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_supervisor_heartbeat_seconds = 1.0
+
+        assert service._robot_supervisor_connection_is_fresh(
+            {"connected": True, "telemetry_age_seconds": 3.9}, settings
+        ) is True
+        assert service._robot_supervisor_connection_is_fresh(
+            {"connected": True, "telemetry_age_seconds": 30.0}, settings
+        ) is False
+
+
+def test_auto_recovery_closes_stale_socket_and_reenables_verified_routing(client, monkeypatch) -> None:
+    class StaleThenFreshSupervisor:
+        def __init__(self) -> None:
+            self.stopped = 0
+            self.started = 0
+            self.fresh = False
+
+        def status(self):
+            return {
+                "connected": True,
+                "listening": True,
+                "telemetry_age_seconds": 0.1 if self.fresh else 120.0,
+                "heartbeat_age_seconds": 0.1 if self.fresh else 120.0,
+                "robot_session": 9001,
+                "robot_last_sequence": 0,
+                "robot_last_event": "idle",
+                "latched": False,
+                "telemetry": {"safety_mode": 1, "runtime_state": 1},
+            }
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def start(self, *_args) -> None:
+            self.started += 1
+            self.fresh = True
+
+    supervisor = StaleThenFreshSupervisor()
+    monkeypatch.setattr(service, "robot_supervisor", lambda: supervisor)
+    monkeypatch.setattr(service, "robot_dashboard_health", lambda *_args: {"ok": True})
+
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.41"
+        settings.robot_supervisor_enabled = False
+        settings.robot_supervisor_activation_verified = False
+        session.commit()
+
+        result = service.auto_recover_controller_connections(session)
+
+        restored = service.get_settings(session)
+        assert restored.robot_supervisor_enabled is True
+        assert restored.robot_supervisor_activation_verified is True
+
+    assert supervisor.stopped == 1
+    assert supervisor.started == 1
+    assert any(item["action"] == "Stale socket reset" for item in result["results"])
+    assert any(item["action"] == "Enabled" for item in result["results"])
+
+
+def test_failed_bootstrap_preserves_prior_supervisor_activation(client, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service, "generated_script_directory", lambda _root: tmp_path)
+    with client.app.state.session_factory() as session:
+        settings = service.get_settings(session)
+        settings.robot_connection_mode = "physical"
+        settings.robot_host = "192.168.86.41"
+        settings.robot_supervisor_enabled = True
+        settings.robot_supervisor_activation_verified = True
+        settings.robot_supervisor_maintenance_mode = False
+        session.commit()
+
+        with pytest.raises(Exception, match="Rebuild generated scripts"):
+            service.bootstrap_robot_supervisor(session)
+
+        restored = service.get_settings(session)
+        assert restored.robot_supervisor_enabled is True
+        assert restored.robot_supervisor_activation_verified is True
+        assert restored.robot_supervisor_maintenance_mode is False
+
+
 def test_fragmented_numeric_frames_are_reassembled() -> None:
     frame = event_frame(7, EVENT_COMPLETED)
     buffer = FrameBuffer()

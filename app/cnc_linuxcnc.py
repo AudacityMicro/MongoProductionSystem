@@ -995,3 +995,82 @@ print("MONGO_CNC_ABORT=" + json.dumps({
         host, port, username, password, timeout,
         remote_script, "MONGO_CNC_ABORT=",
     )
+
+
+def set_linuxcnc_optional_stop(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+    enabled: bool,
+) -> dict:
+    """Set LinuxCNC Optional Stop and confirm the controller state."""
+    requested = "1" if enabled else "0"
+    remote_script = r'''import json
+import linuxcnc
+import time
+
+command = linuxcnc.command()
+command.set_optional_stop({requested})
+command.wait_complete()
+status = linuxcnc.stat()
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    status.poll()
+    if bool(getattr(status, "optional_stop", False)) is {expected}:
+        break
+    time.sleep(0.05)
+status.poll()
+actual = bool(getattr(status, "optional_stop", False))
+if actual is not {expected}:
+    raise RuntimeError("LinuxCNC did not confirm the requested Optional Stop state.")
+print("MONGO_CNC_OPTIONAL_STOP=" + json.dumps({{
+    "optional_stop": actual,
+    "interp_state": getattr(status, "interp_state", None),
+}}))
+'''.format(requested=requested, expected="True" if enabled else "False")
+    return _read_remote_payload(
+        host, port, username, password, timeout,
+        remote_script, "MONGO_CNC_OPTIONAL_STOP=",
+    )
+
+
+def feed_hold_linuxcnc_program(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: float,
+) -> dict:
+    """Pause active Auto execution and confirm PathPilot reports a paused state."""
+    remote_script = r'''import json
+import linuxcnc
+import time
+
+status = linuxcnc.stat()
+status.poll()
+if getattr(status, "interp_state", linuxcnc.INTERP_IDLE) == linuxcnc.INTERP_IDLE:
+    raise RuntimeError("PathPilot is Idle; there is no active program to feed hold.")
+command = linuxcnc.command()
+command.auto(linuxcnc.AUTO_PAUSE)
+command.wait_complete()
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    status.poll()
+    if bool(getattr(status, "paused", False)):
+        break
+    time.sleep(0.05)
+status.poll()
+if not bool(getattr(status, "paused", False)):
+    raise RuntimeError("PathPilot did not confirm Feed Hold.")
+print("MONGO_CNC_FEED_HOLD=" + json.dumps({
+    "paused": True,
+    "interp_state": getattr(status, "interp_state", None),
+    "program": getattr(status, "file", "") or "",
+}))
+'''
+    return _read_remote_payload(
+        host, port, username, password, timeout,
+        remote_script, "MONGO_CNC_FEED_HOLD=",
+    )
